@@ -1,4 +1,4 @@
-﻿name: Release Assets
+name: Release Assets
 
 on:
   push:
@@ -59,6 +59,7 @@ jobs:
         run: |
           Compress-Archive -Path target/${{ matrix.target }}/release/${{ matrix.artifact_name }}, README.md, LICENSE-MIT, LICENSE-APACHE -DestinationPath ${{ matrix.asset_name }} -Force
       - name: Upload to GitHub Release
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

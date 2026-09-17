@@ -124,13 +124,16 @@ pub fn git_cmd_with_path<P: AsRef<Path>>(cwd: P) -> Command {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        let current_path = std::env::var("PATH").unwrap_or_default();
-        let extra = if let Some(parent) = dir.parent() {
-            format!("{};{};{}", dir.display(), parent.display(), current_path)
-        } else {
-            format!("{};{}", dir.display(), current_path)
-        };
-        cmd.env("PATH", extra);
+        let mut paths = vec![dir.to_path_buf()];
+        if let Some(parent) = dir.parent() {
+            paths.push(parent.to_path_buf());
+        }
+        if let Some(current) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&current));
+        }
+        if let Ok(joined) = std::env::join_paths(paths) {
+            cmd.env("PATH", joined);
+        }
     }
     cmd
 }
@@ -755,16 +758,15 @@ impl GitRepo {
                                 #[cfg(not(windows))]
                                 {
                                     if is_readonly {
-                                        if let Some(parent) = full_path.parent() {
-                                            if let Ok(parent_meta) = fs::metadata(parent) {
-                                                if parent_meta.permissions().readonly() {
-                                                    return Err(anyhow!(
-                                                        "Parent directory of read-only secret file '{}' in worktree '{}' is not writable.",
-                                                        rel_path,
-                                                        wt.display()
-                                                    ));
-                                                }
-                                            }
+                                        if let Some(parent) = full_path.parent()
+                                            && let Ok(parent_meta) = fs::metadata(parent)
+                                            && parent_meta.permissions().readonly()
+                                        {
+                                            return Err(anyhow!(
+                                                "Parent directory of read-only secret file '{}' in worktree '{}' is not writable.",
+                                                rel_path,
+                                                wt.display()
+                                            ));
                                         }
                                     } else {
                                         match fs::OpenOptions::new().write(true).open(&full_path) {

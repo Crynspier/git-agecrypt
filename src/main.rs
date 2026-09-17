@@ -635,15 +635,20 @@ fn cmd_rewrap(paths: &[PathBuf], all: bool, identity_opt: Option<&str>, force: b
         }
     } else {
         let cwd = std::env::current_dir().unwrap_or_else(|_| repo.root.clone());
+        let canon_root = fs::canonicalize(&repo.root).unwrap_or_else(|_| repo.root.clone());
         for p in paths {
             let abs_p = if p.is_absolute() {
                 p.clone()
             } else {
                 cwd.join(p)
             };
-            let rel = match abs_p.strip_prefix(&repo.root) {
+            let canon_abs = fs::canonicalize(&abs_p).unwrap_or_else(|_| abs_p.clone());
+            let rel = match canon_abs.strip_prefix(&canon_root) {
                 Ok(r) => r.to_string_lossy().replace('\\', "/"),
-                Err(_) => p.to_string_lossy().replace('\\', "/"),
+                Err(_) => match abs_p.strip_prefix(&repo.root) {
+                    Ok(r) => r.to_string_lossy().replace('\\', "/"),
+                    Err(_) => p.to_string_lossy().replace('\\', "/"),
+                },
             };
             target_rel_paths.push(rel);
         }

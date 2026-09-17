@@ -5,13 +5,20 @@ use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
 
+fn prepend_to_path(dir: &Path) -> std::ffi::OsString {
+    let mut paths = vec![dir.to_path_buf()];
+    if let Some(current) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&current));
+    }
+    std::env::join_paths(paths).unwrap_or_default()
+}
+
 fn run_git(repo: &Path, args: &[&str]) {
     let bin_dir = assert_cmd::cargo::cargo_bin("git-agecrypt")
         .parent()
         .unwrap()
         .to_path_buf();
-    let current_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{};{}", bin_dir.display(), current_path);
+    let new_path = prepend_to_path(&bin_dir);
 
     let status = Command::new("git")
         .args(args)
@@ -27,8 +34,7 @@ fn git_out(repo: &Path, args: &[&str]) -> Vec<u8> {
         .parent()
         .unwrap()
         .to_path_buf();
-    let current_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{};{}", bin_dir.display(), current_path);
+    let new_path = prepend_to_path(&bin_dir);
 
     let output = Command::new("git")
         .args(args)

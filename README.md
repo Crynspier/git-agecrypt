@@ -97,9 +97,9 @@ When a team member rotates the master key via `git-agecrypt rekey`, collaborator
 
 Download pre-compiled standalone binaries from the [GitHub Releases](https://github.com/Crynspier/git-agecrypt/releases) page:
 
-- **Linux:** `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`
-- **macOS:** `aarch64-apple-darwin` (Apple Silicon), `x86_64-apple-darwin` (Intel)
-- **Windows:** `x86_64-pc-windows-msvc` (`git-agecrypt.exe`)
+- **Linux:** `git-agecrypt-linux-x86_64.tar.gz` (x86_64)
+- **macOS:** `git-agecrypt-macos-aarch64.tar.gz` (Apple Silicon M-series), `git-agecrypt-macos-x86_64.tar.gz` (Intel)
+- **Windows:** `git-agecrypt-windows-x86_64.zip` (`git-agecrypt.exe`)
 
 Extract the binary and place it in your system `PATH` (e.g. `/usr/local/bin` on Unix, or `C:\Program Files\Git\usr\bin` on Windows).
 
@@ -292,7 +292,7 @@ jobs:
       # Option A: Download standalone pre-compiled release binary
       - name: Install git-agecrypt
         run: |
-          curl -sSL https://github.com/Crynspier/git-agecrypt/releases/latest/download/git-agecrypt-x86_64-unknown-linux-musl.tar.gz | tar -xz
+          curl -sSL https://github.com/Crynspier/git-agecrypt/releases/latest/download/git-agecrypt-linux-x86_64.tar.gz | tar -xz
           sudo mv git-agecrypt /usr/local/bin/
 
       # Option B (if Rust toolchain is already installed):

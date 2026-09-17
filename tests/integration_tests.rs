@@ -3258,19 +3258,17 @@ fn test_check_skips_submodule_gitlinks() {
 
     // Create a mock gitlink entry (mode 160000) in the index under submodules/my-submodule
     let dummy_sha = "0123456789abcdef0123456789abcdef01234567";
-    let status = Command::new("git")
-        .args([
+    run_git(
+        repo,
+        &[
             "update-index",
             "--add",
             "--cacheinfo",
             "160000",
             dummy_sha,
             "submodules/my-submodule",
-        ])
-        .current_dir(repo)
-        .status()
-        .expect("Failed to create gitlink in index");
-    assert!(status.success());
+        ],
+    );
 
     // Verify git ls-files --stage shows mode 160000
     let ls_out = git_out(repo, &["ls-files", "--stage", "submodules/my-submodule"]);
@@ -3544,11 +3542,10 @@ fn test_pre_push_hook_catches_committed_leak_with_clean_index() {
 
     // Create a bare remote
     let remote_dir = temp.path().join("remote.git");
-    let status = Command::new("git")
-        .args(["init", "--bare", remote_dir.to_str().unwrap()])
-        .status()
-        .unwrap();
-    assert!(status.success());
+    run_git(
+        temp.path(),
+        &["init", "--bare", remote_dir.to_str().unwrap()],
+    );
     run_git(
         repo,
         &["remote", "add", "origin", remote_dir.to_str().unwrap()],
@@ -3589,19 +3586,17 @@ fn test_pre_push_hook_catches_committed_leak_with_clean_index() {
     .unwrap()
     .trim()
     .to_string();
-    let status = Command::new("git")
-        .args([
+    run_git(
+        repo,
+        &[
             "update-index",
             "--add",
             "--cacheinfo",
             "100644",
             &blob_sha,
             "leak.secret.env",
-        ])
-        .current_dir(repo)
-        .status()
-        .unwrap();
-    assert!(status.success());
+        ],
+    );
     run_git(
         repo,
         &[
@@ -3711,19 +3706,17 @@ fn test_pre_push_hook_ignores_dirty_staged_files() {
     .unwrap()
     .trim()
     .to_string();
-    let status = Command::new("git")
-        .args([
+    run_git(
+        repo,
+        &[
             "update-index",
             "--add",
             "--cacheinfo",
             "100644",
             &wip_blob_sha,
             "wip.secret.env",
-        ])
-        .current_dir(repo)
-        .status()
-        .unwrap();
-    assert!(status.success());
+        ],
+    );
 
     // Standard check fails because wip.secret.env is invalid in staging
     let mut check_staged = Command::cargo_bin("git-agecrypt").unwrap();
@@ -3959,19 +3952,17 @@ fn test_windows_backslash_path_in_check_special_entry() {
 
     // Create a submodule entry at tools/sub
     let dummy_sha = "0123456789abcdef0123456789abcdef01234567";
-    let status = Command::new("git")
-        .args([
+    run_git(
+        repo,
+        &[
             "update-index",
             "--add",
             "--cacheinfo",
             "160000",
             dummy_sha,
             "tools/sub",
-        ])
-        .current_dir(repo)
-        .status()
-        .unwrap();
-    assert!(status.success());
+        ],
+    );
 
     // Run check: path normalization with backslashes should not fail or escape-corrupt
     let mut check_cmd = Command::cargo_bin("git-agecrypt").unwrap();
@@ -4020,19 +4011,17 @@ fn test_pre_push_skips_deleted_secrets_and_submodules() {
     // Delete the secret and add a submodule
     run_git(repo, &["rm", "database.secret.env"]);
     let dummy_sha = "0123456789abcdef0123456789abcdef01234567";
-    let status = Command::new("git")
-        .args([
+    run_git(
+        repo,
+        &[
             "update-index",
             "--add",
             "--cacheinfo",
             "160000",
             dummy_sha,
             "vendor/submodule.secret.env",
-        ])
-        .current_dir(repo)
-        .status()
-        .unwrap();
-    assert!(status.success());
+        ],
+    );
     run_git(
         repo,
         &["commit", "-m", "Commit 2: delete secret and add submodule"],

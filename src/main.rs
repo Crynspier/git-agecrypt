@@ -1078,7 +1078,10 @@ fn cmd_lock(force: bool) -> Result<()> {
         ));
     }
 
-    repo.transactional_lock(|| repo.refresh_all_worktrees(force))?;
+    // Cleanliness and uncommitted edits across all worktrees were already strictly validated above.
+    // Pass force=true to refresh_all_worktrees so that re-checking git status while repo.key is staged
+    // does not falsely trigger dirty detection due to racy git timestamp cache differences.
+    repo.transactional_lock(|| repo.refresh_all_worktrees(true))?;
     let _ = repo.clear_cache();
     eprintln!("Repository locked across all linked worktrees. Local credentials removed.");
     Ok(())

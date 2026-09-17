@@ -1,0 +1,66 @@
+﻿name: Release Assets
+
+on:
+  push:
+    tags:
+      - 'v*'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-assets:
+    name: Build & Upload (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: git-agecrypt
+            asset_name: git-agecrypt-linux-x86_64.tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: git-agecrypt
+            asset_name: git-agecrypt-macos-x86_64.tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: git-agecrypt
+            asset_name: git-agecrypt-macos-aarch64.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: git-agecrypt.exe
+            asset_name: git-agecrypt-windows-x86_64.zip
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build target
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package asset (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} .
+          tar -czf ${{ matrix.asset_name }} ${{ matrix.artifact_name }} README.md LICENSE-MIT LICENSE-APACHE
+      - name: Package asset (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          Compress-Archive -Path target/${{ matrix.target }}/release/${{ matrix.artifact_name }}, README.md, LICENSE-MIT, LICENSE-APACHE -DestinationPath ${{ matrix.asset_name }} -Force
+      - name: Upload to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.event.release.tag_name || github.ref_name || 'v0.1.0' }}"
+          gh release upload "$TAG" "${{ matrix.asset_name }}" --clobber

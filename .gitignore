@@ -1,0 +1,21 @@
+# Rust build artifacts
+/target
+
+# Editor & IDE artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.iml
+
+# OS metadata
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# Test keys & backup files
+*.bak
+*.bk
+*.orig
+*.tmp

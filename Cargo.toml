@@ -1,0 +1,37 @@
+[package]
+name = "git-agecrypt"
+version = "0.1.0"
+edition = "2024"
+authors = ["Leon Zjakić <117075643+Crynspier@users.noreply.github.com>"]
+description = "Modern, GPG-free Git secrets filter using age encryption and SSH keys"
+license = "Apache-2.0 OR MIT"
+readme = "README.md"
+repository = "https://github.com/Crynspier/git-agecrypt"
+keywords = ["git", "age", "encryption", "secrets", "security"]
+categories = ["command-line-utilities", "cryptography", "development-tools::version-control"]
+
+[dependencies]
+age = { version = "0.12.1", features = ["ssh", "armor", "cli-common"] }
+clap = { version = "4.5", features = ["derive", "cargo"] }
+zeroize = { version = "1.8", features = ["derive"] }
+tempfile = "3.17"
+dirs = "6.0"
+anyhow = "1.0"
+sha2 = "0.10"
+hmac = "0.12"
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+content_inspector = "0.2"
+glob = "0.3"
+filetime = "0.2.29"
+ctrlc = "3.4"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+

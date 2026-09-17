@@ -1,0 +1,36 @@
+﻿#!/usr/bin/env bash
+# Server-side pre-receive hook for git-agecrypt:
+# Rejects any git push containing unencrypted secret files matching filter=agecrypt.
+#
+# Installation:
+# Place this script in your server repository's hooks/ directory as `pre-receive`
+# and ensure it has executable permissions (`chmod +x pre-receive`).
+set -euo pipefail
+
+while read -r oldrev newrev refname; do
+    if [ "$newrev" = "0000000000000000000000000000000000000000" ]; then
+        continue # Branch deletion
+    fi
+
+    if [ "$oldrev" = "0000000000000000000000000000000000000000" ]; then
+        revs="$newrev"
+    else
+        revs="$oldrev..$newrev"
+    fi
+
+    for commit in $(git rev-list "$revs"); do
+        for path in $(git diff-tree -r --name-only --no-commit-id "$commit"); do
+            if git check-attr filter -- "$path" | grep -q 'filter: agecrypt'; then
+                header=$(git cat-file -p "$commit:$path" | head -n 1 || true)
+                if [[ ! "$header" =~ ^age-encryption\.org/v1 ]]; then
+                    echo "===============================================================" >&2
+                    echo "PUSH REJECTED BY SERVER PRE-RECEIVE HOOK" >&2
+                    echo "Commit $commit contains UNENCRYPTED secret file: $path" >&2
+                    echo "Please configure git-agecrypt locally and re-commit." >&2
+                    echo "===============================================================" >&2
+                    exit 1
+                fi
+            fi
+        done
+    done
+done

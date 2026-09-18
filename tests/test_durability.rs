@@ -1,6 +1,5 @@
 mod common;
 
-use assert_cmd::prelude::*;
 use common::*;
 use std::fs;
 use tempfile::tempdir;

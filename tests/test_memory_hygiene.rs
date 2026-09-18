@@ -1,6 +1,5 @@
 mod common;
 
-use assert_cmd::prelude::*;
 use common::*;
 use sha2::{Digest, Sha256};
 use std::fs;

@@ -5651,3 +5651,85 @@ fn test_check_staged_safe_files_not_flagged() {
     let mut check_cmd = Command::cargo_bin("git-agecrypt").unwrap();
     check_cmd.current_dir(repo).arg("check").assert().success();
 }
+
+#[test]
+fn test_run_subcommand_with_env_injection() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Test Developer"]);
+    run_git(repo, &["config", "user.email", "dev@example.com"]);
+
+    let mut init_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    init_cmd.current_dir(repo).arg("init").assert().success();
+
+    // Create a .env file with secrets
+    let env_path = repo.join(".env");
+    fs::write(
+        &env_path,
+        "TEST_AGE_SECRET=super_top_secret_value\nPORT=9999\n",
+    )
+    .unwrap();
+
+    let mut run_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    run_cmd.current_dir(repo).arg("run").arg("--");
+
+    #[cfg(windows)]
+    {
+        run_cmd.args(["cmd", "/C", "echo %TEST_AGE_SECRET%"]);
+        run_cmd
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("super_top_secret_value"));
+    }
+    #[cfg(not(windows))]
+    {
+        run_cmd.args(["sh", "-c", "echo $TEST_AGE_SECRET"]);
+        run_cmd
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("super_top_secret_value"));
+    }
+}
+
+#[test]
+fn test_run_subcommand_with_custom_env_file() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Test Developer"]);
+    run_git(repo, &["config", "user.email", "dev@example.com"]);
+
+    let mut init_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    init_cmd.current_dir(repo).arg("init").assert().success();
+
+    let custom_env = repo.join("custom.secret.env");
+    fs::write(&custom_env, "CUSTOM_VAR=custom_value_456\n").unwrap();
+
+    let mut run_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    run_cmd
+        .current_dir(repo)
+        .arg("run")
+        .arg("--env-file")
+        .arg("custom.secret.env")
+        .arg("--");
+
+    #[cfg(windows)]
+    {
+        run_cmd.args(["cmd", "/C", "echo %CUSTOM_VAR%"]);
+        run_cmd
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("custom_value_456"));
+    }
+    #[cfg(not(windows))]
+    {
+        run_cmd.args(["sh", "-c", "echo $CUSTOM_VAR"]);
+        run_cmd
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("custom_value_456"));
+    }
+}

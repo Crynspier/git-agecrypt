@@ -131,18 +131,23 @@ pub fn run_3way_merge(
     let lf_bytes = strip_cr(&merged_bytes);
     if ours_uses_crlf {
         let mut crlf_bytes = Vec::with_capacity(lf_bytes.len() + lf_bytes.len() / 20);
-        for b in lf_bytes {
-            if b == b'\n' {
+        for b in &lf_bytes {
+            if *b == b'\n' {
                 crlf_bytes.push(b'\r');
             }
-            crlf_bytes.push(b);
+            crlf_bytes.push(*b);
         }
         fs::write(temp_ours.path(), crlf_bytes)?;
     } else {
-        fs::write(temp_ours.path(), lf_bytes)?;
+        fs::write(temp_ours.path(), lf_bytes.as_slice())?;
     }
 
-    // 4. Re-encrypt the merged result in temp_ours atomically into the target `ours` (%A)
+    // 4. Semantic conflict inspection on key-value / .env files
+    if exit_code == 0 {
+        check_semantic_conflicts(&lf_bytes, file_path);
+    }
+
+    // 5. Re-encrypt the merged result in temp_ours atomically into the target `ours` (%A)
     {
         let orig_readonly = fs::metadata(ours)
             .map(|m| m.permissions().readonly())
@@ -228,4 +233,101 @@ pub fn run_3way_merge(
     }
 
     Ok(exit_code)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SemanticConflict {
+    pub key: String,
+    pub prev_line: usize,
+    pub curr_line: usize,
+    pub prev_val: String,
+    pub curr_val: String,
+}
+
+/// Detects duplicate conflicting key definitions in merged key-value or .env files.
+pub fn find_semantic_conflicts(content: &[u8], file_path: &str) -> Vec<SemanticConflict> {
+    let lower_path = file_path.to_lowercase();
+    let is_key_val = lower_path.ends_with(".env")
+        || lower_path.contains(".env.")
+        || lower_path.ends_with(".conf")
+        || lower_path.ends_with(".ini")
+        || lower_path.ends_with(".properties");
+
+    if !is_key_val {
+        return Vec::new();
+    }
+
+    let mut conflicts = Vec::new();
+    if let Ok(text) = std::str::from_utf8(content) {
+        let mut seen_keys: std::collections::HashMap<String, (usize, String)> =
+            std::collections::HashMap::new();
+        for (line_idx, raw_line) in text.lines().enumerate() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                continue;
+            }
+            let candidate = if let Some(stripped) = line.strip_prefix("export ") {
+                stripped.trim()
+            } else {
+                line
+            };
+
+            if let Some((key, val)) = candidate.split_once('=') {
+                let key = key.trim();
+                let val = val.trim();
+                if !key.is_empty() {
+                    if let Some((prev_line, prev_val)) = seen_keys.get(key) {
+                        if prev_val != val {
+                            conflicts.push(SemanticConflict {
+                                key: key.to_string(),
+                                prev_line: *prev_line,
+                                curr_line: line_idx + 1,
+                                prev_val: prev_val.clone(),
+                                curr_val: val.to_string(),
+                            });
+                        }
+                    } else {
+                        seen_keys.insert(key.to_string(), (line_idx + 1, val.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    conflicts
+}
+
+/// Scans merged key-value or .env file content for duplicate key definitions.
+/// Emits warnings to alert developers if concurrent branch edits produced duplicate conflicting keys.
+pub fn check_semantic_conflicts(content: &[u8], file_path: &str) {
+    for c in find_semantic_conflicts(content, file_path) {
+        eprintln!(
+            "git-agecrypt merge [WARNING]: Semantic duplicate assignment for key '{}' in '{file_path}' (line {} vs line {}). Please review merged secrets.",
+            c.key, c.prev_line, c.curr_line
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_semantic_conflicts() {
+        let content = b"# Database settings\nPORT=3000\nexport HOST=localhost\n# Concurrent branch added another PORT\nPORT=8080\n";
+        let conflicts = find_semantic_conflicts(content, ".env");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].key, "PORT");
+        assert_eq!(conflicts[0].prev_line, 2);
+        assert_eq!(conflicts[0].curr_line, 5);
+        assert_eq!(conflicts[0].prev_val, "3000");
+        assert_eq!(conflicts[0].curr_val, "8080");
+
+        // Same value duplicate is not a conflict
+        let identical = b"API_KEY=xyz\nAPI_KEY=xyz\n";
+        assert!(find_semantic_conflicts(identical, ".env").is_empty());
+
+        // Non-key-val file is skipped
+        let ignored = find_semantic_conflicts(content, "data.json");
+        assert!(ignored.is_empty());
+    }
 }

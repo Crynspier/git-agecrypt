@@ -156,4 +156,15 @@ pub enum Commands {
         #[arg(short, long)]
         identity: Option<String>,
     },
+
+    /// Execute a command with decrypted secrets injected into the process environment
+    Run {
+        /// Specific secret env file to load (defaults to all tracked .env / *.secret.env files)
+        #[arg(short, long)]
+        env_file: Option<PathBuf>,
+
+        /// Command and arguments to execute
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
 }

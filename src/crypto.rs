@@ -4,7 +4,7 @@ use sha2::Sha256;
 use std::fs::{self, File};
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
+use zeroize::Zeroize;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -19,7 +19,7 @@ pub fn format_cache_hash(mac_bytes: &[u8]) -> String {
 
 /// Computes a keyed HMAC-SHA256 cache filename using the master key.
 /// This prevents dictionary attacks or rainbow tables on low-entropy secrets in the cache.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn compute_cache_filename(key: &[u8], plaintext: &[u8]) -> String {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts keys of any size");
     mac.update(plaintext);
@@ -46,43 +46,20 @@ pub fn parse_recipient(s: &str) -> Result<Box<dyn age::Recipient + Send + 'stati
     let s = s.trim();
     if s.starts_with("sk-") {
         return Err(anyhow!(
-            "FIDO2 / hardware security keys ('sk-ssh-ed25519' or 'sk-ecdsa') are not supported by the age encryption format. Please use a standard ed25519 key ('ssh-ed25519') or native age key ('age1...')."
+            "FIDO2 / hardware security keys ('sk-ssh-ed25519' or 'sk-ecdsa') are not supported by the age encryption format. Please use a standard ed25519 key ('ssh-ed25519'), native age key ('age1...'), or age plugin ('age1yubikey1...')."
         ));
     }
-    if s.starts_with("age1") {
-        let r = age::x25519::Recipient::from_str(s)
-            .map_err(|e| anyhow!("Invalid age recipient '{s}': {e}"))?;
-        Ok(Box::new(r))
-    } else if s.starts_with("ssh-") {
-        let r = age::ssh::Recipient::from_str(s)
-            .map_err(|e| anyhow!("Invalid SSH recipient '{s}': {e:?}"))?;
-        Ok(Box::new(r))
-    } else {
-        Err(anyhow!(
-            "Unsupported recipient format for '{s}'. Expected 'age1...' or OpenSSH public key ('ssh-ed25519 ...' / 'ssh-rsa ...')"
-        ))
-    }
-}
 
-/// Parses recipients from a file (e.g. `~/.ssh/id_ed25519.pub` or a keys list).
-#[allow(dead_code)]
-pub fn parse_recipients_file(path: &Path) -> Result<Vec<Box<dyn age::Recipient + Send + 'static>>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read recipient file: {}", path.display()))?;
-    let mut recipients = Vec::new();
-    for (line_no, line) in content.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let recipient = parse_recipient(trimmed)
-            .with_context(|| format!("Error parsing recipient at {}:{line_no}", path.display()))?;
-        recipients.push(recipient);
+    let mut guard = age::cli_common::StdinGuard::new(false);
+    let mut recipients =
+        age::cli_common::read_recipients(vec![s.to_string()], vec![], vec![], None, &mut guard)
+            .map_err(|e| anyhow!("Failed to parse recipient '{s}': {e}"))?;
+
+    if let Some(r) = recipients.pop() {
+        Ok(r)
+    } else {
+        Err(anyhow!("No valid recipient parsed from '{s}'"))
     }
-    if recipients.is_empty() {
-        return Err(anyhow!("No valid recipients found in {}", path.display()));
-    }
-    Ok(recipients)
 }
 
 /// Wraps (encrypts) the master key string for a given recipient and returns ASCII armor.
@@ -389,12 +366,99 @@ pub fn prune_cache_if_needed(cache_dir: &Path, max_entries: usize, max_bytes: u6
     Ok(())
 }
 
+const IN_MEMORY_SPOOL_LIMIT: usize = 1024 * 1024; // 1 MiB
+
+/// Staging buffer for clean filter and probe streams.
+/// Holds data in memory (zeroized on drop) for typical secret files (<= 1 MiB)
+/// to eliminate temporary disk file I/O, seamlessly spilling to a NamedTempFile
+/// only for files exceeding 1 MiB to guarantee bounded O(1) RAM usage.
+pub enum SpoolBuffer {
+    Memory(Vec<u8>),
+    Disk(tempfile::NamedTempFile),
+}
+
+impl Drop for SpoolBuffer {
+    fn drop(&mut self) {
+        if let SpoolBuffer::Memory(bytes) = self {
+            bytes.zeroize();
+        }
+    }
+}
+
+impl SpoolBuffer {
+    pub fn reader(&self) -> Result<Box<dyn Read + '_>> {
+        match self {
+            SpoolBuffer::Memory(bytes) => Ok(Box::new(Cursor::new(bytes.as_slice()))),
+            SpoolBuffer::Disk(file) => {
+                let f = File::open(file.path())?;
+                Ok(Box::new(f))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_in_memory(&self) -> bool {
+        matches!(self, SpoolBuffer::Memory(_))
+    }
+}
+
+/// Spools a stream into memory (or temporary file if > 1 MiB) while optionally updating an HMAC digest.
+pub fn spool_stream<R: Read>(
+    mut stream: R,
+    cache_dir: Option<&Path>,
+    mut mac_opt: Option<HmacSha256>,
+) -> Result<(SpoolBuffer, Option<String>)> {
+    let mut mem_buf = Vec::new();
+    let mut disk_file: Option<tempfile::NamedTempFile> = None;
+    let mut buf = [0u8; 64 * 1024];
+
+    loop {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if let Some(ref mut mac) = mac_opt {
+            mac.update(&buf[..n]);
+        }
+
+        if let Some(ref mut df) = disk_file {
+            df.write_all(&buf[..n])?;
+        } else if mem_buf.len() + n <= IN_MEMORY_SPOOL_LIMIT {
+            mem_buf.extend_from_slice(&buf[..n]);
+        } else {
+            let mut df = if let Some(c_dir) = cache_dir {
+                fs::create_dir_all(c_dir)?;
+                tempfile::NamedTempFile::new_in(c_dir)?
+            } else {
+                tempfile::NamedTempFile::new()?
+            };
+            df.write_all(&mem_buf)?;
+            df.write_all(&buf[..n])?;
+            mem_buf.clear();
+            mem_buf.shrink_to_fit();
+            disk_file = Some(df);
+        }
+    }
+
+    if let Some(ref mut df) = disk_file {
+        df.flush()?;
+    }
+
+    let hash_hex_opt = mac_opt.map(|mac| format_cache_hash(&mac.finalize().into_bytes()));
+    let spool = match disk_file {
+        Some(df) => SpoolBuffer::Disk(df),
+        None => SpoolBuffer::Memory(mem_buf),
+    };
+
+    Ok((spool, hash_hex_opt))
+}
+
 /// Encrypts a plaintext stream into output, querying and updating the cache if enabled.
 /// Employs index-aware deduplication: if the cache misses (or was pruned by LRU / cleared),
 /// checks if the existing staged blob in Git index decrypts to the exact same plaintext.
 /// If so, outputs the existing staged ciphertext to permanently defeat phantom diffs!
 fn encrypt_plaintext_stream<R: Read, W: Write>(
-    mut stream: R,
+    stream: R,
     mut output: W,
     recipient: &dyn age::Recipient,
     cache_dir: Option<&Path>,
@@ -402,38 +466,8 @@ fn encrypt_plaintext_stream<R: Read, W: Write>(
     identity_opt: Option<&dyn age::Identity>,
     staged_ciphertext: Option<&[u8]>,
 ) -> Result<()> {
-    // Spool into a repository-local temporary file (or system temp fallback) while hashing with HMAC-SHA256
-    let mut temp_in = if let Some(c_dir) = cache_dir {
-        fs::create_dir_all(c_dir)?;
-        tempfile::NamedTempFile::new_in(c_dir)?
-    } else {
-        tempfile::NamedTempFile::new()?
-    };
-    let mut buf = [0u8; 64 * 1024];
-
-    let hash_hex_opt = if let Some(key) = cache_key {
-        let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key valid");
-        loop {
-            let n = stream.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            mac.update(&buf[..n]);
-            temp_in.write_all(&buf[..n])?;
-        }
-        temp_in.flush()?;
-        Some(format_cache_hash(&mac.finalize().into_bytes()))
-    } else {
-        loop {
-            let n = stream.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            temp_in.write_all(&buf[..n])?;
-        }
-        temp_in.flush()?;
-        None
-    };
+    let mac_opt = cache_key.map(|key| HmacSha256::new_from_slice(key).expect("HMAC key valid"));
+    let (spool, hash_hex_opt) = spool_stream(stream, cache_dir, mac_opt)?;
 
     // 1. Fast path: Check on-disk HMAC cache
     if let (Some(c_dir), Some(hash_hex)) = (cache_dir, hash_hex_opt.as_ref()) {
@@ -487,6 +521,7 @@ fn encrypt_plaintext_stream<R: Read, W: Write>(
 
                     // Repopulate local cache so subsequent checks are immediate
                     if let Some(c_dir) = cache_dir {
+                        let _ = fs::create_dir_all(c_dir);
                         let dest = c_dir.join(format!("{hash_hex}.age"));
                         if !dest.exists() {
                             let _ = fs::write(&dest, staged_bytes);
@@ -499,7 +534,7 @@ fn encrypt_plaintext_stream<R: Read, W: Write>(
     }
 
     // Cache miss or no cache: encrypt plaintext
-    let mut reader = File::open(temp_in.path())?;
+    let mut reader = spool.reader()?;
     let encryptor = age::Encryptor::with_recipients(std::iter::once(recipient))
         .map_err(|e| anyhow!("Failed to initialize age encryptor for clean filter: {e}"))?;
 
@@ -588,24 +623,9 @@ pub fn clean_stream<R: Read, W: Write>(
     if is_age_ciphertext(&prefix) {
         if let Some(id) = identity_opt {
             // Repo is unlocked: verify this is actually a valid Age ciphertext for our key
-            let mut temp_probe = if let Some(c_dir) = cache_dir {
-                fs::create_dir_all(c_dir)?;
-                tempfile::NamedTempFile::new_in(c_dir)?
-            } else {
-                tempfile::NamedTempFile::new()?
-            };
-            let mut buf = [0u8; 64 * 1024];
-            loop {
-                let n = stream.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                temp_probe.write_all(&buf[..n])?;
-            }
-            temp_probe.flush()?;
-
-            let probe_file = File::open(temp_probe.path())?;
-            match age::Decryptor::new(probe_file) {
+            let (spool, _) = spool_stream(stream, cache_dir, None)?;
+            let probe_reader = spool.reader()?;
+            match age::Decryptor::new(probe_reader) {
                 Ok(decryptor) => {
                     // Structurally valid Age container. Verify payload authentication.
                     match decryptor.decrypt(std::iter::once(id)) {
@@ -630,7 +650,7 @@ pub fn clean_stream<R: Read, W: Write>(
                             }
 
                             // 100% genuine, intact ciphertext: pass through untouched
-                            let mut valid_file = File::open(temp_probe.path())?;
+                            let mut valid_file = spool.reader()?;
                             io::copy(&mut valid_file, &mut output)?;
                             output.flush()?;
                             return Ok(());
@@ -645,7 +665,7 @@ pub fn clean_stream<R: Read, W: Write>(
                             eprintln!(
                                 "git-agecrypt clean [WARNING]: File is encrypted with a historical or foreign key (does not match active recipient)."
                             );
-                            let mut valid_file = File::open(temp_probe.path())?;
+                            let mut valid_file = spool.reader()?;
                             io::copy(&mut valid_file, &mut output)?;
                             output.flush()?;
                             return Ok(());
@@ -661,7 +681,7 @@ pub fn clean_stream<R: Read, W: Write>(
                 Err(_) => {
                     // Not an Age container (e.g. documentation starting with 'age-encryption.org/v1\n').
                     // Counter-trap: Must encrypt so plaintext is never committed to Git!
-                    let temp_read = File::open(temp_probe.path())?;
+                    let temp_read = spool.reader()?;
                     return encrypt_plaintext_stream(
                         temp_read,
                         output,
@@ -1359,5 +1379,42 @@ mod tests {
         );
         let repopulated_content = fs::read(cached_file).unwrap();
         assert_eq!(repopulated_content, initial_cipher);
+    }
+
+    #[test]
+    fn test_spool_buffer_memory_and_disk() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // 1. Small stream (< 1 MiB) -> stays in Memory
+        let small_data = b"SECRET_API_KEY=1234567890abcdef\n";
+        let (spool_small, mac_small) = spool_stream(
+            Cursor::new(small_data.to_vec()),
+            Some(temp_dir.path()),
+            None,
+        )
+        .unwrap();
+        assert!(spool_small.is_in_memory());
+        assert!(mac_small.is_none());
+        let mut read_back = Vec::new();
+        spool_small
+            .reader()
+            .unwrap()
+            .read_to_end(&mut read_back)
+            .unwrap();
+        assert_eq!(read_back, small_data);
+
+        // 2. Large stream (> 1 MiB) -> spills to Disk
+        let large_size = 1024 * 1024 + 100; // 1 MiB + 100 bytes
+        let large_data = vec![0x42u8; large_size];
+        let (spool_large, _) =
+            spool_stream(Cursor::new(large_data.clone()), Some(temp_dir.path()), None).unwrap();
+        assert!(!spool_large.is_in_memory());
+        let mut large_read_back = Vec::new();
+        spool_large
+            .reader()
+            .unwrap()
+            .read_to_end(&mut large_read_back)
+            .unwrap();
+        assert_eq!(large_read_back, large_data);
     }
 }

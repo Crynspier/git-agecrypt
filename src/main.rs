@@ -108,6 +108,7 @@ fn run(cli: Cli) -> Result<()> {
             file_path,
         } => cmd_merge(&base, &ours, &theirs, marker_size, file_path.as_deref()),
         Commands::MigrateFromGitCrypt { identity } => cmd_migrate(identity.as_deref()),
+        Commands::Run { env_file, command } => cmd_run(env_file.as_deref(), &command),
     }
 }
 
@@ -1513,4 +1514,173 @@ fn find_default_ssh_public_key() -> Option<String> {
         }
     }
     None
+}
+
+fn cmd_run(env_file_opt: Option<&Path>, command: &[String]) -> Result<()> {
+    if command.is_empty() {
+        return Err(anyhow!("No command specified to run"));
+    }
+
+    let repo = GitRepo::discover()?;
+
+    let files_to_read: Vec<PathBuf> = if let Some(ef) = env_file_opt {
+        let full = if ef.is_absolute() {
+            ef.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(ef)
+        };
+        if !full.exists() {
+            return Err(anyhow!(
+                "Specified env file '{}' does not exist",
+                ef.display()
+            ));
+        }
+        vec![full]
+    } else {
+        let mut env_files = Vec::new();
+        let default_env = repo.root.join(".env");
+        if default_env.exists() {
+            env_files.push(default_env);
+        }
+        if let Ok(patterns) = repo.get_tracked_patterns() {
+            for pat in patterns {
+                let lower = pat.to_lowercase();
+                if lower.ends_with(".env")
+                    || lower.contains(".env.")
+                    || lower.ends_with(".secret.env")
+                {
+                    let candidate = repo.root.join(&pat);
+                    if candidate.exists() && candidate.is_file() && !env_files.contains(&candidate)
+                    {
+                        env_files.push(candidate);
+                    }
+                }
+            }
+        }
+        if env_files.is_empty() {
+            let cwd_env = std::env::current_dir()?.join(".env");
+            if cwd_env.exists() {
+                env_files.push(cwd_env);
+            }
+        }
+        if env_files.is_empty() {
+            return Err(anyhow!(
+                "No .env file found in repository root or current directory. Specify one with -e/--env-file."
+            ));
+        }
+        env_files
+    };
+
+    let mut master_key_opt: Option<String> = None;
+    let mut env_vars = std::collections::HashMap::new();
+
+    for path in files_to_read {
+        let bytes = fs::read(&path)
+            .with_context(|| format!("Failed to read secret env file: {}", path.display()))?;
+
+        let prefix_len = std::cmp::min(bytes.len(), crypto::AGE_HEADER_MAGIC.len());
+        let plaintext = if crypto::is_age_ciphertext(&bytes[..prefix_len]) {
+            if master_key_opt.is_none() {
+                if let Ok(Some(key)) = repo.read_local_master_key() {
+                    master_key_opt = Some(key);
+                } else if let Ok(Some(key)) = repo.try_auto_refresh_master_key() {
+                    master_key_opt = Some(key);
+                } else {
+                    let keys_dir = repo.keys_dir();
+                    if keys_dir.exists() {
+                        let mut identities = Vec::new();
+                        for candidate in crypto::get_default_identity_paths() {
+                            if candidate.exists()
+                                && let Ok(ids) =
+                                    crypto::load_identities_from_file_non_interactive(&candidate)
+                            {
+                                identities.extend(ids);
+                            }
+                        }
+                        if !identities.is_empty() {
+                            if let Ok(entries) = fs::read_dir(&keys_dir) {
+                                for entry in entries.flatten() {
+                                    let key_path = entry.path();
+                                    if key_path.extension().and_then(|s| s.to_str()) == Some("age")
+                                    {
+                                        if let Ok(content) = fs::read_to_string(&key_path) {
+                                            if let Ok(key) =
+                                                crypto::unwrap_master_key(&content, &identities)
+                                            {
+                                                master_key_opt = Some(key);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if master_key_opt.is_none() {
+                        return Err(anyhow!(
+                            "File '{}' is encrypted with git-agecrypt, but repository is locked and no valid identity was found.\n\
+                             Run 'git-agecrypt unlock' first or provide an unlocked identity.",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+
+            let master_key = master_key_opt.as_ref().unwrap();
+            let id = age::x25519::Identity::from_str(master_key)
+                .map_err(|e| anyhow!("Invalid master key identity: {e}"))?;
+            let decryptor = age::Decryptor::new(&bytes[..]).map_err(|e| {
+                anyhow!(
+                    "Failed to parse age ciphertext for '{}': {e}",
+                    path.display()
+                )
+            })?;
+            let mut reader = decryptor
+                .decrypt(std::iter::once(&id as &dyn age::Identity))
+                .map_err(|e| anyhow!("Failed to decrypt secret file '{}': {e}", path.display()))?;
+            let mut decrypted_str = String::new();
+            reader.read_to_string(&mut decrypted_str)?;
+            decrypted_str
+        } else {
+            String::from_utf8(bytes)
+                .with_context(|| format!("File '{}' is not valid UTF-8 text", path.display()))?
+        };
+
+        for line in plaintext.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+                continue;
+            }
+            let candidate = if let Some(stripped) = trimmed.strip_prefix("export ") {
+                stripped.trim()
+            } else {
+                trimmed
+            };
+            if let Some((k, v)) = candidate.split_once('=') {
+                let k = k.trim().to_string();
+                let mut v = v.trim().to_string();
+                if ((v.starts_with('"') && v.ends_with('"'))
+                    || (v.starts_with('\'') && v.ends_with('\'')))
+                    && v.len() >= 2
+                {
+                    v = v[1..v.len() - 1].to_string();
+                }
+                if !k.is_empty() {
+                    env_vars.insert(k, v);
+                }
+            }
+        }
+    }
+
+    let mut child = process::Command::new(&command[0]);
+    child.args(&command[1..]);
+    for (k, v) in env_vars {
+        child.env(k, v);
+    }
+
+    let status = child
+        .status()
+        .with_context(|| format!("Failed to execute command '{}'", &command[0]))?;
+    process::exit(status.code().unwrap_or(1));
 }

@@ -390,16 +390,6 @@ impl GitRepo {
         Ok(())
     }
 
-    /// Removes local master key, locking the repository.
-    #[allow(dead_code)]
-    pub fn lock(&self) -> Result<()> {
-        let key_file = self.local_master_key_file();
-        if key_file.exists() {
-            fs::remove_file(key_file)?;
-        }
-        Ok(())
-    }
-
     /// Checks for and resolves any dangling or interrupted lock transactions on startup.
     ///
     /// If repo.key.locking exists:

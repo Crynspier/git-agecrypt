@@ -1,6 +1,6 @@
 # git-agecrypt
 
-Transparent client-side Git encryption using [age](https://age-encryption.org/v1) and SSH keys.
+Transparent client-side Git encryption using [age](https://age-encryption.org/v1), SSH keys, and hardware tokens.
 
 [![CI](https://github.com/Crynspier/git-agecrypt/actions/workflows/ci.yml/badge.svg)](https://github.com/Crynspier/git-agecrypt/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
@@ -12,7 +12,7 @@ Transparent client-side Git encryption using [age](https://age-encryption.org/v1
 
 Files remain unencrypted cleartext in your local working directory so your editor, linters, and compiler can access them normally. When files are committed or pushed to a remote repository, they are automatically encrypted into authenticated `age` ciphertexts. Collaborators without an enrolled private key see only encrypted data.
 
-It is designed as a modern replacement for `git-crypt`, substituting GPG and OpenSSL dependencies with the `age` format (X25519, ChaCha20-Poly1305) and standard SSH Ed25519 or RSA keys.
+It is designed as a modern replacement for `git-crypt`, substituting GPG and OpenSSL dependencies with the `age` format (X25519, ChaCha20-Poly1305), standard SSH Ed25519 or RSA keys, and native Age hardware plugins (YubiKey, Apple Secure Enclave, TPM).
 
 ---
 
@@ -55,7 +55,7 @@ Working Tree                 Git Index & Staging              Remote (GitHub, et
 `git-agecrypt` uses a two-tier key envelope:
 
 1. **Repository Master Key:** A 256-bit symmetric key that encrypts all secret files in the repository.
-2. **Recipient Envelopes (`.git-agecrypt/keys/<name>.age`):** The master key is encrypted individually for each authorized team member using their SSH public key (`~/.ssh/id_ed25519.pub`, `~/.ssh/id_rsa.pub`) or native `age` identity.
+2. **Recipient Envelopes (`.git-agecrypt/keys/<name>.age`):** The master key is encrypted individually for each authorized team member using their SSH public key (`~/.ssh/id_ed25519.pub`, `~/.ssh/id_rsa.pub`), native `age` identity, or hardware token recipient.
 
 When a team member rotates the master key via `git-agecrypt rekey`, collaborators re-synchronize transparently on `git pull` using their local SSH identity.
 
@@ -63,10 +63,14 @@ When a team member rotates the master key via `git-agecrypt rekey`, collaborator
 
 ## Features
 
-- **No GPG required:** Uses standard SSH keys (`~/.ssh/id_ed25519`, `~/.ssh/id_rsa`) or native `age` keys. No GPG daemon, keyrings, or pinentry prompts.
-- **GitHub user key enrollment:** Add team members directly by GitHub username (`git-agecrypt add-recipient --github <user>`).
+- **No GPG required:** Uses standard SSH keys (`~/.ssh/id_ed25519`, `~/.ssh/id_rsa`), native `age` keys, or hardware tokens via Age plugins. No GPG daemon, keyrings, or pinentry prompts.
+- **Hardware token & Age plugin support:** Seamlessly enroll YubiKeys (`age-plugin-yubikey`), Apple Secure Enclave (`age-plugin-se`), and TPM tokens (`age-plugin-tpm`) via standard Age plugin recipients (`age1yubikey1...`, `age1se1...`).
+- **Runtime secret injection:** Execute child commands with in-memory decrypted environment variables (`git-agecrypt run -- <cmd>`) without writing cleartext `.env` files to disk.
+- **In-memory clean fast-path:** Small secrets and config files (< 1 MiB) are spooled and encrypted entirely in RAM with zero temporary disk file I/O. Memory buffers are cryptographically zeroized on drop.
+- **Zero memory bloat on large files ($O(1)$ RAM):** Streams larger than 1 MiB automatically spill to disk, processing files in 64 KiB chunks; multi-gigabyte archives or database dumps never exhaust system memory.
 - **Deterministic HMAC ciphertext cache:** Prevents phantom `git diff` churn caused by random encryption nonces, using keyed HMAC-SHA256 digests over plaintext payloads.
-- **Zero memory bloat ($O(1)$ RAM):** Streaming architecture processes files in 64 KiB chunks; large archives and database dumps never buffer entirely in memory.
+- **Semantic merge conflict detection:** 3-way merge driver detects conflicting duplicate key definitions on concurrent branch edits to `.env` and configuration files and emits actionable warnings.
+- **GitHub user key enrollment:** Add team members directly by GitHub username (`git-agecrypt add-recipient --github <user>`).
 - **Safe locked clones:** Cloning without a configured key succeeds cleanly (exit code 0). Files remain encrypted on disk until unlocked.
 - **Transactional lock with WAL:** `git-agecrypt lock` re-smudges files on disk to encrypted ciphertext with write-ahead logging, guaranteeing recovery if interrupted.
 - **Automated 3-way merge driver:** Decrypts conflicting branches, performs line-based 3-way merging, re-encrypts the result, and protects binary secrets from corruption.
@@ -83,13 +87,13 @@ When a team member rotates the master key via `git-agecrypt rekey`, collaborator
 
 | Aspect | `git-agecrypt` | `git-crypt` | Mozilla `sops` |
 |---|---|---|---|
-| **Working Tree State** | Transparent cleartext on disk | Transparent cleartext on disk | Encrypted on disk (manual CLI edit) |
+| **Working Tree State** | Transparent cleartext or ephemeral runtime injection (`git-agecrypt run`) | Transparent cleartext on disk | Encrypted on disk (manual CLI edit) |
 | **Cryptography** | `age` (X25519, ChaCha20-Poly1305) | GPG (OpenPGP) / AES-CTR | Age, PGP, AWS KMS, GCP KMS, Vault |
-| **Identity Mechanism** | SSH keys (`id_ed25519`) or Age | GPG keyring / Symmetric key | Cloud KMS or GPG/Age |
+| **Identity Mechanism** | SSH keys (`id_ed25519`), Age keys, or Age plugins (YubiKey, Apple SE, TPM) | GPG keyring / Symmetric key | Cloud KMS or GPG/Age |
 | **Nonce Handling** | Keyed HMAC cache (zero phantom diffs) | Deterministic IV (from SHA-1 HMAC) | N/A (whole file encryption) |
 | **Locked Clone Behavior** | Passes ciphertext through (exit 0) | Fails checkout (exit 128) | N/A |
-| **Binary Dependencies** | Pure Rust static binary (~4.5 MB) | C++ linking OpenSSL | Go binary |
-| **3-Way Merge Driver** | Built-in | None (manual conflict resolution) | None |
+| **Binary Dependencies** | Pure Rust static binary (~4.8 MB) | C++ linking OpenSSL | Go binary |
+| **3-Way Merge Driver** | Built-in (with semantic conflict warnings) | None (manual conflict resolution) | None |
 
 ---
 
@@ -179,6 +183,9 @@ git-agecrypt add-recipient --github octocat --name octocat
 # From a key string
 git-agecrypt add-recipient -i "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..." --name bob
 
+# Hardware token recipient via Age plugin (e.g. YubiKey or Apple Secure Enclave)
+git-agecrypt add-recipient -i "age1yubikey1..." --name yubikey-alice
+
 # List enrolled recipients
 git-agecrypt list-recipients
 ```
@@ -242,7 +249,24 @@ git-agecrypt lock
 
 Files on disk are replaced with their encrypted `.age` ciphertexts, and cached credentials in `.git/` are cleared.
 
-### 6. Offboarding and Key Rotation
+### 6. Ephemeral Runtime Secret Injection (`run`)
+
+To execute applications or tests without keeping unencrypted secrets on disk, use `git-agecrypt run`:
+
+```bash
+# Decrypt repository .env in memory and inject into child process environment
+git-agecrypt run -- cargo run
+
+# Run a server or script with specific encrypted env file
+git-agecrypt run -e production.secret.env -- node server.js
+
+# Run automated tests with injected environment secrets
+git-agecrypt run -- npm test
+```
+
+Secrets are decrypted entirely in RAM, injected into the child process environment, and immediately zeroized upon exit without creating temporary cleartext files on disk.
+
+### 7. Offboarding and Key Rotation
 
 When a collaborator leaves:
 
@@ -261,7 +285,7 @@ git push
 
 The offboarded developer cannot decrypt any subsequent commits.
 
-### 7. Resolving Historical Branches (`rewrap`)
+### 8. Resolving Historical Branches (`rewrap`)
 
 When cherry-picking or merging an older commit created under a previous master key:
 
@@ -349,6 +373,7 @@ git commit -m "Migrate from git-crypt to git-agecrypt"
 | `smudge` | `[PATH]` | Git smudge filter (streams stdin ciphertext to stdout plaintext). |
 | `textconv` | `<PATH>` | Git diff driver (decrypts target for cleartext diffs). |
 | `merge` | `<O> <A> <B> [L] [P]` | Git 3-way merge driver. |
+| `run` | `[-e, --env-file <PATH>] -- <COMMAND>...` | Execute child process with in-memory decrypted secrets injected into environment variables. |
 | `migrate-from-git-crypt` | `-i, --identity <KEY>` | Convert an existing git-crypt repository. |
 
 ---

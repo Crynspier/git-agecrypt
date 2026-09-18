@@ -26,7 +26,7 @@ It is designed as a modern replacement for `git-crypt`, substituting GPG and Ope
 - [CI / CD Integration](#ci--cd-integration)
 - [Migration from git-crypt](#migration-from-git-crypt)
 - [CLI Reference](#cli-reference)
-- [Security Model & Caveats](#security-model)
+- [Documentation & Deep Dives](#documentation--deep-dives)
 - [Minimum Supported Versions](#minimum-supported-versions)
 - [License](#license)
 
@@ -378,73 +378,15 @@ git commit -m "Migrate from git-crypt to git-agecrypt"
 
 ---
 
-## Security Model
+## Documentation & Deep Dives
 
-### Cryptographic Foundation
+Comprehensive specifications and architecture guides are available in the [`docs/`](docs/) directory:
 
-- **Payload Encryption:** ChaCha20-Poly1305 AEAD (RFC 8439) in 64 KiB streaming chunks.
-- **Key Exchange:** X25519 ECDH (RFC 7748) and Ed25519-to-X25519 point conversion (RFC 8032).
-- **Deterministic Ciphertext Caching:** Cache lookup keys are derived using `HMAC-SHA256(master_key, plaintext)`. The cache key cannot be precomputed without the master key, protecting low-entropy secrets from dictionary or rainbow-table attacks.
-- **Payload Authentication:** Any bit manipulation of ciphertext headers or chunks fails Poly1305 AEAD authentication immediately, preventing silent corruption.
-- **Partial Hunk Staging:** `git add -p` is blocked by safeguard hooks because Git's interactive hunk applier bypasses clean filter drivers.
-- **POSIX State Directory Permissions:** State directories (`.git/git-agecrypt/`), lock journals, and master key files are enforced with strict POSIX permissions (`0o700` for directories, `0o600` for files on Unix) to prevent unauthorized read access by other local users on shared systems.
-- **Git Object Database Invariant:** Git filter pipelines ingest files directly via clean drivers, ensuring that plaintext secrets never touch loose object files or packed packfiles inside `.git/objects/`, even across complex operations like `git stash`, `git rebase`, or `git commit --amend`.
-- **Local Context Exposure Mitigation:** Local LLM agents and IDE context indexers operate directly on the unencrypted working tree. Synchronizing `.cursorignore`, `.claudeignore`, `.aiderignore`, and `.aiignore` against active `.gitattributes` guarantees that transparently smudged secrets are excluded from workspace indexing and automated prompt context windows.
-- **Pre-Commit Heuristic Guard:** Safeguard hooks inspect all staged index entries against known credential filename patterns and private key headers (`-----BEGIN ... PRIVATE KEY-----`, AWS client keys), preventing unconfigured or untracked plaintext secrets from slipping past Git filters.
+- **[Security Model & Threat Analysis](docs/security-model.md):**
+  Detailed threat model, cryptographic primitives (ChaCha20-Poly1305, X25519, HMAC caching), POSIX permissions (`0o700`/`0o600`), crash durability (`sync_all`), Merkle DAG forward-secrecy vs historical revocation, runtime secret injection boundaries, and enterprise server-side `pre-receive` hook enforcement.
 
-### Threat Model: Ephemeral Runtime Secret Injection (`run`)
-
-The `git-agecrypt run` command decrypts secret environment files entirely in memory and injects them directly into child process environment variables without writing cleartext files to disk.
-
-When deploying or executing commands with `run`, keep the operating system's process boundary in mind:
-- **Process Memory & `/proc` Visibility:** On Linux, any process running under the same user ID (UID) or possessing `PTRACE_MODE_READ` capabilities can inspect `/proc/<pid>/environ`. In multi-tenant server environments, run sensitive processes under isolated service accounts.
-- **Child Process Environment Forwarding:** Environment variables are inherited by child processes spawned by the target command. Ensure downstream scripts, verbose build tools, or test runners do not echo environment variables to public CI/CD logs.
-- **Crash Dumps:** In high-security environments, prevent unencrypted secrets from being included in core dump files on unexpected crashes by setting `ulimit -c 0` or configuring kernel dump restrictions (`fs.suid_dumpable = 0`).
-- **Cryptographic Memory Erasure:** All in-memory plaintext buffers used by `git-agecrypt` are automatically wiped using `zeroize` upon completion.
-
-### Caveats & Inherited Risks
-
-Like all repository-level transparent encryption systems (including `git-crypt`), `git-agecrypt` operates within Git's architecture and carries specific inherited trade-offs:
-
-1. **Git Metadata is Unencrypted:**
-   Git stores commit logs, authors, timestamps, filenames, and directory trees in the clear. An unauthorized party with read access to the remote repository can see which secret files exist, when they were modified, and their approximate file size (within Age's 64 KiB chunk boundary). For strict regulatory environments where file paths or metadata must remain confidential, dedicated secret managers (such as HashiCorp Vault or AWS Secrets Manager) or envelope tools like Mozilla `sops` are recommended.
-
-2. **Client-Side Filter Reliance:**
-   Transparent Git filters execute on developers' local machines. If a developer runs `git commit --no-verify`, client-side pre-commit hooks are bypassed. If a developer clones a repository on a machine lacking `git-agecrypt` and stages a secret file, unencrypted files could theoretically be committed.
-
-### Server-Side Enforcement (Enterprise Guard)
-
-To eliminate client-side filter reliance across team environments, configure a server-side `pre-receive` hook (or repository push rule) on your Git host (GitHub Enterprise, GitLab, Gitea, or bare Git servers). This guarantees that any push containing an unencrypted secret is rejected by the server, regardless of client configuration:
-
-```bash
-#!/usr/bin/env bash
-# Server-side pre-receive hook: rejects pushes containing unencrypted secrets
-set -euo pipefail
-
-while read -r oldrev newrev refname; do
-    if [ "$newrev" = "0000000000000000000000000000000000000000" ]; then
-        continue # Branch deletion
-    fi
-
-    revs=$([ "$oldrev" = "0000000000000000000000000000000000000000" ] && echo "$newrev" || echo "$oldrev..$newrev")
-
-    for commit in $(git rev-list "$revs"); do
-        for path in $(git diff-tree -r --name-only --no-commit-id "$commit"); do
-            if git check-attr filter -- "$path" | grep -q 'filter: agecrypt'; then
-                header=$(git cat-file -p "$commit:$path" | head -n 1 || true)
-                if [[ ! "$header" =~ ^age-encryption\.org/v1 ]]; then
-                    echo "===============================================================" >&2
-                    echo "PUSH REJECTED BY SERVER PRE-RECEIVE HOOK" >&2
-                    echo "Commit $commit contains UNENCRYPTED secret: $path" >&2
-                    echo "Please configure git-agecrypt locally and re-commit." >&2
-                    echo "===============================================================" >&2
-                    exit 1
-                fi
-            fi
-        done
-    done
-done
-```
+- **[Internal Architecture & Driver Mechanics](docs/internals.md):**
+  In-depth breakdown of the Git filter lifecycle (`clean`, `smudge`, `textconv`, `merge`), two-tier spooling architecture (RAM < 1 MiB with `zeroize`, disk >= 1 MiB inside `.git/git-agecrypt/spool/`), stage-0 index deduplication, cache validation, and the 3-way semantic merge driver conflict algorithms.
 
 ---
 

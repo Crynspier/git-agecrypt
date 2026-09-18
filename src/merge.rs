@@ -142,9 +142,30 @@ pub fn run_3way_merge(
         fs::write(temp_ours.path(), lf_bytes.as_slice())?;
     }
 
-    // 4. Semantic conflict inspection on key-value / .env files
-    if exit_code == 0 {
+    // 4. Determine final merge status:
+    // A false merge is worse than a visible conflict.
+    // If git merge-file encountered conflicts OR conflict markers were introduced,
+    // force a visible conflict (exit code >= 1).
+    let base_has_markers = contains_conflict_markers(&base_bytes);
+    let merged_has_markers = contains_conflict_markers(&lf_bytes);
+
+    let final_exit_code = if exit_code != 0 {
+        exit_code
+    } else if merged_has_markers && !base_has_markers {
+        eprintln!(
+            "git-agecrypt merge [CONFLICT]: Unresolved conflict markers detected in '{file_path}'. Forcing merge conflict."
+        );
+        1
+    } else {
+        0
+    };
+
+    if final_exit_code == 0 {
         check_semantic_conflicts(&lf_bytes, file_path);
+    } else {
+        eprintln!(
+            "git-agecrypt merge [CONFLICT]: Visible merge conflict in '{file_path}' (exit code {final_exit_code})."
+        );
     }
 
     // 5. Re-encrypt the merged result in temp_ours atomically into the target `ours` (%A)
@@ -202,6 +223,9 @@ pub fn run_3way_merge(
             None
         };
 
+        // Ensure disk flush before atomic rename
+        let _ = temp_target.as_file().sync_all();
+
         // Atomically replace `ours` with retry for antivirus software on Windows
         let mut to_persist = temp_target;
         let mut replaced = false;
@@ -232,7 +256,30 @@ pub fn run_3way_merge(
         }
     }
 
-    Ok(exit_code)
+    Ok(final_exit_code)
+}
+
+/// Checks whether a byte buffer contains standard Git 3-way conflict markers.
+pub fn contains_conflict_markers(content: &[u8]) -> bool {
+    let lines = content.split(|&b| b == b'\n');
+    let mut has_start = false;
+    let mut has_sep = false;
+    let mut has_end = false;
+    for line in lines {
+        let trimmed = if line.ends_with(b"\r") {
+            &line[..line.len() - 1]
+        } else {
+            line
+        };
+        if trimmed.starts_with(b"<<<<<<< ") {
+            has_start = true;
+        } else if trimmed == b"=======" {
+            has_sep = true;
+        } else if trimmed.starts_with(b">>>>>>> ") {
+            has_end = true;
+        }
+    }
+    has_start && has_sep && has_end
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -329,6 +376,20 @@ mod tests {
         // Non-key-val file is skipped
         let ignored = find_semantic_conflicts(content, "data.json");
         assert!(ignored.is_empty());
+    }
+
+    #[test]
+    fn test_contains_conflict_markers() {
+        let clean = b"KEY1=val1\nKEY2=val2\n";
+        assert!(!contains_conflict_markers(clean));
+
+        let conflict =
+            b"<<<<<<< HEAD (ours)\nKEY1=val1\n=======\nKEY1=val2\n>>>>>>> incoming (theirs)\n";
+        assert!(contains_conflict_markers(conflict));
+
+        // Incomplete markers (missing separator or closing) should not trigger
+        let incomplete = b"<<<<<<< HEAD (ours)\nKEY1=val1\n";
+        assert!(!contains_conflict_markers(incomplete));
     }
 
     proptest::proptest! {

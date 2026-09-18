@@ -46,6 +46,21 @@ fn git_out(repo: &Path, args: &[&str]) -> Vec<u8> {
     output.stdout
 }
 
+fn run_git_output(repo: &Path, args: &[&str]) -> std::process::Output {
+    let bin_dir = assert_cmd::cargo::cargo_bin("git-agecrypt")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let new_path = prepend_to_path(&bin_dir);
+
+    Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .env("PATH", &new_path)
+        .output()
+        .expect("Failed to execute git command")
+}
+
 #[test]
 fn test_git_agecrypt_init_and_transparent_encryption() {
     let temp = tempdir().expect("Failed to create tempdir");
@@ -6008,4 +6023,281 @@ fn test_hardware_plugin_missing_fails_closed() {
         .arg("non_existent_key_stub.key")
         .assert()
         .failure();
+}
+
+#[test]
+fn test_exact_boundary_file_sizes() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Boundary Tester"]);
+    run_git(repo, &["config", "user.email", "boundary@example.com"]);
+
+    let mut init_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    init_cmd.current_dir(repo).arg("init").assert().success();
+
+    let boundary_sizes = [
+        0,         // Empty file
+        65_535,    // 64 KiB - 1
+        65_536,    // 64 KiB exact chunk boundary
+        65_537,    // 64 KiB + 1
+        1_048_575, // 1 MiB - 1
+        1_048_576, // 1 MiB exact spool threshold
+        1_048_577, // 1 MiB + 1 (spills to disk buffer)
+    ];
+
+    for (idx, &size) in boundary_sizes.iter().enumerate() {
+        let file_name = format!("boundary_{idx}_{size}.secret.env");
+        let file_path = repo.join(&file_name);
+        let mut payload = vec![0u8; size];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = ((i * 31 + 7) % 256) as u8;
+        }
+        fs::write(&file_path, &payload).unwrap();
+
+        run_git(repo, &["add", &file_name]);
+        run_git(
+            repo,
+            &["commit", "-m", &format!("Commit boundary size {size}")],
+        );
+
+        // Verify committed blob is encrypted
+        let blob = git_out(repo, &["cat-file", "-p", &format!("HEAD:{file_name}")]);
+        if size > 0 {
+            assert!(blob.starts_with(b"age-encryption.org/v1\n"));
+        }
+
+        // Verify working tree file matches original bytes exactly
+        let disk_data = fs::read(&file_path).unwrap();
+        assert_eq!(disk_data.len(), size);
+        assert_eq!(disk_data, payload);
+    }
+}
+
+#[test]
+fn test_cache_hit_corruption_fallback() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Cache Tester"]);
+    run_git(repo, &["config", "user.email", "cache@example.com"]);
+
+    let mut init_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    init_cmd.current_dir(repo).arg("init").assert().success();
+
+    let secret_file = repo.join("test.secret.env");
+    fs::write(&secret_file, "API_KEY=valid_secret_data_123\n").unwrap();
+    run_git(repo, &["add", "test.secret.env"]);
+
+    // Find the generated cache file in .git/git-agecrypt/cache/
+    let base_cache = repo.join(".git").join("git-agecrypt").join("cache");
+    assert!(base_cache.exists());
+
+    // Corrupt all cache files (truncate to 0 bytes or write junk)
+    for entry in fs::read_dir(&base_cache).unwrap().flatten() {
+        if entry.path().is_dir() {
+            for cache_entry in fs::read_dir(entry.path()).unwrap().flatten() {
+                if cache_entry.path().extension().and_then(|s| s.to_str()) == Some("age") {
+                    // Overwrite with corrupted non-age junk
+                    fs::write(cache_entry.path(), b"corrupted_garbage_not_age").unwrap();
+                }
+            }
+        }
+    }
+
+    // Modify file and stage again
+    fs::write(&secret_file, "API_KEY=valid_secret_data_123\n").unwrap();
+    run_git(repo, &["add", "test.secret.env"]);
+
+    // Verify blob in git is STILL valid age ciphertext and NOT the corrupted cache junk!
+    let blob = git_out(repo, &["cat-file", "-p", ":0:test.secret.env"]);
+    assert!(blob.starts_with(b"age-encryption.org/v1\n"));
+    assert!(!blob.starts_with(b"corrupted_garbage"));
+}
+
+#[test]
+fn test_merge_driver_rejects_unresolved_conflict_markers() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Merge Tester"]);
+    run_git(repo, &["config", "user.email", "merge@example.com"]);
+
+    let mut init_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    init_cmd.current_dir(repo).arg("init").assert().success();
+
+    let base = repo.join("base.txt");
+    let ours = repo.join("ours.txt");
+    let theirs = repo.join("theirs.txt");
+
+    fs::write(&base, "PORT=3000\n").unwrap();
+    let initial_ours = "PORT=8080\n";
+    fs::write(&ours, initial_ours).unwrap();
+    fs::write(&theirs, "PORT=9090\n").unwrap();
+
+    let mut merge_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    merge_cmd
+        .current_dir(repo)
+        .args([
+            "merge",
+            base.to_str().unwrap(),
+            ours.to_str().unwrap(),
+            theirs.to_str().unwrap(),
+            "7",
+            "ours.txt",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Visible merge conflict"));
+
+    // Verify ours was encrypted with the visible conflict markers and exit code was strictly non-zero
+    let merged_bytes = fs::read(&ours).unwrap();
+    assert!(merged_bytes.starts_with(b"age-encryption.org/v1\n"));
+}
+
+#[test]
+fn test_check_blocks_corrupted_staged_ciphertext() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Patch Tester"]);
+    run_git(repo, &["config", "user.email", "patch@example.com"]);
+
+    let mut init_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    init_cmd.current_dir(repo).arg("init").assert().success();
+
+    fs::write(
+        repo.join(".gitattributes"),
+        "*.secret.env filter=agecrypt diff=agecrypt merge=agecrypt -text\n",
+    )
+    .unwrap();
+
+    let secret_file = repo.join("creds.secret.env");
+    fs::write(&secret_file, "SECRET=v1\n").unwrap();
+    run_git(
+        repo,
+        &["add", ".gitattributes", ".git-agecrypt", "creds.secret.env"],
+    );
+    run_git(repo, &["commit", "-m", "Commit initial secret"]);
+
+    // Verify git add -p presents ciphertext hunks and NEVER exposes cleartext secrets in diff
+    let out = run_git_output(repo, &["add", "-p", "creds.secret.env"]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("SECRET=v1"),
+        "Git add -p must never display cleartext secret values: {combined}"
+    );
+
+    // Simulate corrupted Age header staged into Git index (e.g. from hunk patching or git apply --cached)
+    let bin_dir = assert_cmd::cargo::cargo_bin("git-agecrypt")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let new_path = prepend_to_path(&bin_dir);
+
+    let mut child = Command::new("git")
+        .args(["hash-object", "-w", "--stdin"])
+        .current_dir(repo)
+        .env("PATH", &new_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(b"age-encryption.org/v1\nCORRUPTED_HEADER_STAGED_FROM_PATCH\n")
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    // Update index directly with corrupted object
+    run_git(
+        repo,
+        &[
+            "update-index",
+            "--cacheinfo",
+            &format!("100644,{oid},creds.secret.env"),
+        ],
+    );
+
+    // Run git-agecrypt check: MUST strictly fail and abort commit due to corrupted age header!
+    let mut check_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    check_cmd
+        .current_dir(repo)
+        .arg("check")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("CORRUPTED AGE CIPHERTEXT STAGED"));
+}
+
+#[test]
+fn test_unmerged_index_stages_strictly_ciphertext() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init", "-b", "main"]);
+    run_git(repo, &["config", "user.name", "Conflict Tester"]);
+    run_git(repo, &["config", "user.email", "conflict@example.com"]);
+
+    let mut init_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    init_cmd.current_dir(repo).arg("init").assert().success();
+
+    let secret_file = repo.join("db.secret.env");
+    fs::write(&secret_file, "DB_PASS=base_secret_pass\n").unwrap();
+    run_git(
+        repo,
+        &["add", ".gitattributes", ".git-agecrypt", "db.secret.env"],
+    );
+    run_git(repo, &["commit", "-m", "Base commit"]);
+
+    // Create branch-a
+    run_git(repo, &["checkout", "-b", "branch-a"]);
+    fs::write(&secret_file, "DB_PASS=branch_a_secret_pass\n").unwrap();
+    run_git(repo, &["commit", "-am", "Branch A commit"]);
+
+    // Create branch-b from main
+    run_git(repo, &["checkout", "main"]);
+    run_git(repo, &["checkout", "-b", "branch-b"]);
+    fs::write(&secret_file, "DB_PASS=branch_b_secret_pass\n").unwrap();
+    run_git(repo, &["commit", "-am", "Branch B commit"]);
+
+    // Merge branch-a into branch-b: will produce an unmerged conflict
+    let _ = run_git_output(repo, &["merge", "branch-a"]);
+
+    // Query unmerged index stages (stages 1, 2, 3)
+    let ls_out = git_out(repo, &["ls-files", "-u", "-s"]);
+    let ls_str = String::from_utf8_lossy(&ls_out);
+
+    // Assert that we have stages 1, 2, and 3
+    assert!(ls_str.contains(" 1\tdb.secret.env"));
+    assert!(ls_str.contains(" 2\tdb.secret.env"));
+    assert!(ls_str.contains(" 3\tdb.secret.env"));
+
+    // Fetch blobs for stages 1, 2, 3 and verify all are authentic age ciphertext
+    for stage in 1..=3 {
+        let blob = git_out(
+            repo,
+            &["cat-file", "blob", &format!(":{stage}:db.secret.env")],
+        );
+        assert!(
+            blob.starts_with(b"age-encryption.org/v1\n"),
+            "Stage {stage} in Git index must be authentic Age ciphertext!"
+        );
+        // Verify canary cleartext is nowhere in the blob
+        let blob_str = String::from_utf8_lossy(&blob);
+        assert!(!blob_str.contains("base_secret_pass"));
+        assert!(!blob_str.contains("branch_a_secret_pass"));
+        assert!(!blob_str.contains("branch_b_secret_pass"));
+    }
 }

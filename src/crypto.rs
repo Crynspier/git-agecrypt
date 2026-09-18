@@ -483,12 +483,27 @@ fn encrypt_plaintext_stream<R: Read, W: Write>(
     if let (Some(c_dir), Some(hash_hex)) = (cache_dir, hash_hex_opt.as_ref()) {
         let cache_file = c_dir.join(format!("{hash_hex}.age"));
         if cache_file.exists() {
-            // Touch mtime on cache hit to maintain true LRU (Least Recently Used) ordering
-            let _ = filetime::set_file_mtime(&cache_file, filetime::FileTime::now());
-            let mut cached_reader = File::open(&cache_file)?;
-            io::copy(&mut cached_reader, &mut output)?;
-            output.flush()?;
-            return Ok(());
+            let is_valid = if let Ok(mut f) = File::open(&cache_file) {
+                let mut prefix = [0u8; AGE_HEADER_MAGIC.len()];
+                f.read_exact(&mut prefix).is_ok() && is_age_ciphertext(&prefix)
+            } else {
+                false
+            };
+
+            if is_valid {
+                // Touch mtime on cache hit to maintain true LRU (Least Recently Used) ordering
+                let _ = filetime::set_file_mtime(&cache_file, filetime::FileTime::now());
+                let mut cached_reader = File::open(&cache_file)?;
+                io::copy(&mut cached_reader, &mut output)?;
+                output.flush()?;
+                return Ok(());
+            } else {
+                // Corrupted or truncated cache entry: treat as cache miss and purge bad entry
+                eprintln!(
+                    "git-agecrypt clean [WARNING]: Corrupted or truncated cache entry detected ({hash_hex}.age). Purging and re-encrypting."
+                );
+                let _ = fs::remove_file(&cache_file);
+            }
         }
     }
 
@@ -529,12 +544,16 @@ fn encrypt_plaintext_stream<R: Read, W: Write>(
                     output.write_all(staged_bytes)?;
                     output.flush()?;
 
-                    // Repopulate local cache so subsequent checks are immediate
+                    // Repopulate local cache atomically so subsequent checks are immediate
                     if let Some(c_dir) = cache_dir {
                         let _ = fs::create_dir_all(c_dir);
                         let dest = c_dir.join(format!("{hash_hex}.age"));
-                        if !dest.exists() {
-                            let _ = fs::write(&dest, staged_bytes);
+                        if !dest.exists()
+                            && let Ok(mut tmp) = tempfile::NamedTempFile::new_in(c_dir)
+                            && tmp.write_all(staged_bytes).is_ok()
+                            && tmp.as_file().sync_all().is_ok()
+                        {
+                            let _ = tmp.persist(&dest);
                         }
                     }
                     return Ok(());
@@ -563,6 +582,9 @@ fn encrypt_plaintext_stream<R: Read, W: Write>(
             io::copy(&mut cache_read, &mut output)?;
             output.flush()?;
         }
+
+        // Guarantee physical media sync before atomic rename
+        let _ = cache_temp.as_file().sync_all();
 
         let dest = c_dir.join(format!("{hash_hex}.age"));
         if !dest.exists() {

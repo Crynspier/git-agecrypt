@@ -277,7 +277,20 @@ impl GitRepo {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700));
         }
+        let spool_dir = self.spool_dir();
+        fs::create_dir_all(&spool_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&spool_dir, fs::Permissions::from_mode(0o700));
+        }
         Ok(state_dir)
+    }
+
+    /// Path to local untracked temporary disk spool buffer directory (`.git/git-agecrypt/spool`).
+    pub fn spool_dir(&self) -> PathBuf {
+        let dir = self.local_state_dir().join("spool");
+        ensure_extended_path(&dir)
     }
 
     /// Path to local untracked master key (`repo.key`).
@@ -329,6 +342,7 @@ impl GitRepo {
             let mut file = File::create(&temp_path)?;
             file.write_all(secret_key.trim().as_bytes())?;
             file.flush()?;
+            file.sync_all()?;
 
             #[cfg(unix)]
             {
@@ -1538,6 +1552,7 @@ impl GitRepo {
 
         let mut leaked_files = Vec::new();
         let mut foreign_key_files = Vec::new();
+        let mut corrupted_files = Vec::new();
         let mut untracked_secret_files = Vec::new();
 
         let master_identity = if let Ok(Some(k)) = self.read_local_master_key() {
@@ -1565,12 +1580,18 @@ impl GitRepo {
                     if !is_age_ciphertext(prefix) {
                         leaked_files.push(path_str);
                     } else if let Some(ref id) = master_identity {
-                        // Forward-secrecy verification: verify staged ciphertext can be unwrapped with active master key!
-                        if let Ok(decryptor) = age::Decryptor::new(&header[..])
-                            && let Err(age::DecryptError::NoMatchingKeys) =
-                                decryptor.decrypt(std::iter::once(id as &dyn age::Identity))
-                        {
-                            foreign_key_files.push(path_str);
+                        // Forward-secrecy & integrity verification: verify staged ciphertext is valid and matches active master key!
+                        match age::Decryptor::new(&header[..]) {
+                            Ok(decryptor) => {
+                                if let Err(age::DecryptError::NoMatchingKeys) =
+                                    decryptor.decrypt(std::iter::once(id as &dyn age::Identity))
+                                {
+                                    foreign_key_files.push(path_str);
+                                }
+                            }
+                            Err(err) => {
+                                corrupted_files.push((path_str, err.to_string()));
+                            }
                         }
                     }
                 }
@@ -1720,6 +1741,33 @@ impl GitRepo {
             );
             return Err(anyhow!(
                 "Commit aborted: staged blob encrypted with revoked/foreign key"
+            ));
+        }
+
+        if !corrupted_files.is_empty() {
+            eprintln!();
+            eprintln!(
+                "================================================================================"
+            );
+            eprintln!("  CRITICAL SECURITY ALERT: CORRUPTED AGE CIPHERTEXT STAGED IN GIT INDEX!");
+            eprintln!(
+                "================================================================================"
+            );
+            eprintln!("The following staged secret(s) contain corrupted or malformed age headers:");
+            for (f, err) in &corrupted_files {
+                eprintln!("  - {f}: {err}");
+            }
+            eprintln!();
+            eprintln!(
+                "This typically occurs if 'git add -p' was used, or if binary ciphertext was patched."
+            );
+            eprintln!("To fix:");
+            eprintln!("  git reset HEAD <files> && git add <files>");
+            eprintln!(
+                "================================================================================"
+            );
+            return Err(anyhow!(
+                "Commit aborted: corrupted age ciphertext in git index"
             ));
         }
 

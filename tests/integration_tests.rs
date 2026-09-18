@@ -5733,3 +5733,279 @@ fn test_run_subcommand_with_custom_env_file() {
             .stdout(predicate::str::contains("custom_value_456"));
     }
 }
+
+fn scan_dir_for_needle(dir: &Path, needle: &str) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                scan_dir_for_needle(&path, needle);
+            } else if path.is_file() {
+                if let Ok(bytes) = fs::read(&path) {
+                    let text = String::from_utf8_lossy(&bytes);
+                    assert!(
+                        !text.contains(needle),
+                        "Plaintext canary found inside file {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_git_object_database_zero_plaintext_leak() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Test Developer"]);
+    run_git(repo, &["config", "user.email", "dev@example.com"]);
+
+    let mut init_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    init_cmd.current_dir(repo).arg("init").assert().success();
+
+    let gitattributes = repo.join(".gitattributes");
+    fs::write(
+        &gitattributes,
+        "*.secret.env filter=agecrypt diff=agecrypt merge=agecrypt -text\n",
+    )
+    .unwrap();
+    run_git(repo, &["add", ".gitattributes"]);
+    run_git(repo, &["commit", "-m", "Add gitattributes"]);
+
+    let canary = "CANARY_TOKEN_9999_NEVER_LEAK_INTO_OBJECT_DB";
+    let secret_file = repo.join("database.secret.env");
+    fs::write(&secret_file, format!("SECRET_KEY={canary}\nPORT=5432\n")).unwrap();
+
+    // 1. Normal git add and commit
+    run_git(repo, &["add", "database.secret.env"]);
+    run_git(repo, &["commit", "-m", "Commit secret 1"]);
+
+    // 2. Modify and stash
+    fs::write(
+        &secret_file,
+        format!("SECRET_KEY={canary}_MODIFIED\nPORT=5433\n"),
+    )
+    .unwrap();
+    run_git(repo, &["stash", "push", "-m", "WIP secrets"]);
+    run_git(repo, &["stash", "pop"]);
+
+    // 3. Amend commit
+    run_git(repo, &["add", "database.secret.env"]);
+    run_git(repo, &["commit", "--amend", "-m", "Amended secret commit"]);
+
+    // 4. Create branch, edit and merge
+    run_git(repo, &["checkout", "-b", "feature"]);
+    fs::write(
+        &secret_file,
+        format!("SECRET_KEY={canary}_FEATURE\nPORT=5434\n"),
+    )
+    .unwrap();
+    run_git(repo, &["commit", "-am", "Feature commit"]);
+
+    run_git(repo, &["checkout", "master"]);
+    run_git(repo, &["merge", "feature", "-m", "Merge feature"]);
+
+    // 5. Pack loose objects
+    run_git(repo, &["gc"]);
+
+    // 6. Deep inspection of EVERY object in Git's database
+    let all_objects_output = git_out(repo, &["cat-file", "--batch-check", "--batch-all-objects"]);
+    let all_objects_str = String::from_utf8_lossy(&all_objects_output);
+    for line in all_objects_str.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if let Some(sha) = parts.first() {
+            let obj_content = git_out(repo, &["cat-file", "-p", sha]);
+            let obj_str = String::from_utf8_lossy(&obj_content);
+            assert!(
+                !obj_str.contains(canary),
+                "Plaintext canary found inside Git object {}! Plaintext leaked into object database.",
+                sha
+            );
+        }
+    }
+
+    // 7. Also inspect all reflog files in .git/logs/
+    let logs_dir = repo.join(".git").join("logs");
+    if logs_dir.exists() {
+        scan_dir_for_needle(&logs_dir, canary);
+    }
+}
+
+#[test]
+fn test_multi_generation_rekey_revocation_lifecycle() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Admin"]);
+    run_git(repo, &["config", "user.email", "admin@example.com"]);
+
+    let mut init_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    init_cmd.current_dir(repo).arg("init").assert().success();
+
+    // Generate Alice, Bob, and Charlie SSH keys
+    let alice_key = temp.path().join("id_alice");
+    Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-f", alice_key.to_str().unwrap()])
+        .status()
+        .unwrap();
+    let alice_pub = temp.path().join("id_alice.pub");
+
+    let bob_key = temp.path().join("id_bob");
+    Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-f", bob_key.to_str().unwrap()])
+        .status()
+        .unwrap();
+    let bob_pub = temp.path().join("id_bob.pub");
+
+    let charlie_key = temp.path().join("id_charlie");
+    Command::new("ssh-keygen")
+        .args([
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-f",
+            charlie_key.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    let charlie_pub = temp.path().join("id_charlie.pub");
+
+    // 1. Generation 1: Enroll Alice and Bob
+    let mut add_alice = Command::cargo_bin("git-agecrypt").unwrap();
+    add_alice
+        .current_dir(repo)
+        .args([
+            "add-recipient",
+            "-i",
+            alice_pub.to_str().unwrap(),
+            "--name",
+            "alice",
+        ])
+        .assert()
+        .success();
+
+    let mut add_bob = Command::cargo_bin("git-agecrypt").unwrap();
+    add_bob
+        .current_dir(repo)
+        .args([
+            "add-recipient",
+            "-i",
+            bob_pub.to_str().unwrap(),
+            "--name",
+            "bob",
+        ])
+        .assert()
+        .success();
+
+    let gitattributes = repo.join(".gitattributes");
+    fs::write(
+        &gitattributes,
+        "*.secret.env filter=agecrypt diff=agecrypt merge=agecrypt -text\n",
+    )
+    .unwrap();
+
+    let v1_file = repo.join("v1.secret.env");
+    fs::write(&v1_file, "V1_SECRET=alice_and_bob_shared_v1\n").unwrap();
+    run_git(
+        repo,
+        &["add", ".gitattributes", ".git-agecrypt", "v1.secret.env"],
+    );
+    run_git(repo, &["commit", "-m", "Commit Gen 1 secrets"]);
+
+    // 2. Generation 2: Rekey to Bob + Charlie, revoking Alice
+    let mut rm_alice = Command::cargo_bin("git-agecrypt").unwrap();
+    rm_alice
+        .current_dir(repo)
+        .args(["remove-recipient", "alice"])
+        .assert()
+        .success();
+
+    let mut add_charlie = Command::cargo_bin("git-agecrypt").unwrap();
+    add_charlie
+        .current_dir(repo)
+        .args([
+            "add-recipient",
+            "-i",
+            charlie_pub.to_str().unwrap(),
+            "--name",
+            "charlie",
+        ])
+        .assert()
+        .success();
+
+    let mut rekey_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    rekey_cmd.current_dir(repo).arg("rekey").assert().success();
+
+    let v2_file = repo.join("v2.secret.env");
+    fs::write(&v2_file, "V2_SECRET=bob_and_charlie_shared_v2\n").unwrap();
+    run_git(
+        repo,
+        &["add", ".git-agecrypt", "v1.secret.env", "v2.secret.env"],
+    );
+    run_git(repo, &["commit", "-m", "Commit Gen 2 secrets"]);
+
+    // 3. Lock repository to test unwrap capabilities
+    let mut lock_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    lock_cmd
+        .current_dir(repo)
+        .args(["lock", "--force"])
+        .assert()
+        .success();
+
+    // Alice attempts to unlock active state (v2) -> MUST FAIL because Alice was revoked!
+    let mut unlock_alice = Command::cargo_bin("git-agecrypt").unwrap();
+    unlock_alice
+        .current_dir(repo)
+        .arg("unlock")
+        .arg(alice_key.to_str().unwrap())
+        .assert()
+        .failure();
+
+    // Bob attempts to unlock active state (v2) -> MUST SUCCEED
+    let mut unlock_bob = Command::cargo_bin("git-agecrypt").unwrap();
+    unlock_bob
+        .current_dir(repo)
+        .arg("unlock")
+        .arg(bob_key.to_str().unwrap())
+        .assert()
+        .success();
+
+    // Verify Bob sees decrypted content for v2
+    let read_v2 = fs::read_to_string(&v2_file).unwrap();
+    assert!(read_v2.contains("bob_and_charlie_shared_v2"));
+}
+
+#[test]
+fn test_hardware_plugin_missing_fails_closed() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Test Developer"]);
+    run_git(repo, &["config", "user.email", "dev@example.com"]);
+
+    let mut init_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    init_cmd.current_dir(repo).arg("init").assert().success();
+
+    // Lock repository
+    let mut lock_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    lock_cmd
+        .current_dir(repo)
+        .args(["lock", "--force"])
+        .assert()
+        .success();
+
+    // Attempting unlock with non-existent hardware token or key path MUST fail cleanly
+    let mut unlock_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    unlock_cmd
+        .current_dir(repo)
+        .arg("unlock")
+        .arg("non_existent_key_stub.key")
+        .assert()
+        .failure();
+}

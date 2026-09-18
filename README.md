@@ -387,8 +387,20 @@ git commit -m "Migrate from git-crypt to git-agecrypt"
 - **Deterministic Ciphertext Caching:** Cache lookup keys are derived using `HMAC-SHA256(master_key, plaintext)`. The cache key cannot be precomputed without the master key, protecting low-entropy secrets from dictionary or rainbow-table attacks.
 - **Payload Authentication:** Any bit manipulation of ciphertext headers or chunks fails Poly1305 AEAD authentication immediately, preventing silent corruption.
 - **Partial Hunk Staging:** `git add -p` is blocked by safeguard hooks because Git's interactive hunk applier bypasses clean filter drivers.
+- **POSIX State Directory Permissions:** State directories (`.git/git-agecrypt/`), lock journals, and master key files are enforced with strict POSIX permissions (`0o700` for directories, `0o600` for files on Unix) to prevent unauthorized read access by other local users on shared systems.
+- **Git Object Database Invariant:** Git filter pipelines ingest files directly via clean drivers, ensuring that plaintext secrets never touch loose object files or packed packfiles inside `.git/objects/`, even across complex operations like `git stash`, `git rebase`, or `git commit --amend`.
 - **Local Context Exposure Mitigation:** Local LLM agents and IDE context indexers operate directly on the unencrypted working tree. Synchronizing `.cursorignore`, `.claudeignore`, `.aiderignore`, and `.aiignore` against active `.gitattributes` guarantees that transparently smudged secrets are excluded from workspace indexing and automated prompt context windows.
 - **Pre-Commit Heuristic Guard:** Safeguard hooks inspect all staged index entries against known credential filename patterns and private key headers (`-----BEGIN ... PRIVATE KEY-----`, AWS client keys), preventing unconfigured or untracked plaintext secrets from slipping past Git filters.
+
+### Threat Model: Ephemeral Runtime Secret Injection (`run`)
+
+The `git-agecrypt run` command decrypts secret environment files entirely in memory and injects them directly into child process environment variables without writing cleartext files to disk.
+
+When deploying or executing commands with `run`, keep the operating system's process boundary in mind:
+- **Process Memory & `/proc` Visibility:** On Linux, any process running under the same user ID (UID) or possessing `PTRACE_MODE_READ` capabilities can inspect `/proc/<pid>/environ`. In multi-tenant server environments, run sensitive processes under isolated service accounts.
+- **Child Process Environment Forwarding:** Environment variables are inherited by child processes spawned by the target command. Ensure downstream scripts, verbose build tools, or test runners do not echo environment variables to public CI/CD logs.
+- **Crash Dumps:** In high-security environments, prevent unencrypted secrets from being included in core dump files on unexpected crashes by setting `ulimit -c 0` or configuring kernel dump restrictions (`fs.suid_dumpable = 0`).
+- **Cryptographic Memory Erasure:** All in-memory plaintext buffers used by `git-agecrypt` are automatically wiped using `zeroize` upon completion.
 
 ### Caveats & Inherited Risks
 

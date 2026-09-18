@@ -428,10 +428,20 @@ pub fn spool_stream<R: Read>(
         } else {
             let mut df = if let Some(c_dir) = cache_dir {
                 fs::create_dir_all(c_dir)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(c_dir, fs::Permissions::from_mode(0o700));
+                }
                 tempfile::NamedTempFile::new_in(c_dir)?
             } else {
                 tempfile::NamedTempFile::new()?
             };
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(df.path(), fs::Permissions::from_mode(0o600));
+            }
             df.write_all(&mem_buf)?;
             df.write_all(&buf[..n])?;
             mem_buf.clear();
@@ -1416,5 +1426,37 @@ mod tests {
             .read_to_end(&mut large_read_back)
             .unwrap();
         assert_eq!(large_read_back, large_data);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(32))]
+
+        #[test]
+        fn proptest_clean_and_smudge_roundtrip(data in proptest::collection::vec(proptest::num::u8::ANY, 0..16384)) {
+            let (identity, recipient) = generate_master_identity();
+            let mut ciphertext = Vec::new();
+            clean_stream(Cursor::new(&data), &mut ciphertext, &recipient, None, Some(&identity), None, None)
+                .expect("clean_stream must not fail on arbitrary bytes");
+
+            let mut decrypted = Vec::new();
+            smudge_stream(Cursor::new(&ciphertext), &mut decrypted, Some(&identity), None, None)
+                .expect("smudge_stream must decrypt authenticated ciphertext");
+
+            proptest::prop_assert_eq!(data, decrypted);
+        }
+
+        #[test]
+        fn proptest_smudge_arbitrary_bytes_never_panics(corrupt in proptest::collection::vec(proptest::num::u8::ANY, 0..4096)) {
+            let (identity, _) = generate_master_identity();
+            let mut decrypted = Vec::new();
+            let _ = smudge_stream(Cursor::new(&corrupt), &mut decrypted, Some(&identity), None, None);
+        }
+
+        #[test]
+        fn proptest_clean_arbitrary_bytes_never_panics(data in proptest::collection::vec(proptest::num::u8::ANY, 0..4096)) {
+            let (identity, recipient) = generate_master_identity();
+            let mut ciphertext = Vec::new();
+            let _ = clean_stream(Cursor::new(&data), &mut ciphertext, &recipient, None, Some(&identity), None, None);
+        }
     }
 }

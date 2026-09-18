@@ -330,4 +330,15 @@ mod tests {
         let ignored = find_semantic_conflicts(content, "data.json");
         assert!(ignored.is_empty());
     }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(32))]
+
+        #[test]
+        fn proptest_find_semantic_conflicts_never_panics(content in proptest::collection::vec(proptest::num::u8::ANY, 0..8192)) {
+            let _ = find_semantic_conflicts(&content, ".env");
+            let _ = find_semantic_conflicts(&content, "app.conf");
+            let _ = find_semantic_conflicts(&content, "other.json");
+        }
+    }
 }

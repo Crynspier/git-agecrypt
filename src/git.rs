@@ -268,6 +268,18 @@ impl GitRepo {
         self.common_dir.join("git-agecrypt")
     }
 
+    /// Ensures `.git/git-agecrypt/` exists with secure owner-only permissions (0700 on Unix).
+    pub fn ensure_local_state_dir(&self) -> Result<PathBuf> {
+        let state_dir = self.local_state_dir();
+        fs::create_dir_all(&state_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700));
+        }
+        Ok(state_dir)
+    }
+
     /// Path to local untracked master key (`repo.key`).
     pub fn local_master_key_file(&self) -> PathBuf {
         self.local_state_dir().join("repo.key")
@@ -310,8 +322,7 @@ impl GitRepo {
 
     /// Atomically stores the master secret key in `.git/git-agecrypt/repo.key`.
     pub fn save_local_master_key(&self, secret_key: &str) -> Result<()> {
-        let state_dir = self.local_state_dir();
-        fs::create_dir_all(&state_dir)?;
+        let state_dir = self.ensure_local_state_dir()?;
 
         let temp_path = state_dir.join(format!("repo.key.tmp.{}", std::process::id()));
         {
@@ -827,6 +838,11 @@ impl GitRepo {
         }
 
         if let Ok(mut jf) = File::create(&journal_file) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&journal_file, fs::Permissions::from_mode(0o600));
+            }
             let _ = jf.write_all(journal_content.as_bytes());
             let _ = jf.sync_all();
         }
@@ -909,8 +925,7 @@ impl GitRepo {
             return self.read_local_master_key();
         }
 
-        let state_dir = self.local_state_dir();
-        let _ = fs::create_dir_all(&state_dir);
+        let state_dir = self.ensure_local_state_dir()?;
         let lock_path = state_dir.join("refresh.lock");
         let start = std::time::Instant::now();
         let mut _guard = None;
@@ -927,6 +942,11 @@ impl GitRepo {
                 .open(&lock_path)
             {
                 Ok(mut file) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600));
+                    }
                     let pid = std::process::id();
                     let now_ts = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)

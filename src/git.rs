@@ -154,6 +154,20 @@ pub fn sync_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Ensures that a sensitive path is not a symlink, directory junction, or reparse point.
+/// This prevents symlink redirection attacks where an adversary swaps metadata or key paths.
+pub fn ensure_not_symlink_or_reparse(path: &Path) -> Result<()> {
+    if let Ok(meta) = path.symlink_metadata() {
+        if meta.file_type().is_symlink() {
+            return Err(anyhow!(
+                "Security violation: path '{}' is a symlink or reparse point, which is strictly prohibited for security-critical repository metadata",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Checks whether a process with the given PID is currently alive on the system.
 #[cfg(windows)]
 pub fn is_pid_alive(pid: u32) -> bool {
@@ -351,6 +365,26 @@ impl GitRepo {
         }
     }
 
+    /// Checks if a proposed or accessed ring name collides with an existing ring on disk differing only in case.
+    /// On case-insensitive filesystems (Windows NTFS, macOS APFS), collisions lead to silent state contamination.
+    pub fn check_ring_case_collision(&self, ring: &str) -> Result<()> {
+        let rings_dir = self.agecrypt_metadata_dir().join("rings");
+        if rings_dir.exists() {
+            for entry in fs::read_dir(&rings_dir)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.eq_ignore_ascii_case(ring) && name != ring {
+                    return Err(anyhow!(
+                        "Security violation: ring name '{}' collides with existing ring '{}' differing only in letter case. On case-insensitive filesystems (Windows/macOS), this leads to state confusion. Please use exact matching case.",
+                        ring,
+                        name
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Path to the committed public key file (`.git-agecrypt/repo.pub`).
     pub fn public_key_file(&self) -> PathBuf {
         self.public_key_file_for_ring(None)
@@ -514,6 +548,11 @@ impl GitRepo {
         ring: Option<&str>,
     ) -> Result<()> {
         let state_dir = self.ensure_local_state_dir_for_ring(ring)?;
+        ensure_not_symlink_or_reparse(&state_dir)?;
+        let dest = self.local_master_key_file_for_ring(ring);
+        if dest.exists() {
+            ensure_not_symlink_or_reparse(&dest)?;
+        }
 
         let temp_path = state_dir.join(format!("repo.key.tmp.{}", std::process::id()));
         {
@@ -1096,6 +1135,7 @@ impl GitRepo {
         if !key_file.exists() {
             return Ok(None);
         }
+        ensure_not_symlink_or_reparse(&key_file)?;
         let content = fs::read_to_string(key_file)?;
         Ok(Some(content.trim().to_string()))
     }
@@ -2403,13 +2443,7 @@ impl GitRepo {
             .output()
             .context("Failed to check git status")?;
 
-        let is_target = |path: &str| -> bool {
-            if ring.is_some() {
-                self.is_file_tracked_for_ring(path, ring)
-            } else {
-                self.is_file_tracked(path)
-            }
-        };
+        let is_target = |path: &str| -> bool { self.is_file_tracked_for_ring(path, ring) };
 
         let mut dirty_secrets = Vec::new();
         let bytes = &status_out.stdout;
@@ -2570,11 +2604,7 @@ impl GitRepo {
                     }
 
                     // Scoped ring check: only checkout files belonging to the specified ring
-                    let should_refresh = if ring.is_some() {
-                        self.is_file_tracked_for_ring(rel_path, ring)
-                    } else {
-                        self.is_file_tracked(rel_path)
-                    };
+                    let should_refresh = self.is_file_tracked_for_ring(rel_path, ring);
 
                     if should_refresh {
                         let full_path = self.root.join(rel_path);
@@ -2722,11 +2752,6 @@ impl GitRepo {
         }
 
         Ok(results)
-    }
-
-    /// Checks all worktrees for dirty tracked secret files across all rings.
-    pub fn get_dirty_files_across_worktrees(&self) -> Result<Vec<(PathBuf, Vec<String>)>> {
-        self.get_dirty_files_across_worktrees_for_ring(None)
     }
 
     /// Refreshes the working tree across all linked worktrees for a specific ring (or all rings if None).

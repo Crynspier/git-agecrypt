@@ -1,6 +1,8 @@
 #![allow(unused)]
 
-use assert_cmd::prelude::*;
+pub mod invariants;
+
+pub use assert_cmd::prelude::*;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,6 +25,14 @@ pub fn prepend_to_path(dir: &Path) -> OsString {
 
 pub fn agecrypt_cmd(repo: &Path) -> Command {
     let mut cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    let bd = bin_dir();
+    let new_path = prepend_to_path(&bd);
+    cmd.current_dir(repo).env("PATH", &new_path);
+    cmd
+}
+
+pub fn agecrypt_assert_cmd(repo: &Path) -> assert_cmd::Command {
+    let mut cmd = assert_cmd::Command::cargo_bin("git-agecrypt").unwrap();
     let bd = bin_dir();
     let new_path = prepend_to_path(&bd);
     cmd.current_dir(repo).env("PATH", &new_path);

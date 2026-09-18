@@ -166,9 +166,11 @@ fn cmd_init(create_gitattributes: bool, ai_shield: bool, ring_opt: Option<&str>)
             );
         }
     } else {
+        let r = ring_opt.unwrap();
+        repo.check_ring_case_collision(r)?;
         eprintln!(
             "Initializing git-agecrypt ring '{}' in {}",
-            ring_opt.unwrap(),
+            r,
             repo.root.display()
         );
     }
@@ -1202,11 +1204,7 @@ fn cmd_lock(force: bool, ring_opt: Option<&str>) -> Result<()> {
         ));
     }
 
-    let dirty_across = if ring_opt.is_none() {
-        repo.get_dirty_files_across_worktrees()?
-    } else {
-        repo.get_dirty_files_across_worktrees_for_ring(ring_opt)?
-    };
+    let dirty_across = repo.get_dirty_files_across_worktrees_for_ring(ring_opt)?;
     if !dirty_across.is_empty() && !force {
         eprintln!(
             "git-agecrypt [WARNING]: Uncommitted (staged or unstaged) changes detected in tracked secret file(s):"
@@ -1249,16 +1247,11 @@ fn cmd_lock(force: bool, ring_opt: Option<&str>) -> Result<()> {
         repo.clear_cache_for_ring(Some(r), false)?;
         eprintln!("Ring '{r}' locked across all linked worktrees. Local credentials removed.");
     } else {
-        repo.transactional_lock_for_ring(None, || repo.refresh_all_worktrees(true))?;
-        if let Ok(rings) = repo.list_rings() {
-            for r in rings {
-                if r != "default" {
-                    let _ = repo.transactional_lock_for_ring(Some(&r), || Ok(()));
-                }
-            }
-        }
+        repo.transactional_lock_for_ring(None, || repo.refresh_all_worktrees_for_ring(true, None))?;
         let _ = repo.clear_cache();
-        eprintln!("Repository locked across all linked worktrees. Local credentials removed.");
+        eprintln!(
+            "Repository (default ring) locked across all linked worktrees. Local credentials removed."
+        );
     }
     Ok(())
 }
@@ -1306,6 +1299,12 @@ fn cmd_status() -> Result<()> {
         0
     };
     println!("  Enrolled keys:     {}", recipient_count);
+
+    if let Ok(rings) = repo.list_rings()
+        && !rings.is_empty()
+    {
+        println!("  Configured rings:  {}", rings.join(", "));
+    }
 
     Ok(())
 }
@@ -1729,6 +1728,8 @@ fn pass_via_memfd(
             if flags >= 0 {
                 let _ = libc::fcntl(raw_fd_val, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
             }
+            // Block unprivileged same-UID /proc/<pid>/fd inspection and ptrace attachment
+            let _ = libc::prctl(libc::PR_SET_DUMPABLE, 0);
             Ok(())
         });
     }

@@ -223,33 +223,33 @@ done
 
 ## 8. Formal Security Invariants (A through F)
 
-`git-agecrypt` v0.3.0 establishes and formally verifies six architectural invariants:
+`git-agecrypt` v0.4.0 establishes and formally verifies six architectural invariants through an automated, generative state-machine testing harness ([`tests/test_stateful_random_harness.rs`](../tests/test_stateful_random_harness.rs)) and the comprehensive [Verification Matrix](verification-matrix.md):
 
 ### Invariant A: Working-Tree vs Object Database Invariant
 $$\text{Working tree} = \text{Plaintext} \iff \text{Git index / Object database} = \text{Ciphertext}$$
 - Under no circumstances does plaintext enter Git loose objects (`.git/objects/??/`), packfiles (`.git/objects/pack/*.pack`), or unmerged index stages (stages 1, 2, 3).
-- Verified by automated canary scans inspecting uncompressed packfile bytes and loose object stores following `commit`, `rebase`, `stash`, and `cherry-pick`.
+- Verified continuously across 100+ randomized state-machine transitions and forensic canary scans inspecting uncompressed packfile bytes and loose object stores following `commit`, `rebase`, `stash`, and `cherry-pick`.
 
 ### Invariant B: Crash & Durability Invariant
 - All state mutations (key generation, rekeying, lock journals, merge resolution, cache entries) are staged into atomic temporary files on the same filesystem.
 - File payloads and parent directories are physically synchronized to disk (`fsync` / `sync_all()` + POSIX `sync_dir`).
-- All filesystem operations strictly propagate I/O errors (`?`); partial or uncommitted writes immediately fail closed.
+- In-flight crash kill points and corrupted WAL journals automatically heal and recover state (`recover_interrupted_transaction`) on subsequent command invocations.
 
 ### Invariant C: Cross-Ring Isolation Invariant
 - Every recipient ring (`default`, `prod`, `dev`, etc.) operates with cryptographic and operational independence:
   - Separate repository master keys (`repo.pub`, `.git/git-agecrypt/rings/<name>/repo.key`).
   - Independent recipient envelopes and key rotation life-cycles.
   - Dedicated cache namespaces preventing ciphertext re-use across privilege tiers.
-- Locking, unlocking, or rekeying Ring A cannot lock, unlock, mutate, or decrypt secrets belonging to Ring B.
+- Locking, unlocking, or rekeying Ring A cannot lock, unlock, mutate, or decrypt secrets belonging to Ring B. Case-variant ring collisions (`prod` vs `PROD`) are strictly rejected on case-insensitive filesystems.
 
 ### Invariant D: Path Traversal & Device Grammar Invariant
 - Ring identifiers must strictly adhere to the grammar: `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`.
 - Path separators (`/`, `\`), directory traversal (`..`), control characters, hidden filenames, and Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`) are rejected before any filesystem or Git command dispatch.
-- Symlinks targeting files outside the repository root or pointing into `.git-agecrypt` metadata directories are rejected.
+- Symlinks and NTFS reparse points targeting files outside the repository root or pointing into `.git-agecrypt` metadata directories are rejected (`ensure_not_symlink_or_reparse`).
 
 ### Invariant E: Zero-Plaintext Memory Invariant
 - Plaintext secrets held in memory by filter drivers, merge drivers, or secret runner routines are wrapped in `Zeroizing<T>` allocations and wiped with zeroes upon drop.
-- In-memory descriptor injection (`run --fd`) isolates runtime secrets from `/proc/<pid>/environ` argument inspections.
+- In-memory descriptor injection (`run --fd`) isolates runtime secrets from `/proc/<pid>/environ` argument inspections and sets `libc::prctl(PR_SET_DUMPABLE, 0)` in child processes on Linux to prevent ptrace/coredump leakage.
 
 ### Invariant F: Idempotent Git Plumbing Invariant
 - Standard Git porcelain and plumbing commands (`stash push/pop`, `cherry-pick`, `rebase`, `merge`, `reset --hard`, `sparse-checkout`) preserve working tree plaintext and object database ciphertext idempotently.

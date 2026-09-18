@@ -422,6 +422,9 @@ Comprehensive specifications and architecture guides are available in the [`docs
 - **[Internal Architecture & Driver Mechanics](docs/internals.md):**
   In-depth breakdown of the Git filter lifecycle (`clean`, `smudge`, `textconv`, `merge`), two-tier spooling architecture (RAM < 1 MiB with `zeroize`, disk >= 1 MiB inside `.git/git-agecrypt/spool/`), scoped ring grammar validation, stage-0 index deduplication, cache validation, and the 3-way semantic merge driver conflict algorithms.
 
+- **[High-Assurance Verification & Invariant Matrix](docs/verification-matrix.md):**
+  Exhaustive traceability matrix mapping all 27 critique requirements (generative state machine, multi-ring combinatorial DAG, kill points, forensic canary sweeps, Linux prctl lockdown, symlink/case-collision defense) and formal Invariants A–F to automated test suites.
+
 ---
 
 ## Minimum Supported Versions

@@ -248,4 +248,24 @@ To prevent filesystem metadata inconsistency or zero-length files in the event o
 3. **Directory Entry Sync (`sync_dir`):** On POSIX operating systems, `git-agecrypt` opens the parent directory in read-only mode and issues `fsync` on the directory descriptor. This guarantees that directory link updates and file name renames are flushed to physical journal storage. On Windows, this operation safely succeeds as a no-op.
 4. **Fail-Closed I/O:** All filesystem synchronization operations strictly propagate errors (`?`). Neither cache operations nor merge resolutions swallow write or sync failures silently.
 
+---
+
+## 9. Generative State Machine & Combinatorial DAG Verification
+
+Starting with v0.4.0, `git-agecrypt` incorporates a generative randomized state-machine test harness ([`tests/test_stateful_random_harness.rs`](../tests/test_stateful_random_harness.rs)) powered by seeded PRNG (`rand_chacha::ChaCha8Rng`):
+
+1. **State Space Exploration:** The harness executes 100+ pseudorandom sequential operations including `EditSecret`, `GitAdd`, `GitCommit`, `GitCreateBranch`, `GitSwitchBranch`, `GitStashPush`, `GitStashPop`, `GitRepack`, `AgecryptLock`, `AgecryptUnlock`, and `AgecryptRekey`.
+2. **Shadow State Model:** Tracks expected plaintext and encrypted status in memory, asserting formal Invariants A–F at each transition.
+3. **Forensic Canary Validation:** Injects unique canary tokens into secrets and verifies through packfile/loose-object forensic sweeps that plaintext never escapes into the Git object store.
+4. **Combinatorial DAG Testing:** Tests multi-ring (`default`, `prod`, `dev`) $\times$ multi-generation ($G_0, G_1, \dots$) branch divergence, merges, and cross-generation credential synchronization ([`tests/test_combinatorial_rings_generations.rs`](../tests/test_combinatorial_rings_generations.rs)).
+
+---
+
+## 10. Filesystem Boundary Validation & Platform Hardening
+
+1. **Symlink & Reparse Point Protection:** To defend against arbitrary file overwrite or credential redirection attacks via symlink swapping (TOCTOU), `ensure_not_symlink_or_reparse` validates that `.git/git-agecrypt/repo.key`, `.git-agecrypt/keys/`, and state directories are genuine physical directories and files.
+2. **Case-Insensitive Collision Prevention:** On case-insensitive filesystems (Windows NTFS, macOS APFS), `check_ring_case_collision` prevents ring collisions (e.g. creating `PROD` when `prod` already exists).
+3. **Linux Kernel Memory Lockdown:** When passing secrets via `run --fd`, child processes execute `libc::prctl(PR_SET_DUMPABLE, 0)` in `pre_exec` to prevent unauthorized memory attachment via `ptrace` or core dump generation.
+
+
 

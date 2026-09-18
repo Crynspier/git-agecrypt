@@ -1,6 +1,6 @@
 [package]
 name = "git-agecrypt"
-version = "0.2.0"
+version = "0.3.0"
 rust-version = "1.85.0"
 # Rust language edition (RFC 3501, requires Rust 1.85+ for let-chains; valid values: 2015, 2018, 2021, 2024)
 edition = "2024"

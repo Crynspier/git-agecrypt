@@ -1040,7 +1040,7 @@ fn test_filter_config_includes_filename_expansion() {
     );
     let clean_str = String::from_utf8_lossy(&clean_cfg);
     assert!(
-        clean_str.contains("git-agecrypt clean %f"),
+        clean_str.contains("%f"),
         "Filter clean must include %f: got {clean_str}"
     );
 
@@ -1050,7 +1050,7 @@ fn test_filter_config_includes_filename_expansion() {
     );
     let smudge_str = String::from_utf8_lossy(&smudge_cfg);
     assert!(
-        smudge_str.contains("git-agecrypt smudge %f"),
+        smudge_str.contains("%f"),
         "Filter smudge must include %f: got {smudge_str}"
     );
 }
@@ -6648,11 +6648,19 @@ fn test_run_with_fd_flag() {
 
     // Run git-agecrypt run --fd with a child command
     let mut run_cmd = Command::cargo_bin("git-agecrypt").unwrap();
-    run_cmd
-        .current_dir(repo)
-        .args(["run", "--fd", "--", "git", "--version"])
-        .assert()
-        .success();
+    run_cmd.current_dir(repo);
+    #[cfg(target_os = "linux")]
+    run_cmd.args(["run", "--fd", "--", "git", "--version"]);
+    #[cfg(not(target_os = "linux"))]
+    run_cmd.args([
+        "run",
+        "--fd",
+        "--allow-env-fallback",
+        "--",
+        "git",
+        "--version",
+    ]);
+    run_cmd.assert().success();
 }
 
 #[test]

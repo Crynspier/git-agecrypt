@@ -55,6 +55,16 @@ fn is_broken_pipe(err: &anyhow::Error) -> bool {
     false
 }
 
+fn validate_ring_arg(ring: Option<&str>) -> Result<Option<&str>> {
+    match ring {
+        None => Ok(None),
+        Some(r) => {
+            crate::git::validate_ring_name(r)?;
+            Ok(Some(r))
+        }
+    }
+}
+
 fn run(cli: Cli) -> Result<()> {
     // For non-filter management commands, recover any interrupted lock transaction
     match &cli.command {
@@ -131,12 +141,20 @@ fn run(cli: Cli) -> Result<()> {
             env_file,
             ring,
             fd,
+            allow_env_fallback,
             command,
-        } => cmd_run(env_file.as_deref(), ring.as_deref(), fd, &command),
+        } => cmd_run(
+            env_file.as_deref(),
+            ring.as_deref(),
+            fd,
+            allow_env_fallback,
+            &command,
+        ),
     }
 }
 
 fn cmd_init(create_gitattributes: bool, ai_shield: bool, ring_opt: Option<&str>) -> Result<()> {
+    let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
     let is_default_ring = matches!(ring_opt, None | Some("default") | Some(""));
 
@@ -159,16 +177,23 @@ fn cmd_init(create_gitattributes: bool, ai_shield: bool, ring_opt: Option<&str>)
     fs::create_dir_all(&keys_dir)?;
 
     let pub_file = repo.public_key_file_for_ring(ring_opt);
-    let _master_identity = if pub_file.exists() && repo.is_unlocked_for_ring(ring_opt) {
-        if is_default_ring {
-            eprintln!("Repository already initialized. Re-configuring git filters...");
+    if pub_file.exists() {
+        if repo.is_unlocked_for_ring(ring_opt) {
+            if is_default_ring {
+                eprintln!("Repository already initialized. Re-configuring git filters...");
+            } else {
+                eprintln!("Ring already initialized. Re-configuring git filters...");
+            }
+        } else if is_default_ring {
+            eprintln!(
+                "Repository is initialized but locked. Configured git filters. Run 'git-agecrypt unlock' to decrypt."
+            );
         } else {
-            eprintln!("Ring already initialized. Re-configuring git filters...");
+            eprintln!(
+                "Ring is initialized but locked. Configured git filters. Run 'git-agecrypt unlock --ring {}' to decrypt.",
+                ring_opt.unwrap()
+            );
         }
-        let key_str = repo
-            .read_local_master_key_for_ring(ring_opt)?
-            .ok_or_else(|| anyhow!("Failed to read local master key"))?;
-        age::x25519::Identity::from_str(&key_str).map_err(|e| anyhow!("{e}"))?
     } else {
         let (identity, recipient) = crypto::generate_master_identity();
         if let Some(parent) = pub_file.parent() {
@@ -200,8 +225,7 @@ fn cmd_init(create_gitattributes: bool, ai_shield: bool, ring_opt: Option<&str>)
             fs::write(initial_key_file, wrapped)?;
             eprintln!("Automatically enrolled your local SSH public key as a recipient.");
         }
-        identity
-    };
+    }
 
     // Configure git config filters
     repo.configure_git_filters_for_ring(ring_opt)?;
@@ -267,6 +291,7 @@ fn cmd_add_recipient(
         ));
     }
 
+    let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
     let master_key = repo.read_local_master_key_for_ring(ring_opt)?.ok_or_else(|| {
         anyhow!(
@@ -404,6 +429,7 @@ fn cmd_add_recipient(
 }
 
 fn cmd_remove_recipient(name: &str, ring_opt: Option<&str>) -> Result<()> {
+    let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
     let keys_dir = repo.keys_dir_for_ring(ring_opt);
     let label = name.trim_end_matches(".age");
@@ -450,6 +476,7 @@ fn cmd_remove_recipient(name: &str, ring_opt: Option<&str>) -> Result<()> {
 }
 
 fn cmd_list_recipients(ring_opt: Option<&str>) -> Result<()> {
+    let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
     let keys_dir = repo.keys_dir_for_ring(ring_opt);
     if !keys_dir.exists() {
@@ -490,6 +517,7 @@ fn cmd_list_recipients(ring_opt: Option<&str>) -> Result<()> {
 }
 
 fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
+    let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
     if !repo.is_unlocked_for_ring(ring_opt) {
         return Err(anyhow!(
@@ -596,7 +624,7 @@ fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
 
     // 5. Update local master key in common git dir atomically and clear stale cache
     repo.save_local_master_key_for_ring(new_secret_str.expose_secret(), ring_opt)?;
-    let _ = repo.clear_cache();
+    repo.clear_cache_for_ring(ring_opt, true)?;
 
     // 6. Re-stage strictly tracked secret files using targeted pathspecs (never '.'!)
     let ls_out = git::git_cmd_with_path(&repo.root)
@@ -1057,6 +1085,7 @@ fn cmd_rewrap(paths: &[PathBuf], all: bool, identity_opt: Option<&str>, force: b
 }
 
 fn cmd_unlock(key_file: Option<&str>, force: bool, ring_opt: Option<&str>) -> Result<()> {
+    let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
     let keys_dir = repo.keys_dir_for_ring(ring_opt);
     if !keys_dir.exists() {
@@ -1133,7 +1162,11 @@ fn cmd_unlock(key_file: Option<&str>, force: bool, ring_opt: Option<&str>) -> Re
     repo.save_local_master_key_for_ring(&master_key, ring_opt)?;
 
     // 4. Safe checkout / refresh working trees across all linked worktrees
-    repo.refresh_all_worktrees(force)?;
+    if ring_opt.is_none() {
+        repo.refresh_all_worktrees(force)?;
+    } else {
+        repo.refresh_all_worktrees_for_ring(force, ring_opt)?;
+    }
 
     let is_default = matches!(ring_opt, None | Some("default") | Some(""));
     if is_default {
@@ -1150,6 +1183,7 @@ fn cmd_unlock(key_file: Option<&str>, force: bool, ring_opt: Option<&str>) -> Re
 }
 
 fn cmd_lock(force: bool, ring_opt: Option<&str>) -> Result<()> {
+    let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
 
     if let Some(op) = repo.check_active_git_operations()?
@@ -1168,7 +1202,11 @@ fn cmd_lock(force: bool, ring_opt: Option<&str>) -> Result<()> {
         ));
     }
 
-    let dirty_across = repo.get_dirty_files_across_worktrees()?;
+    let dirty_across = if ring_opt.is_none() {
+        repo.get_dirty_files_across_worktrees()?
+    } else {
+        repo.get_dirty_files_across_worktrees_for_ring(ring_opt)?
+    };
     if !dirty_across.is_empty() && !force {
         eprintln!(
             "git-agecrypt [WARNING]: Uncommitted (staged or unstaged) changes detected in tracked secret file(s):"
@@ -1205,8 +1243,10 @@ fn cmd_lock(force: bool, ring_opt: Option<&str>) -> Result<()> {
     // Pass force=true to refresh_all_worktrees so that re-checking git status while repo.key is staged
     // does not falsely trigger dirty detection due to racy git timestamp cache differences.
     if let Some(r) = ring_opt {
-        repo.transactional_lock_for_ring(Some(r), || repo.refresh_all_worktrees(true))?;
-        let _ = repo.clear_cache();
+        repo.transactional_lock_for_ring(Some(r), || {
+            repo.refresh_all_worktrees_for_ring(true, Some(r))
+        })?;
+        repo.clear_cache_for_ring(Some(r), false)?;
         eprintln!("Ring '{r}' locked across all linked worktrees. Local credentials removed.");
     } else {
         repo.transactional_lock_for_ring(None, || repo.refresh_all_worktrees(true))?;
@@ -1321,6 +1361,7 @@ fn cmd_check(pre_push: bool, allow_untracked_secrets: bool) -> Result<()> {
 }
 
 fn cmd_clean(file_path: Option<&str>, ring_opt: Option<&str>) -> Result<()> {
+    let ring_opt = validate_ring_arg(ring_opt)?;
     // Git clean filter: reads stdin, writes stdout.
     // ALL LOGGING MUST BE ON STDERR.
     let repo = GitRepo::discover().context("git-agecrypt clean: failed to discover git repo")?;
@@ -1391,6 +1432,7 @@ fn cmd_clean(file_path: Option<&str>, ring_opt: Option<&str>) -> Result<()> {
 }
 
 fn cmd_smudge(file_path: Option<&str>, ring_opt: Option<&str>) -> Result<()> {
+    let ring_opt = validate_ring_arg(ring_opt)?;
     // Git smudge filter: reads stdin, writes stdout.
     // ALL LOGGING MUST BE ON STDERR.
     let repo = GitRepo::discover().context("git-agecrypt smudge: failed to discover git repo")?;
@@ -1450,6 +1492,7 @@ fn cmd_smudge(file_path: Option<&str>, ring_opt: Option<&str>) -> Result<()> {
 }
 
 fn cmd_textconv(file: &Path, ring_opt: Option<&str>) -> Result<()> {
+    let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
     let key_opt = if repo
         .is_local_master_key_stale_for_ring(ring_opt)
@@ -1524,6 +1567,7 @@ fn cmd_merge(
     file_path: Option<&str>,
     ring_opt: Option<&str>,
 ) -> Result<()> {
+    let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
     let key_str = if repo
         .is_local_master_key_stale_for_ring(ring_opt)
@@ -1649,6 +1693,7 @@ fn pass_via_memfd(
 ) -> Result<()> {
     use std::ffi::CString;
     use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::os::unix::process::CommandExt;
 
     let mut content = String::new();
     for (k, v) in env_vars {
@@ -1656,7 +1701,8 @@ fn pass_via_memfd(
     }
 
     let name = CString::new("git_agecrypt_env")?;
-    let fd = unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), 0) } as i32;
+    let fd =
+        unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), libc::MFD_CLOEXEC) } as i32;
     if fd < 0 {
         return Err(anyhow!(
             "memfd_create failed: {}",
@@ -1677,9 +1723,22 @@ fn pass_via_memfd(
     child.env("GIT_AGECRYPT_ENV_FD", raw_fd_val.to_string());
     child.env("GIT_AGECRYPT_ENV_FILE", format!("/dev/fd/{raw_fd_val}"));
 
+    unsafe {
+        child.pre_exec(move || {
+            let flags = libc::fcntl(raw_fd_val, libc::F_GETFD);
+            if flags >= 0 {
+                let _ = libc::fcntl(raw_fd_val, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+            }
+            Ok(())
+        });
+    }
+
     let status = child
         .status()
         .with_context(|| format!("Failed to execute command '{}'", command[0]))?;
+    unsafe {
+        libc::close(raw_fd_val);
+    }
     process::exit(status.code().unwrap_or(1));
 }
 
@@ -1687,9 +1746,15 @@ fn pass_via_memfd(
 fn pass_via_memfd(
     _env_vars: &std::collections::HashMap<String, String>,
     _command: &[String],
+    allow_env_fallback: bool,
 ) -> Result<()> {
+    if !allow_env_fallback {
+        return Err(anyhow!(
+            "git-agecrypt run [ERROR]: --fd requires Linux anonymous memfd support (SYS_memfd_create). Anonymous in-memory file descriptors are not natively supported on this platform. To explicitly allow falling back to standard process environment injection, re-run with --allow-env-fallback."
+        ));
+    }
     eprintln!(
-        "git-agecrypt run [NOTICE]: In-memory anonymous file descriptor passing (--fd / memfd_create) is only supported on Linux. Falling back to standard child process environment variable injection."
+        "git-agecrypt run [NOTICE]: In-memory anonymous file descriptor passing (--fd / memfd_create) is only supported on Linux. Falling back to standard child process environment variable injection because --allow-env-fallback was specified."
     );
     Ok(())
 }
@@ -1698,8 +1763,11 @@ fn cmd_run(
     env_file_opt: Option<&Path>,
     ring_opt: Option<&str>,
     fd_flag: bool,
+    allow_env_fallback: bool,
     command: &[String],
 ) -> Result<()> {
+    let _ = allow_env_fallback;
+    let ring_opt = validate_ring_arg(ring_opt)?;
     if command.is_empty() {
         return Err(anyhow!("No command specified to run"));
     }
@@ -1734,6 +1802,34 @@ fn cmd_run(
         let default_env = repo.root.join(".env");
         if default_env.exists() && !env_files.contains(&default_env) {
             env_files.push(default_env);
+        }
+        if let Ok(out) = git::git_cmd_with_path(&repo.root)
+            .args(["ls-files"])
+            .output()
+        {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                for line in text.lines() {
+                    let rel = line.trim();
+                    if rel.is_empty() {
+                        continue;
+                    }
+                    let lower = rel.to_lowercase();
+                    if (lower.ends_with(".env")
+                        || lower.contains(".env.")
+                        || lower.ends_with(".secret.env"))
+                        && repo.is_file_tracked_for_ring(rel, ring_opt)
+                    {
+                        let candidate = repo.root.join(rel);
+                        if candidate.exists()
+                            && candidate.is_file()
+                            && !env_files.contains(&candidate)
+                        {
+                            env_files.push(candidate);
+                        }
+                    }
+                }
+            }
         }
         if let Ok(patterns) = repo.get_tracked_patterns_for_ring(ring_opt) {
             for pat in patterns {
@@ -1867,7 +1963,14 @@ fn cmd_run(
     }
 
     if fd_flag {
-        pass_via_memfd(&env_vars, command)?;
+        #[cfg(target_os = "linux")]
+        {
+            return pass_via_memfd(&env_vars, command);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            pass_via_memfd(&env_vars, command, allow_env_fallback)?;
+        }
     }
 
     let mut child = process::Command::new(&command[0]);

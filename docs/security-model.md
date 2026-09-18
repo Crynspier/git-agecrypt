@@ -175,12 +175,13 @@ When executing commands using `run`, consider the operating system process bound
 
 ### 6.2 Anonymous In-Memory Secret Passing (`run --fd`)
 
-For high-security Linux runtime environments where `/proc/<pid>/environ` inspection by other co-tenant processes is a threat:
-- `git-agecrypt run --fd -- <cmd>` creates an anonymous in-memory file descriptor via the Linux `SYS_memfd_create` syscall (`MFD_CLOEXEC`).
-- Secrets are written entirely into kernel RAM without touching the filesystem.
-- The descriptor is passed to the child process via `GIT_AGECRYPT_ENV_FD` (and accessible via `/dev/fd/<fd>`).
+For high-security Linux runtime environments where `/proc/<pid>/environ` inspection by other co-tenant processes is an attack vector:
+- `git-agecrypt run --fd -- <cmd>` creates an anonymous in-memory file descriptor via the Linux `SYS_memfd_create` syscall with `MFD_CLOEXEC`.
+- Secrets are written entirely into kernel RAM without touching the physical filesystem.
+- **Child Descriptor Lifecycle:** In the parent process, `MFD_CLOEXEC` ensures file descriptors do not leak across unrelated child forks. Prior to executing the child command, a `pre_exec` hook unsets the `FD_CLOEXEC` flag (`fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC)`) exclusively for the target child process, allowing it to inherit the descriptor while keeping all other file handles sealed.
+- The descriptor number is passed to the child process via the `GIT_AGECRYPT_ENV_FD` environment variable (accessible via `/dev/fd/<fd>` or `open("/proc/self/fd/<fd>", O_RDONLY)`).
 - Plaintext secrets are never exposed in `/proc/<pid>/environ` argument arrays or command-line strings.
-- On Windows and macOS platforms, `--fd` gracefully emits a notification and falls back to standard in-memory environment injection.
+- **Fail-Closed Security on Non-Linux Hosts:** On platforms where `memfd_create` is unsupported (Windows, macOS), `run --fd` strictly fails closed by default with an explicit security error. If a user or CI pipeline explicitly wishes to tolerate falling back to standard in-memory environment injection on non-Linux platforms, they must pass `--allow-env-fallback`.
 
 ---
 
@@ -217,3 +218,40 @@ while read -r oldrev newrev refname; do
     done
 done
 ```
+
+---
+
+## 8. Formal Security Invariants (A through F)
+
+`git-agecrypt` v0.3.0 establishes and formally verifies six architectural invariants:
+
+### Invariant A: Working-Tree vs Object Database Invariant
+$$\text{Working tree} = \text{Plaintext} \iff \text{Git index / Object database} = \text{Ciphertext}$$
+- Under no circumstances does plaintext enter Git loose objects (`.git/objects/??/`), packfiles (`.git/objects/pack/*.pack`), or unmerged index stages (stages 1, 2, 3).
+- Verified by automated canary scans inspecting uncompressed packfile bytes and loose object stores following `commit`, `rebase`, `stash`, and `cherry-pick`.
+
+### Invariant B: Crash & Durability Invariant
+- All state mutations (key generation, rekeying, lock journals, merge resolution, cache entries) are staged into atomic temporary files on the same filesystem.
+- File payloads and parent directories are physically synchronized to disk (`fsync` / `sync_all()` + POSIX `sync_dir`).
+- All filesystem operations strictly propagate I/O errors (`?`); partial or uncommitted writes immediately fail closed.
+
+### Invariant C: Cross-Ring Isolation Invariant
+- Every recipient ring (`default`, `prod`, `dev`, etc.) operates with cryptographic and operational independence:
+  - Separate repository master keys (`repo.pub`, `.git/git-agecrypt/rings/<name>/repo.key`).
+  - Independent recipient envelopes and key rotation life-cycles.
+  - Dedicated cache namespaces preventing ciphertext re-use across privilege tiers.
+- Locking, unlocking, or rekeying Ring A cannot lock, unlock, mutate, or decrypt secrets belonging to Ring B.
+
+### Invariant D: Path Traversal & Device Grammar Invariant
+- Ring identifiers must strictly adhere to the grammar: `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`.
+- Path separators (`/`, `\`), directory traversal (`..`), control characters, hidden filenames, and Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`) are rejected before any filesystem or Git command dispatch.
+- Symlinks targeting files outside the repository root or pointing into `.git-agecrypt` metadata directories are rejected.
+
+### Invariant E: Zero-Plaintext Memory Invariant
+- Plaintext secrets held in memory by filter drivers, merge drivers, or secret runner routines are wrapped in `Zeroizing<T>` allocations and wiped with zeroes upon drop.
+- In-memory descriptor injection (`run --fd`) isolates runtime secrets from `/proc/<pid>/environ` argument inspections.
+
+### Invariant F: Idempotent Git Plumbing Invariant
+- Standard Git porcelain and plumbing commands (`stash push/pop`, `cherry-pick`, `rebase`, `merge`, `reset --hard`, `sparse-checkout`) preserve working tree plaintext and object database ciphertext idempotently.
+- Refreshing index stats (`git update-index -q --refresh`) ensures clean filter state without phantom modifications.
+

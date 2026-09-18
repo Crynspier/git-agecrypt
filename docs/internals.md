@@ -209,6 +209,16 @@ When `git-agecrypt clean %f --ring prod` or `git-agecrypt smudge %f --ring prod`
 3. If locked, `smudge` safely passes ciphertext through without breaking Git checkout or branch switching.
 4. During pre-commit and pre-push validation, `git-agecrypt check` dynamically inspects each staged file's assigned filter attribute and validates ciphertext against that specific ring's key epoch.
 
+### 6.3 Ring Identifier Validation Grammar
+
+To prevent directory traversal attacks, arbitrary file overwrites, and platform-specific device name collisions, all ring identifiers supplied via `--ring <name>` or parsed from `.gitattributes` (`filter=agecrypt-<name>`) must strictly satisfy the following validation rules:
+
+1. **Length:** Between 1 and 64 characters.
+2. **Grammar Whitelist:** Must begin with an alphanumeric character (`[a-zA-Z0-9]`), followed optionally by alphanumeric characters, underscores (`_`), dots (`.`), or hyphens (`-`).
+3. **Disallowed Characters:** Forward slashes (`/`), backslashes (`\`), spaces, null bytes, and non-printable control characters are strictly rejected.
+4. **Parent Traversal Prevention:** Sequences such as `..`, `.`, or paths containing path separators are immediately rejected before performing any filesystem operations.
+5. **Reserved Device Protection:** Rejects reserved Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1` through `COM9`, `LPT1` through `LPT9`) regardless of file extension or letter casing.
+
 ---
 
 ## 7. Anonymous In-Memory Secret Passing (`memfd_create`)
@@ -218,10 +228,24 @@ To eliminate exposure of decrypted environment variables via `/proc/<pid>/enviro
 ### 7.1 Linux Kernel In-Memory File Descriptors
 
 When `git-agecrypt run --fd -- <cmd>` is executed on Linux:
-1. **Syscall Invocation:** `git-agecrypt` invokes `libc::syscall(SYS_memfd_create, name, MFD_CLOEXEC)`.
+1. **Syscall Invocation:** `git-agecrypt` invokes `libc::syscall(SYS_memfd_create, name, MFD_CLOEXEC)`. The `MFD_CLOEXEC` flag guarantees that the descriptor will not leak into unrelated forks or subprocesses spawned by the parent.
 2. **Anonymous RAM Allocation:** The Linux kernel allocates an anonymous, RAM-backed file descriptor that has no path on the physical filesystem.
 3. **Decryption & Spooling:** The encrypted `.env` file is decrypted in RAM and written into the file descriptor.
 4. **File Offset Rewind:** The file position is rewound to 0 (`lseek(fd, 0, SEEK_SET)`).
-5. **FD Exposure:** The descriptor is configured with `GIT_AGECRYPT_ENV_FD=<fd>`. Child processes can read secrets via `/dev/fd/<fd>` or `open("/proc/self/fd/<fd>", O_RDONLY)`.
-6. **Zero Disk Footprint:** When the parent or child process terminates, the kernel frees the memory automatically. Cleartext secrets never touch disk or swap partitions.
+5. **Child Process Descriptor Transfer:** In `Command::pre_exec` before executing the child command via `execve`, the `FD_CLOEXEC` flag is cleared (`fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC)`) exclusively for the target child process.
+6. **FD Exposure:** The descriptor number is injected into the child's environment as `GIT_AGECRYPT_ENV_FD=<fd>`. Child processes can read secrets via `/dev/fd/<fd>` or `open("/proc/self/fd/<fd>", O_RDONLY)`.
+7. **Zero Disk Footprint:** When the parent or child process terminates, the kernel frees the memory automatically. Cleartext secrets never touch disk or swap partitions.
+8. **Fail-Closed on Non-Linux Hosts:** On operating systems lacking anonymous RAM descriptors (Windows, macOS), `run --fd` strictly fails closed by default. Users must explicitly supply `--allow-env-fallback` to permit falling back to standard in-memory environment variable injection.
+
+---
+
+## 8. Crash Durability & Directory Synchronization
+
+To prevent filesystem metadata inconsistency or zero-length files in the event of unexpected system power loss:
+
+1. **Atomic Temporary Replacement:** All critical file writes (master keys, lock journals, merge results, cache entries) write first to an anonymous or uniquely named temporary file located within the same directory (`NamedTempFile::new_in(dir)`).
+2. **File Content Sync:** Prior to renaming, `sync_all()` (`fsync`) is invoked on the file handle, ensuring all data bytes and inode metadata are committed to physical media.
+3. **Directory Entry Sync (`sync_dir`):** On POSIX operating systems, `git-agecrypt` opens the parent directory in read-only mode and issues `fsync` on the directory descriptor. This guarantees that directory link updates and file name renames are flushed to physical journal storage. On Windows, this operation safely succeeds as a no-op.
+4. **Fail-Closed I/O:** All filesystem synchronization operations strictly propagate errors (`?`). Neither cache operations nor merge resolutions swallow write or sync failures silently.
+
 

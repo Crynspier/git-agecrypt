@@ -215,6 +215,10 @@ pub enum Commands {
         #[arg(long)]
         fd: bool,
 
+        /// Allow fallback to environment variables when --fd is requested on non-Linux platforms
+        #[arg(long)]
+        allow_env_fallback: bool,
+
         /// Command and arguments to execute
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,

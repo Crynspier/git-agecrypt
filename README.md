@@ -263,6 +263,9 @@ git-agecrypt run -- cargo run
 # Anonymous in-memory descriptor passing via Linux memfd_create (bypasses /proc/<pid>/environ)
 git-agecrypt run --fd -- ./app_server
 
+# On Windows/macOS, allow fallback from --fd to in-memory environment injection
+git-agecrypt run --fd --allow-env-fallback -- node server.js
+
 # Run a server or script with specific encrypted env file or scoped ring
 git-agecrypt run -e production.secret.env --ring prod -- node server.js
 
@@ -270,14 +273,14 @@ git-agecrypt run -e production.secret.env --ring prod -- node server.js
 git-agecrypt run -- npm test
 ```
 
-Secrets are decrypted entirely in RAM, injected into the child process environment (or anonymous file descriptor via `GIT_AGECRYPT_ENV_FD`), and immediately zeroized upon exit without creating temporary cleartext files on disk.
+Secrets are decrypted entirely in RAM, injected into the child process environment (or anonymous file descriptor via `GIT_AGECRYPT_ENV_FD`), and immediately zeroized upon exit without creating temporary cleartext files on disk. On non-Linux hosts where `memfd_create` is unavailable, `--fd` strictly fails closed unless `--allow-env-fallback` is supplied. When `-e` is omitted, `run` automatically detects encrypted `.env` or `*.secret.env` files tracked in the repository.
 
 ### 7. Scoped Recipient Rings (Multi-Environment Secrets)
 
 Segment secrets across different access boundaries (e.g. `prod` vs `dev`):
 
 ```bash
-# 1. Initialize a scoped ring
+# 1. Initialize a scoped ring (names must match ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$)
 git-agecrypt init --ring prod
 
 # 2. Configure .gitattributes to route specific paths to the prod ring
@@ -293,6 +296,9 @@ git-agecrypt unlock ~/.ssh/ops_key --ring prod
 # 5. Rekey a single ring independently
 git-agecrypt rekey --ring prod
 ```
+
+Ring identifiers are strictly validated to prevent directory traversal and OS device name collisions (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`).
+
 
 ### 8. Offboarding and Key Rotation
 
@@ -401,7 +407,7 @@ git commit -m "Migrate from git-crypt to git-agecrypt"
 | `smudge` | `[PATH]`, `[--ring <RING>]` | Git smudge filter (streams stdin ciphertext to stdout plaintext). |
 | `textconv` | `<PATH>`, `[--ring <RING>]` | Git diff driver (decrypts target for cleartext diffs). |
 | `merge` | `<O> <A> <B> [L] [P]`, `[--ring <RING>]` | Git 3-way merge driver. |
-| `run` | `[-e, --env-file <PATH>], [--fd], [--ring <RING>] -- <COMMAND>...` | Execute child process with in-memory decrypted secrets (environment variables or anonymous Linux memfd). |
+| `run` | `[-e, --env-file <PATH>], [--fd], [--allow-env-fallback], [--ring <RING>] -- <COMMAND>...` | Execute child process with in-memory decrypted secrets (environment variables or anonymous Linux memfd). |
 | `migrate-from-git-crypt` | `-i, --identity <KEY>` | Convert an existing git-crypt repository. |
 
 ---
@@ -411,10 +417,10 @@ git commit -m "Migrate from git-crypt to git-agecrypt"
 Comprehensive specifications and architecture guides are available in the [`docs/`](docs/) directory:
 
 - **[Security Model & Threat Analysis](docs/security-model.md):**
-  Detailed threat model, cryptographic primitives (ChaCha20-Poly1305, X25519, HMAC caching), POSIX permissions (`0o700`/`0o600`), crash durability (`sync_all`), Merkle DAG forward-secrecy vs historical revocation, runtime secret injection boundaries, and enterprise server-side `pre-receive` hook enforcement.
+  Detailed threat model, cryptographic primitives (ChaCha20-Poly1305, X25519, HMAC caching), formal Invariants A through F, POSIX permissions (`0o700`/`0o600`), crash durability (`sync_all` + `sync_dir`), Merkle DAG forward-secrecy vs historical revocation, runtime secret injection boundaries, and enterprise server-side `pre-receive` hook enforcement.
 
 - **[Internal Architecture & Driver Mechanics](docs/internals.md):**
-  In-depth breakdown of the Git filter lifecycle (`clean`, `smudge`, `textconv`, `merge`), two-tier spooling architecture (RAM < 1 MiB with `zeroize`, disk >= 1 MiB inside `.git/git-agecrypt/spool/`), stage-0 index deduplication, cache validation, and the 3-way semantic merge driver conflict algorithms.
+  In-depth breakdown of the Git filter lifecycle (`clean`, `smudge`, `textconv`, `merge`), two-tier spooling architecture (RAM < 1 MiB with `zeroize`, disk >= 1 MiB inside `.git/git-agecrypt/spool/`), scoped ring grammar validation, stage-0 index deduplication, cache validation, and the 3-way semantic merge driver conflict algorithms.
 
 ---
 

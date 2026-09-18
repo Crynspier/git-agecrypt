@@ -66,6 +66,94 @@ pub fn set_permissions_writable(perms: &mut fs::Permissions) {
     }
 }
 
+/// Validates that a ring name conforms to strict security grammar:
+/// - Must match ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$
+/// - Length must be between 1 and 64 characters
+/// - First character must be ASCII alphanumeric
+/// - Subsequent characters may only be ASCII alphanumeric, '_', '.', or '-'
+/// - Cannot equal "default", ".", or ".."
+/// - Cannot match Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+pub fn validate_ring_name(ring: &str) -> Result<()> {
+    if ring.is_empty() {
+        return Err(anyhow!("Ring name cannot be empty"));
+    }
+    if ring.len() > 64 {
+        return Err(anyhow!(
+            "Ring name '{}' exceeds maximum allowed length of 64 characters",
+            ring
+        ));
+    }
+    if ring == "default" {
+        return Err(anyhow!(
+            "Ring name cannot be 'default' (the default ring is represented by omitting --ring)"
+        ));
+    }
+    if ring == "." || ring == ".." {
+        return Err(anyhow!("Ring name cannot be '.' or '..'"));
+    }
+
+    let first = ring.chars().next().unwrap();
+    if !first.is_ascii_alphanumeric() {
+        return Err(anyhow!(
+            "Ring name '{}' must start with an alphanumeric character [a-zA-Z0-9]",
+            ring
+        ));
+    }
+
+    for c in ring.chars() {
+        if !c.is_ascii_alphanumeric() && c != '_' && c != '.' && c != '-' {
+            return Err(anyhow!(
+                "Ring name '{}' contains invalid character '{}'. Only ASCII alphanumeric, '_', '.', and '-' are allowed",
+                ring,
+                c
+            ));
+        }
+    }
+
+    // Windows reserved device names check (case-insensitive)
+    let stem = ring.split('.').next().unwrap_or(ring).to_ascii_uppercase();
+    const RESERVED_NAMES: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if RESERVED_NAMES.contains(&stem.as_str()) {
+        return Err(anyhow!(
+            "Ring name '{}' matches reserved system device name '{}'",
+            ring,
+            stem
+        ));
+    }
+
+    Ok(())
+}
+
+/// Flushes the parent directory entry to durable storage on POSIX filesystems (directory fsync).
+/// Safe no-op on platforms or pseudo-filesystems that do not support directory fsync.
+pub fn sync_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        if path.is_dir() {
+            if let Ok(dir) = File::open(path) {
+                match dir.sync_all() {
+                    Ok(()) => {}
+                    Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+                    Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!("Failed to fsync directory {}", path.display())
+                        });
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 /// Checks whether a process with the given PID is currently alive on the system.
 #[cfg(windows)]
 pub fn is_pid_alive(pid: u32) -> bool {
@@ -344,12 +432,29 @@ impl GitRepo {
         ensure_extended_path(&dir)
     }
 
+    /// Purges cached ciphertexts for a specific ring, failing closed if transactional wipe is requested.
+    pub fn clear_cache_for_ring(&self, ring: Option<&str>, transactional: bool) -> Result<()> {
+        let base_cache = self.local_state_dir_for_ring(ring).join("cache");
+        if base_cache.exists() {
+            if let Err(e) = fs::remove_dir_all(&base_cache) {
+                if transactional {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "Failed to transactionally wipe cache directory {}",
+                            base_cache.display()
+                        )
+                    });
+                } else {
+                    eprintln!("git-agecrypt [WARN]: Non-fatal cache eviction error: {e}");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Purges all cached ciphertexts (e.g. during rekey or lock) and sweeps temp files.
     pub fn clear_cache(&self) -> Result<()> {
-        let base_cache = self.local_state_dir().join("cache");
-        if base_cache.exists() {
-            let _ = fs::remove_dir_all(&base_cache);
-        }
+        self.clear_cache_for_ring(None, false)?;
         let rings_cache = self.local_state_dir().join("rings");
         if rings_cache.exists() {
             let _ = fs::remove_dir_all(&rings_cache);
@@ -363,9 +468,13 @@ impl GitRepo {
         self.is_unlocked_for_ring(None)
     }
 
-    /// Checks if a ring is currently unlocked.
+    /// Checks if a ring is currently unlocked with a valid age master key.
     pub fn is_unlocked_for_ring(&self, ring: Option<&str>) -> bool {
-        self.local_master_key_file_for_ring(ring).exists()
+        if let Ok(Some(key_str)) = self.read_local_master_key_for_ring(ring) {
+            age::x25519::Identity::from_str(&key_str).is_ok()
+        } else {
+            false
+        }
     }
 
     /// List all registered rings in the repository (including "default" if configured).
@@ -481,6 +590,7 @@ impl GitRepo {
         {
             fs::rename(&temp_path, &dest)?;
         }
+        sync_dir(&state_dir)?;
         Ok(())
     }
 
@@ -718,7 +828,11 @@ impl GitRepo {
 
     /// Fetches the raw staged blob from the Git index for `rel_path` (:0:<clean_path>) if present.
     pub fn get_staged_blob(&self, rel_path: &str) -> Option<Vec<u8>> {
-        let clean_path = rel_path.trim_start_matches('/').trim_start_matches('\\');
+        let clean_path = rel_path
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim_start_matches('/')
+            .trim_start_matches('\\');
         let out = git_cmd_with_path(&self.root)
             .args(["cat-file", "blob", &format!(":0:{clean_path}")])
             .output()
@@ -924,14 +1038,19 @@ impl GitRepo {
             }
         }
 
-        if let Ok(mut jf) = File::create(&journal_file) {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&journal_file, fs::Permissions::from_mode(0o600));
-            }
-            let _ = jf.write_all(journal_content.as_bytes());
-            let _ = jf.sync_all();
+        let mut jf =
+            File::create(&journal_file).context("Failed to create lock WAL journal file")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&journal_file, fs::Permissions::from_mode(0o600));
+        }
+        jf.write_all(journal_content.as_bytes())
+            .context("Failed to write lock WAL journal file")?;
+        jf.sync_all()
+            .context("Failed to synchronize lock journal")?;
+        if let Some(parent) = journal_file.parent() {
+            sync_dir(parent)?;
         }
 
         let state_dir = self.ensure_local_state_dir_for_ring(ring)?;
@@ -940,6 +1059,7 @@ impl GitRepo {
             let _ = fs::remove_file(&locking_file);
         }
         fs::rename(&key_file, &locking_file).context("Failed to stage master key for locking")?;
+        sync_dir(&state_dir)?;
 
         match f() {
             Ok(()) => {
@@ -949,6 +1069,7 @@ impl GitRepo {
                 if journal_file.exists() {
                     let _ = fs::remove_file(&journal_file);
                 }
+                let _ = sync_dir(&state_dir);
                 Ok(())
             }
             Err(err) => {
@@ -956,6 +1077,7 @@ impl GitRepo {
                 if locking_file.exists() {
                     let lock_mtime = fs::metadata(&locking_file).and_then(|m| m.modified()).ok();
                     let _ = fs::rename(&locking_file, &key_file);
+                    let _ = sync_dir(&state_dir);
                     let _ = self.replay_lock_journal_or_selective(lock_mtime);
                 }
                 Err(err)
@@ -1230,19 +1352,16 @@ impl GitRepo {
     /// Configures the git filter, diff, and merge drivers for a specific ring in local `.git/config`.
     pub fn configure_git_filters_for_ring(&self, ring: Option<&str>) -> Result<()> {
         let is_default = matches!(ring, None | Some("default") | Some(""));
-        let driver_name = if is_default {
-            "agecrypt".to_string()
+        let (driver_name, ring_arg) = if is_default {
+            ("agecrypt".to_string(), "".to_string())
         } else {
-            format!("agecrypt-{}", ring.unwrap())
-        };
-        let ring_arg = if is_default {
-            "".to_string()
-        } else {
-            format!(" --ring {}", ring.unwrap())
+            let r = ring.unwrap();
+            validate_ring_name(r)?;
+            (format!("agecrypt-{r}"), format!(" --ring \"{r}\""))
         };
 
-        let clean_cmd = format!("git-agecrypt clean %f{ring_arg}");
-        let smudge_cmd = format!("git-agecrypt smudge %f{ring_arg}");
+        let clean_cmd = format!("git-agecrypt clean \"%f\"{ring_arg}");
+        let smudge_cmd = format!("git-agecrypt smudge \"%f\"{ring_arg}");
         let textconv_cmd = format!("git-agecrypt textconv{ring_arg}");
         let merge_cmd = format!("git-agecrypt merge \"%O\" \"%A\" \"%B\" %L \"%P\"{ring_arg}");
 
@@ -1465,7 +1584,8 @@ impl GitRepo {
 
     /// Gets the filter attribute value configured for `file_path`.
     pub fn get_file_filter(&self, file_path: &str) -> Option<String> {
-        let normalized = file_path.replace('\\', "/");
+        let clean = file_path.trim_matches('"').trim_matches('\'');
+        let normalized = clean.replace('\\', "/");
         let output = git_cmd_with_path(&self.root)
             .args(["check-attr", "filter", "--", &normalized])
             .output()
@@ -1487,8 +1607,13 @@ impl GitRepo {
     /// Checks whether Git assigns the `agecrypt` filter (default or any ring) to a file path.
     pub fn is_file_tracked(&self, file_path: &str) -> bool {
         if let Some(actual) = self.get_file_filter(file_path) {
-            if actual == "agecrypt" || actual.starts_with("agecrypt-") {
+            if actual == "agecrypt" {
                 return true;
+            }
+            if let Some(ring_suffix) = actual.strip_prefix("agecrypt-") {
+                if !ring_suffix.is_empty() && validate_ring_name(ring_suffix).is_ok() {
+                    return true;
+                }
             }
         }
         // Fallback: check default ring patterns
@@ -1507,14 +1632,18 @@ impl GitRepo {
         let expected_filter = if is_default {
             "agecrypt".to_string()
         } else {
-            format!("agecrypt-{}", ring.unwrap())
+            let r = ring.unwrap();
+            if validate_ring_name(r).is_err() {
+                return false;
+            }
+            format!("agecrypt-{r}")
         };
 
         if let Some(actual) = self.get_file_filter(file_path) {
             if actual == expected_filter {
                 return true;
             }
-            if actual.starts_with("agecrypt") {
+            if actual == "agecrypt" || actual.starts_with("agecrypt-") {
                 return false;
             }
         }
@@ -2266,18 +2395,21 @@ impl GitRepo {
         Ok(())
     }
 
-    /// Returns a list of tracked secret files that currently have unstaged/uncommitted changes.
-    pub fn get_dirty_tracked_files(&self) -> Result<Vec<String>> {
-        let patterns = self.get_tracked_patterns()?;
-        if patterns.is_empty() {
-            return Ok(Vec::new());
-        }
-
+    /// Returns a list of tracked secret files for a ring that currently have unstaged/uncommitted changes.
+    pub fn get_dirty_tracked_files_for_ring(&self, ring: Option<&str>) -> Result<Vec<String>> {
         // Check git status --porcelain -z to handle spaces and renames robustly
         let status_out = git_cmd_with_path(&self.root)
             .args(["status", "--porcelain", "-z"])
             .output()
             .context("Failed to check git status")?;
+
+        let is_target = |path: &str| -> bool {
+            if ring.is_some() {
+                self.is_file_tracked_for_ring(path, ring)
+            } else {
+                self.is_file_tracked(path)
+            }
+        };
 
         let mut dirty_secrets = Vec::new();
         let bytes = &status_out.stdout;
@@ -2309,18 +2441,23 @@ impl GitRepo {
                     idx = orig_end + 1;
 
                     // If EITHER the new destination path or the original path is a tracked secret, record it!
-                    if self.is_file_tracked(&file_path) {
+                    if is_target(&file_path) {
                         dirty_secrets.push(file_path);
                     }
-                    if self.is_file_tracked(&orig_path) {
+                    if is_target(&orig_path) {
                         dirty_secrets.push(orig_path);
                     }
-                } else if self.is_file_tracked(&file_path) {
+                } else if is_target(&file_path) {
                     dirty_secrets.push(file_path);
                 }
             }
         }
         Ok(dirty_secrets)
+    }
+
+    /// Returns a list of tracked secret files that currently have unstaged/uncommitted changes across all rings.
+    pub fn get_dirty_tracked_files(&self) -> Result<Vec<String>> {
+        self.get_dirty_tracked_files_for_ring(None)
     }
 
     /// Returns a list of tracked NON-SECRET files that currently have unstaged/uncommitted changes.
@@ -2389,9 +2526,10 @@ impl GitRepo {
     }
 
     /// Refreshes the working tree non-destructively by default.
+    /// Refreshes the working tree non-destructively by default for a specific ring (or all rings if None).
     /// Checks for unstaged changes before touching files.
-    pub fn refresh_working_tree(&self, force: bool) -> Result<()> {
-        let dirty_secrets = self.get_dirty_tracked_files()?;
+    pub fn refresh_working_tree_for_ring(&self, force: bool, ring: Option<&str>) -> Result<()> {
+        let dirty_secrets = self.get_dirty_tracked_files_for_ring(ring)?;
 
         if !dirty_secrets.is_empty() && !force {
             eprintln!(
@@ -2431,7 +2569,14 @@ impl GitRepo {
                         continue;
                     }
 
-                    if self.is_file_tracked(rel_path) {
+                    // Scoped ring check: only checkout files belonging to the specified ring
+                    let should_refresh = if ring.is_some() {
+                        self.is_file_tracked_for_ring(rel_path, ring)
+                    } else {
+                        self.is_file_tracked(rel_path)
+                    };
+
+                    if should_refresh {
                         let full_path = self.root.join(rel_path);
                         if full_path.exists() {
                             if let Ok(meta) = fs::metadata(&full_path)
@@ -2481,6 +2626,11 @@ impl GitRepo {
                     let _ = fallback_cmd.status();
                 }
             }
+
+            // Synchronize Git's internal stat cache so that checkout timestamp updates do not falsely appear dirty
+            let _ = git_cmd_with_path(&self.root)
+                .args(["update-index", "-q", "--refresh"])
+                .status();
         }
 
         // Re-apply read-only permissions for files that were originally marked read-only
@@ -2495,6 +2645,12 @@ impl GitRepo {
         }
 
         Ok(())
+    }
+
+    /// Refreshes the working tree non-destructively by default across all rings.
+    pub fn refresh_working_tree(&self, force: bool) -> Result<()> {
+        let _ = self.get_dirty_tracked_files()?;
+        self.refresh_working_tree_for_ring(force, None)
     }
 
     /// Discovers all registered worktrees linked to this repository using `git worktree list --porcelain`.
@@ -2542,9 +2698,11 @@ impl GitRepo {
         }
     }
 
-    /// Checks all worktrees for dirty tracked secret files.
-    /// Returns a list of (worktree_path, dirty_files) for any worktree with unstaged modifications.
-    pub fn get_dirty_files_across_worktrees(&self) -> Result<Vec<(PathBuf, Vec<String>)>> {
+    /// Checks all worktrees for dirty tracked secret files belonging to a specific ring (or all rings if None).
+    pub fn get_dirty_files_across_worktrees_for_ring(
+        &self,
+        ring: Option<&str>,
+    ) -> Result<Vec<(PathBuf, Vec<String>)>> {
         let worktrees = self.list_worktrees()?;
         let mut results = Vec::new();
 
@@ -2557,7 +2715,7 @@ impl GitRepo {
                 git_dir: self.git_dir.clone(),
                 common_dir: self.common_dir.clone(),
             };
-            let dirty = repo_for_wt.get_dirty_tracked_files()?;
+            let dirty = repo_for_wt.get_dirty_tracked_files_for_ring(ring)?;
             if !dirty.is_empty() {
                 results.push((wt, dirty));
             }
@@ -2566,9 +2724,14 @@ impl GitRepo {
         Ok(results)
     }
 
-    /// Refreshes the working tree across all linked worktrees.
-    pub fn refresh_all_worktrees(&self, force: bool) -> Result<()> {
-        let dirty_across = self.get_dirty_files_across_worktrees()?;
+    /// Checks all worktrees for dirty tracked secret files across all rings.
+    pub fn get_dirty_files_across_worktrees(&self) -> Result<Vec<(PathBuf, Vec<String>)>> {
+        self.get_dirty_files_across_worktrees_for_ring(None)
+    }
+
+    /// Refreshes the working tree across all linked worktrees for a specific ring (or all rings if None).
+    pub fn refresh_all_worktrees_for_ring(&self, force: bool, ring: Option<&str>) -> Result<()> {
+        let dirty_across = self.get_dirty_files_across_worktrees_for_ring(ring)?;
         if !dirty_across.is_empty() && !force {
             eprintln!(
                 "git-agecrypt [WARNING]: Uncommitted (staged or unstaged) changes detected in tracked secret file(s):"
@@ -2596,9 +2759,26 @@ impl GitRepo {
                 git_dir: self.git_dir.clone(),
                 common_dir: self.common_dir.clone(),
             };
-            repo_for_wt.refresh_working_tree(force)?;
+            repo_for_wt.refresh_working_tree_for_ring(force, ring)?;
         }
 
+        Ok(())
+    }
+
+    /// Refreshes the working tree across all linked worktrees across all rings.
+    pub fn refresh_all_worktrees(&self, force: bool) -> Result<()> {
+        let worktrees = self.list_worktrees()?;
+        for wt in worktrees {
+            if !wt.join(".git").exists() {
+                continue;
+            }
+            let repo_for_wt = GitRepo {
+                root: wt,
+                git_dir: self.git_dir.clone(),
+                common_dir: self.common_dir.clone(),
+            };
+            repo_for_wt.refresh_working_tree(force)?;
+        }
         Ok(())
     }
 }

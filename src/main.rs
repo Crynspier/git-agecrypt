@@ -1681,6 +1681,6 @@ fn cmd_run(env_file_opt: Option<&Path>, command: &[String]) -> Result<()> {
 
     let status = child
         .status()
-        .with_context(|| format!("Failed to execute command '{}'", &command[0]))?;
+        .with_context(|| format!("Failed to execute command '{}'", command[0]))?;
     process::exit(status.code().unwrap_or(1));
 }

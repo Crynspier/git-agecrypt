@@ -17,8 +17,21 @@ permissions:
   contents: write
 
 jobs:
+  create-release:
+    name: Ensure Release Exists
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure GitHub Release exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.event.release.tag_name || github.ref_name || 'v0.1.0' }}"
+          gh release view "$TAG" || gh release create "$TAG" --title "$TAG" --generate-notes
+
   build-assets:
     name: Build & Upload (${{ matrix.target }})
+    needs: create-release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

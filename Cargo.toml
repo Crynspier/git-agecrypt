@@ -1,6 +1,7 @@
 [package]
 name = "git-agecrypt"
-version = "0.1.0"
+version = "0.1.1"
+# Rust language edition (RFC 3501, requires Rust 1.85+ for let-chains; valid values: 2015, 2018, 2021, 2024)
 edition = "2024"
 authors = ["Leon Zjakić <117075643+Crynspier@users.noreply.github.com>"]
 description = "Modern, GPG-free Git secrets filter using age encryption and SSH keys"
@@ -12,10 +13,10 @@ categories = ["command-line-utilities", "cryptography", "development-tools::vers
 
 [dependencies]
 age = { version = "0.12.1", features = ["ssh", "armor", "cli-common"] }
-clap = { version = "4.5", features = ["derive", "cargo"] }
-zeroize = { version = "1.8", features = ["derive"] }
-tempfile = "3.17"
-dirs = "6.0"
+clap = { version = "4.6", features = ["derive", "cargo"] }
+zeroize = { version = "1.9", features = ["derive"] }
+tempfile = "3.27"
+dirs = "7.0"
 anyhow = "1.0"
 sha2 = "0.10"
 hmac = "0.12"
@@ -23,10 +24,10 @@ ureq = { version = "2.12", default-features = false, features = ["tls"] }
 content_inspector = "0.2"
 glob = "0.3"
 filetime = "0.2.29"
-ctrlc = "3.4"
+ctrlc = "3.5"
 
 [dev-dependencies]
-assert_cmd = "2.0"
+assert_cmd = "2.2"
 predicates = "3.1"
 
 [profile.release]

@@ -1338,13 +1338,92 @@ impl GitRepo {
         false
     }
 
+    /// Heuristic check to determine if a filename suggests it contains sensitive secrets.
+    pub fn is_candidate_secret_filename(path_str: &str) -> bool {
+        let norm = path_str.replace('\\', "/");
+        let lower = norm.to_lowercase();
+        let file_name = match lower.rsplit('/').next() {
+            Some(name) => name,
+            None => &lower,
+        };
+
+        // Whitelisted safe non-secret files and templates
+        if file_name.ends_with(".pub")
+            || file_name.ends_with(".example")
+            || file_name.ends_with(".sample")
+            || file_name.ends_with(".template")
+            || file_name.ends_with(".dist")
+            || file_name.ends_with(".test")
+            || file_name.ends_with(".ci")
+            || file_name.ends_with(".md")
+            || file_name.ends_with(".lock")
+            || file_name.ends_with(".toml")
+            || file_name.ends_with(".rs")
+            || file_name.ends_with(".go")
+            || file_name.ends_with(".py")
+            || file_name.ends_with(".js")
+            || file_name.ends_with(".ts")
+        {
+            return false;
+        }
+
+        // Common secret patterns
+        if file_name == ".env"
+            || file_name.starts_with(".env.")
+            || file_name.ends_with(".env")
+            || file_name.contains(".secret.")
+            || file_name.ends_with(".secret")
+            || file_name.contains("credential")
+            || file_name.ends_with(".pem")
+            || file_name.ends_with(".key")
+            || file_name.ends_with(".pfx")
+            || file_name.ends_with(".p12")
+            || file_name.ends_with(".keystore")
+            || file_name.ends_with(".jks")
+            || norm.starts_with("secrets/")
+            || norm.contains("/secrets/")
+        {
+            return true;
+        }
+
+        false
+    }
+
+    /// Content-based heuristics for detecting plaintext private keys or tokens in staged content.
+    pub fn contains_secret_content_markers(bytes: &[u8]) -> bool {
+        let pem_markers: &[&[u8]] = &[
+            b"-----BEGIN RSA PRIVATE KEY-----",
+            b"-----BEGIN OPENSSH PRIVATE KEY-----",
+            b"-----BEGIN EC PRIVATE KEY-----",
+            b"-----BEGIN PRIVATE KEY-----",
+            b"-----BEGIN DSA PRIVATE KEY-----",
+            b"-----BEGIN ENCRYPTED PRIVATE KEY-----",
+        ];
+        for marker in pem_markers {
+            if bytes.windows(marker.len()).any(|w| w == *marker) {
+                return true;
+            }
+        }
+
+        if let Some(pos) = bytes.windows(4).position(|w| w == b"AKIA")
+            && bytes.len() >= pos + 20
+        {
+            let tail = &bytes[pos + 4..pos + 20];
+            if tail
+                .iter()
+                .all(|&b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Inspects staged blobs to ensure no unencrypted secrets are committed.
     /// Used by `git-agecrypt check` and the pre-commit hook.
-    pub fn check_staged_files(&self) -> Result<()> {
-        let patterns = self.get_tracked_patterns()?;
-        if patterns.is_empty() {
-            return Ok(());
-        }
+    pub fn check_staged_files(&self, allow_untracked_secrets: bool) -> Result<()> {
+        let _patterns = self.get_tracked_patterns().unwrap_or_default();
 
         let mut diff_cmd = git_cmd_with_path(&self.root);
         diff_cmd.args(["diff", "--cached", "--name-status", "-z"]);
@@ -1449,6 +1528,7 @@ impl GitRepo {
 
         let mut leaked_files = Vec::new();
         let mut foreign_key_files = Vec::new();
+        let mut untracked_secret_files = Vec::new();
 
         let master_identity = if let Ok(Some(k)) = self.read_local_master_key() {
             age::x25519::Identity::from_str(&k).ok()
@@ -1457,7 +1537,8 @@ impl GitRepo {
         };
 
         for path_str in paths_to_check {
-            if self.is_file_tracked(&path_str) {
+            let is_tracked = self.is_file_tracked(&path_str);
+            if is_tracked {
                 // Symlink / gitlink guard: Symlinks (mode 120000) contain target path string,
                 // and submodules (mode 160000) contain commit hashes, not secret payloads
                 if self.is_staged_special_entry(&path_str) {
@@ -1480,6 +1561,33 @@ impl GitRepo {
                                 decryptor.decrypt(std::iter::once(id as &dyn age::Identity))
                         {
                             foreign_key_files.push(path_str);
+                        }
+                    }
+                }
+            } else if !allow_untracked_secrets {
+                if self.is_staged_special_entry(&path_str) {
+                    continue;
+                }
+
+                let norm_path = path_str.replace('\\', "/");
+                let clean_path = norm_path.trim_start_matches('/');
+                let blob_ref = format!(":0:{clean_path}");
+
+                let is_secret_name = Self::is_candidate_secret_filename(&path_str);
+                if let Some(header) = self.read_blob_header(&blob_ref, 64 * 1024) {
+                    let prefix_len = std::cmp::min(header.len(), AGE_HEADER_MAGIC.len());
+                    let prefix = &header[..prefix_len];
+
+                    // Only alert if the staged content is plaintext (not age ciphertext)
+                    if !is_age_ciphertext(prefix) {
+                        if is_secret_name {
+                            untracked_secret_files
+                                .push((path_str.clone(), "file name matches known secret pattern"));
+                        } else if Self::contains_secret_content_markers(&header) {
+                            untracked_secret_files.push((
+                                path_str.clone(),
+                                "file content contains private key or credential marker",
+                            ));
                         }
                     }
                 }
@@ -1516,6 +1624,50 @@ impl GitRepo {
                 "================================================================================"
             );
             return Err(anyhow!("Commit aborted: unencrypted secrets detected"));
+        }
+
+        if !untracked_secret_files.is_empty() {
+            eprintln!();
+            eprintln!(
+                "================================================================================"
+            );
+            eprintln!("  CRITICAL SECURITY WARNING: UNTRACKED PLAINTEXT SECRET STAGED FOR COMMIT!");
+            eprintln!(
+                "================================================================================"
+            );
+            eprintln!(
+                "The following staged file(s) appear to contain unencrypted secrets but are NOT"
+            );
+            eprintln!("configured for encryption in .gitattributes:");
+            for (f, reason) in &untracked_secret_files {
+                eprintln!("  - '{f}' ({reason})");
+            }
+            eprintln!();
+            eprintln!("If committed, these files will be stored as plaintext in Git history!");
+            eprintln!();
+            eprintln!("To protect these files with git-agecrypt:");
+            eprintln!("  1. Add an encryption rule to .gitattributes, for example:");
+            for (f, _) in &untracked_secret_files {
+                eprintln!(
+                    "     echo \"{f} filter=agecrypt diff=agecrypt merge=agecrypt -text\" >> .gitattributes"
+                );
+            }
+            eprintln!("     git add .gitattributes");
+            eprintln!("  2. Re-stage the files to trigger the encryption filter:");
+            for (f, _) in &untracked_secret_files {
+                eprintln!("     git reset HEAD \"{f}\" && git add \"{f}\"");
+            }
+            eprintln!();
+            eprintln!("If these files are intentional non-secrets, bypass this check with:");
+            eprintln!(
+                "  git commit --no-verify  (or pass --allow-untracked-secrets to git-agecrypt check)"
+            );
+            eprintln!(
+                "================================================================================"
+            );
+            return Err(anyhow!(
+                "Commit aborted: untracked plaintext secret detected"
+            ));
         }
 
         if !foreign_key_files.is_empty() {

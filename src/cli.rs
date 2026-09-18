@@ -20,6 +20,10 @@ pub enum Commands {
         /// Automatically create a default .gitattributes template if none exists
         #[arg(long, default_value_t = true)]
         gitattributes: bool,
+
+        /// Automatically generate AI agent and IDE ignore files (.cursorignore, .claudeignore, etc.)
+        #[arg(long)]
+        ai_shield: bool,
     },
 
     /// Add an age or SSH public key recipient
@@ -74,6 +78,13 @@ pub enum Commands {
     /// Display git-agecrypt status, lock state, recipients, and tracked files
     Status,
 
+    /// Synchronize AI agent and IDE ignore files (.cursorignore, .claudeignore, .aiderignore, .aiignore) with .gitattributes
+    Shield {
+        /// Check whether AI shield ignore files are synchronized without modifying disk
+        #[arg(long)]
+        check: bool,
+    },
+
     /// Install automated pre-commit safeguard hook into .git/hooks/pre-commit
     InstallHooks,
 
@@ -82,6 +93,10 @@ pub enum Commands {
         /// Inspect outgoing commits passed via stdin by git pre-push hook
         #[arg(long)]
         pre_push: bool,
+
+        /// Allow untracked files matching secret heuristics to be committed as plaintext
+        #[arg(long)]
+        allow_untracked_secrets: bool,
     },
 
     /// Git clean filter driver (reads plaintext stdin -> writes age ciphertext stdout)

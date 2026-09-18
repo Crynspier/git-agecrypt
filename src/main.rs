@@ -3,6 +3,7 @@ mod crypto;
 mod git;
 mod github;
 mod merge;
+mod shield;
 
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -69,7 +70,10 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     match cli.command {
-        Commands::Init { gitattributes } => cmd_init(gitattributes),
+        Commands::Init {
+            gitattributes,
+            ai_shield,
+        } => cmd_init(gitattributes, ai_shield),
         Commands::AddRecipient {
             identity,
             github,
@@ -87,8 +91,12 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Unlock { key_file, force } => cmd_unlock(key_file.as_deref(), force),
         Commands::Lock { force } => cmd_lock(force),
         Commands::Status => cmd_status(),
+        Commands::Shield { check } => cmd_shield(check),
         Commands::InstallHooks => cmd_install_hooks(),
-        Commands::Check { pre_push } => cmd_check(pre_push),
+        Commands::Check {
+            pre_push,
+            allow_untracked_secrets,
+        } => cmd_check(pre_push, allow_untracked_secrets),
         Commands::Clean { file_path } => cmd_clean(file_path.as_deref()),
         Commands::Smudge { file_path } => cmd_smudge(file_path.as_deref()),
         Commands::Textconv { file } => cmd_textconv(&file),
@@ -103,7 +111,7 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn cmd_init(create_gitattributes: bool) -> Result<()> {
+fn cmd_init(create_gitattributes: bool, ai_shield: bool) -> Result<()> {
     let repo = GitRepo::discover()?;
     eprintln!("Initializing git-agecrypt in {}", repo.root.display());
 
@@ -167,6 +175,17 @@ secrets/** filter=agecrypt diff=agecrypt merge=agecrypt -text
 "#;
             fs::write(&gitattributes_path, template)?;
             eprintln!("Created default .gitattributes template (with -text binary safety flag).");
+        }
+    }
+
+    // Synchronize AI agent and IDE ignore files (.cursorignore, .claudeignore, .aiderignore, .aiignore)
+    let tracked_patterns = repo.get_tracked_patterns()?;
+    if !tracked_patterns.is_empty() {
+        let updated = shield::sync_ai_shields(&repo.root, &tracked_patterns, ai_shield)?;
+        if !updated.is_empty() {
+            eprintln!(
+                "Synchronized AI agent and IDE ignore files (.cursorignore, .claudeignore, .aiderignore, .aiignore)."
+            );
         }
     }
 
@@ -1134,6 +1153,39 @@ fn cmd_status() -> Result<()> {
     Ok(())
 }
 
+fn cmd_shield(check: bool) -> Result<()> {
+    let repo = GitRepo::discover()?;
+    let patterns = repo.get_tracked_patterns()?;
+    if check {
+        let synced = shield::check_ai_shields(&repo.root, &patterns)?;
+        if synced {
+            println!("AI agent and IDE ignore files are synchronized with .gitattributes.");
+            Ok(())
+        } else {
+            eprintln!(
+                "git-agecrypt shield: AI ignore files are NOT synchronized with .gitattributes."
+            );
+            eprintln!("Run 'git-agecrypt shield' to synchronize.");
+            std::process::exit(1);
+        }
+    } else {
+        let updated = shield::sync_ai_shields(&repo.root, &patterns, true)?;
+        if updated.is_empty() {
+            println!("AI agent and IDE ignore files are already up to date.");
+        } else {
+            println!(
+                "Successfully synchronized {} AI ignore file(s):",
+                updated.len()
+            );
+            for p in updated {
+                let name = p.file_name().unwrap_or_default().to_string_lossy();
+                println!("  - {name}");
+            }
+        }
+        Ok(())
+    }
+}
+
 fn cmd_install_hooks() -> Result<()> {
     let repo = GitRepo::discover()?;
     repo.install_pre_commit_hook()?;
@@ -1141,12 +1193,12 @@ fn cmd_install_hooks() -> Result<()> {
     Ok(())
 }
 
-fn cmd_check(pre_push: bool) -> Result<()> {
+fn cmd_check(pre_push: bool, allow_untracked_secrets: bool) -> Result<()> {
     let repo = GitRepo::discover()?;
     if pre_push {
         repo.check_pushed_commits()?;
     } else {
-        repo.check_staged_files()?;
+        repo.check_staged_files(allow_untracked_secrets)?;
     }
     Ok(())
 }
@@ -1413,7 +1465,7 @@ fn cmd_migrate(identity: Option<&str>) -> Result<()> {
     eprintln!("Updated .gitattributes: migrated filter=git-crypt -> filter=agecrypt");
 
     // Run init
-    cmd_init(false)?;
+    cmd_init(false, false)?;
 
     if let Some(id) = identity {
         cmd_add_recipient(Some(id), None, Some("migration-recipient"))?;

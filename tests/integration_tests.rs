@@ -5416,3 +5416,238 @@ fn test_list_recipients_deterministic_alphabetical() {
         "Recipients must be listed in deterministic alphabetical order: alice < bob < charlie. Actual output:\n{stdout_str}"
     );
 }
+
+#[test]
+fn test_ai_shield_synchronization_on_init() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Test Developer"]);
+    run_git(repo, &["config", "user.email", "dev@example.com"]);
+
+    let mut init_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    init_cmd
+        .current_dir(repo)
+        .args(["init", "--ai-shield"])
+        .assert()
+        .success();
+
+    // Verify all 4 target ignore files were created
+    for target in &[
+        ".cursorignore",
+        ".claudeignore",
+        ".aiderignore",
+        ".aiignore",
+    ] {
+        let path = repo.join(target);
+        assert!(path.exists(), "{target} must exist after git-agecrypt init");
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("# --- BEGIN git-agecrypt AI SHIELD ---"),
+            "{target} missing begin marker"
+        );
+        assert!(
+            content.contains("*.secret.env"),
+            "{target} missing *.secret.env pattern"
+        );
+        assert!(
+            content.contains("secrets/**"),
+            "{target} missing secrets/** pattern"
+        );
+        assert!(
+            content.contains("# --- END git-agecrypt AI SHIELD ---"),
+            "{target} missing end marker"
+        );
+    }
+
+    // Check command should report synced
+    let mut check_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    check_cmd
+        .current_dir(repo)
+        .args(["shield", "--check"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_ai_shield_preserves_user_rules_and_idempotency() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Test Developer"]);
+    run_git(repo, &["config", "user.email", "dev@example.com"]);
+
+    // Write pre-existing user rules in .cursorignore
+    let cursor_ignore = repo.join(".cursorignore");
+    fs::write(
+        &cursor_ignore,
+        "# User pre-existing rules\nnode_modules/\ndist/\n",
+    )
+    .unwrap();
+
+    let mut init_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    init_cmd.current_dir(repo).arg("init").assert().success();
+
+    let content_after_init = fs::read_to_string(&cursor_ignore).unwrap();
+    assert!(content_after_init.contains("# User pre-existing rules"));
+    assert!(content_after_init.contains("node_modules/"));
+    assert!(content_after_init.contains("dist/"));
+    assert!(content_after_init.contains("# --- BEGIN git-agecrypt AI SHIELD ---"));
+
+    // Run shield sync again (idempotency check)
+    let mut shield_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    shield_cmd
+        .current_dir(repo)
+        .arg("shield")
+        .assert()
+        .success();
+
+    let content_after_resync = fs::read_to_string(&cursor_ignore).unwrap();
+    assert_eq!(
+        content_after_init, content_after_resync,
+        "Repeated shield runs must be strictly idempotent"
+    );
+}
+
+#[test]
+fn test_ai_shield_check_detects_out_of_sync() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Test Developer"]);
+    run_git(repo, &["config", "user.email", "dev@example.com"]);
+
+    let mut init_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    init_cmd.current_dir(repo).arg("init").assert().success();
+
+    // Append a new secret pattern to .gitattributes
+    let gitattrs = repo.join(".gitattributes");
+    let mut f = fs::OpenOptions::new().append(true).open(&gitattrs).unwrap();
+    use std::io::Write;
+    writeln!(
+        f,
+        "tokens/* filter=agecrypt diff=agecrypt merge=agecrypt -text"
+    )
+    .unwrap();
+
+    // Now shield --check must detect that AI ignore files are out of sync
+    let mut check_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    check_cmd
+        .current_dir(repo)
+        .args(["shield", "--check"])
+        .assert()
+        .failure();
+
+    // Run shield to synchronize
+    let mut shield_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    shield_cmd
+        .current_dir(repo)
+        .arg("shield")
+        .assert()
+        .success();
+
+    // Now shield --check passes
+    let mut check_cmd2 = Command::cargo_bin("git-agecrypt").unwrap();
+    check_cmd2
+        .current_dir(repo)
+        .args(["shield", "--check"])
+        .assert()
+        .success();
+
+    let cursor_content = fs::read_to_string(repo.join(".cursorignore")).unwrap();
+    assert!(cursor_content.contains("tokens/*"));
+}
+
+#[test]
+fn test_check_staged_untracked_secret_detection() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Test Developer"]);
+    run_git(repo, &["config", "user.email", "dev@example.com"]);
+
+    let mut init_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    init_cmd.current_dir(repo).arg("init").assert().success();
+
+    // Create an untracked secret file (not in .gitattributes)
+    let secret = repo.join("database.env");
+    fs::write(
+        &secret,
+        "DATABASE_PASSWORD=SuperSecretPlaintextPassword123\n",
+    )
+    .unwrap();
+
+    run_git(repo, &["add", "database.env"]);
+
+    // git-agecrypt check should detect the untracked secret and fail
+    let mut check_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    check_cmd.current_dir(repo).arg("check").assert().failure();
+
+    // With --allow-untracked-secrets flag, it should pass
+    let mut bypass_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    bypass_cmd
+        .current_dir(repo)
+        .args(["check", "--allow-untracked-secrets"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_check_staged_untracked_private_key_content_detection() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Test Developer"]);
+    run_git(repo, &["config", "user.email", "dev@example.com"]);
+
+    let mut init_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    init_cmd.current_dir(repo).arg("init").assert().success();
+
+    // Staging a file with private key content under an arbitrary name
+    let key_file = repo.join("deploy_auth");
+    fs::write(
+        &key_file,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAA=\n-----END OPENSSH PRIVATE KEY-----\n",
+    )
+    .unwrap();
+
+    run_git(repo, &["add", "deploy_auth"]);
+
+    let mut check_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    check_cmd.current_dir(repo).arg("check").assert().failure();
+}
+
+#[test]
+fn test_check_staged_safe_files_not_flagged() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.name", "Test Developer"]);
+    run_git(repo, &["config", "user.email", "dev@example.com"]);
+
+    let mut init_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    init_cmd.current_dir(repo).arg("init").assert().success();
+
+    // Safe files: .env.example, public key .pub, and regular code/docs
+    fs::write(repo.join(".env.example"), "DB_PASS=replace_me\n").unwrap();
+    fs::write(
+        repo.join("id_ed25519.pub"),
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI user@host\n",
+    )
+    .unwrap();
+    fs::write(repo.join("README.md"), "# Project Docs\n").unwrap();
+
+    run_git(
+        repo,
+        &["add", ".env.example", "id_ed25519.pub", "README.md"],
+    );
+
+    let mut check_cmd = Command::cargo_bin("git-agecrypt").unwrap();
+    check_cmd.current_dir(repo).arg("check").assert().success();
+}

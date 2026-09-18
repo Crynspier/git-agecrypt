@@ -4,7 +4,7 @@ Transparent client-side Git encryption using [age](https://age-encryption.org/v1
 
 [![CI](https://github.com/Crynspier/git-agecrypt/actions/workflows/ci.yml/badge.svg)](https://github.com/Crynspier/git-agecrypt/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
-[![Rust 1.74+](https://img.shields.io/badge/rust-1.74%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 
 ---
 
@@ -72,6 +72,8 @@ When a team member rotates the master key via `git-agecrypt rekey`, collaborator
 - **Automated 3-way merge driver:** Decrypts conflicting branches, performs line-based 3-way merging, re-encrypts the result, and protects binary secrets from corruption.
 - **Worktree native:** A single unlock operates across all linked Git worktrees via `--git-common-dir`.
 - **Safeguard hooks:** Pre-commit and pre-push hooks inspect staged blobs in the Git index (`:0:<path>`) to block accidental cleartext leaks or commits encrypted under revoked keys.
+- **Untracked secret leak scanner:** Pre-commit safeguard scans all staged files and aborts commits if untracked files matching secret heuristics (e.g. `.env`, private keys) are staged in plaintext.
+- **AI and IDE shielding:** Synchronizes ignore rules across `.cursorignore`, `.claudeignore`, `.aiderignore`, and `.aiignore` so local LLM indexers never ingest unencrypted working-tree secrets.
 - **Headless CI/CD friendly:** Unlocks from stdin (`echo "$KEY" | git-agecrypt unlock -`) with zero daemon processes.
 - **Standalone binary:** Pure Rust with zero external dynamic library dependencies (no OpenSSL DLLs).
 
@@ -105,7 +107,7 @@ Extract the binary and place it in your system `PATH` (e.g. `/usr/local/bin` on 
 
 ### Building From Source
 
-Requires Rust 1.74 or later:
+Requires Rust 1.85 or later (Rust 2024 edition):
 
 ```bash
 git clone https://github.com/Crynspier/git-agecrypt.git
@@ -331,7 +333,7 @@ git commit -m "Migrate from git-crypt to git-agecrypt"
 
 | Command | Options | Description |
 |---|---|---|
-| `init` | `[--gitattributes]` | Initialize master key, enroll current SSH key, configure Git filters, and install hooks. |
+| `init` | `[--gitattributes], [--ai-shield]` | Initialize master key, enroll current SSH key, configure Git filters, and install hooks. |
 | `add-recipient` | `-i, --identity <KEY>`, `--github <USER>`, `-n, --name <NAME>` | Enroll a new recipient public key. |
 | `remove-recipient` | `<NAME>` | Remove an enrolled recipient. |
 | `list-recipients` | *(none)* | Display all enrolled recipients in alphabetical order. |
@@ -340,8 +342,9 @@ git commit -m "Migrate from git-crypt to git-agecrypt"
 | `rekey` | `-f, --force` | Rotate the master key and re-encrypt all tracked secret files. |
 | `rewrap` | `[PATH]...`, `-a, --all`, `-i, --identity <KEY>`, `-f, --force` | Re-encrypt historical ciphertexts under the active master key. |
 | `status` | *(none)* | Display repository status, active key fingerprint, and tracked files. |
+| `shield` | `[--check]` | Synchronize AI agent and IDE ignore files (`.cursorignore`, `.claudeignore`, `.aiderignore`, `.aiignore`). |
 | `install-hooks` | *(none)* | Install or update safeguard hooks (`pre-commit`, `pre-merge-commit`, `pre-push`). |
-| `check` | `[--pre-push]` | Validate staged files or outgoing commits against unencrypted leaks. |
+| `check` | `[--pre-push], [--allow-untracked-secrets]` | Validate staged files or outgoing commits against unencrypted or untracked secret leaks. |
 | `clean` | `[PATH]` | Git clean filter (streams stdin plaintext to stdout ciphertext). |
 | `smudge` | `[PATH]` | Git smudge filter (streams stdin ciphertext to stdout plaintext). |
 | `textconv` | `<PATH>` | Git diff driver (decrypts target for cleartext diffs). |
@@ -359,6 +362,8 @@ git commit -m "Migrate from git-crypt to git-agecrypt"
 - **Deterministic Ciphertext Caching:** Cache lookup keys are derived using `HMAC-SHA256(master_key, plaintext)`. The cache key cannot be precomputed without the master key, protecting low-entropy secrets from dictionary or rainbow-table attacks.
 - **Payload Authentication:** Any bit manipulation of ciphertext headers or chunks fails Poly1305 AEAD authentication immediately, preventing silent corruption.
 - **Partial Hunk Staging:** `git add -p` is blocked by safeguard hooks because Git's interactive hunk applier bypasses clean filter drivers.
+- **Local Context Exposure Mitigation:** Local LLM agents and IDE context indexers operate directly on the unencrypted working tree. Synchronizing `.cursorignore`, `.claudeignore`, `.aiderignore`, and `.aiignore` against active `.gitattributes` guarantees that transparently smudged secrets are excluded from workspace indexing and automated prompt context windows.
+- **Pre-Commit Heuristic Guard:** Safeguard hooks inspect all staged index entries against known credential filename patterns and private key headers (`-----BEGIN ... PRIVATE KEY-----`, AWS client keys), preventing unconfigured or untracked plaintext secrets from slipping past Git filters.
 
 ### Caveats & Inherited Risks
 
@@ -408,7 +413,7 @@ done
 
 ## Minimum Supported Versions
 
-- **Rust:** 1.74.0+
+- **Rust:** 1.85.0+ (Rust 2024 edition)
 - **Git:** 2.25.0+ (recommended for `--pathspec-from-file` and `-z` null-delimited plumbing)
 
 ---

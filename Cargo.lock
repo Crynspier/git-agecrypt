@@ -954,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "git-agecrypt"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "age",
  "anyhow",
@@ -966,6 +966,7 @@ dependencies = [
  "filetime",
  "glob",
  "hmac",
+ "libc",
  "predicates",
  "proptest",
  "sha2 0.10.9",

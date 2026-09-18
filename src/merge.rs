@@ -223,8 +223,8 @@ pub fn run_3way_merge(
             None
         };
 
-        // Ensure disk flush before atomic rename
-        let _ = temp_target.as_file().sync_all();
+        // Ensure disk flush before atomic rename (fail-closed durability)
+        temp_target.as_file().sync_all()?;
 
         // Atomically replace `ours` with retry for antivirus software on Windows
         let mut to_persist = temp_target;

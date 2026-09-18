@@ -253,14 +253,34 @@ impl GitRepo {
         self.root.join(".git-agecrypt")
     }
 
+    /// Returns the metadata directory for a given ring.
+    /// If ring is None or "default", returns `.git-agecrypt`.
+    /// Otherwise returns `.git-agecrypt/rings/<ring>`.
+    pub fn ring_metadata_dir(&self, ring: Option<&str>) -> PathBuf {
+        match ring {
+            None | Some("default") | Some("") => self.agecrypt_metadata_dir(),
+            Some(r) => self.agecrypt_metadata_dir().join("rings").join(r),
+        }
+    }
+
     /// Path to the committed public key file (`.git-agecrypt/repo.pub`).
     pub fn public_key_file(&self) -> PathBuf {
-        self.agecrypt_metadata_dir().join("repo.pub")
+        self.public_key_file_for_ring(None)
+    }
+
+    /// Path to the committed public key file for a ring.
+    pub fn public_key_file_for_ring(&self, ring: Option<&str>) -> PathBuf {
+        self.ring_metadata_dir(ring).join("repo.pub")
     }
 
     /// Path to the committed recipient keys directory (`.git-agecrypt/keys/`).
     pub fn keys_dir(&self) -> PathBuf {
-        self.agecrypt_metadata_dir().join("keys")
+        self.keys_dir_for_ring(None)
+    }
+
+    /// Path to recipient keys directory for a ring.
+    pub fn keys_dir_for_ring(&self, ring: Option<&str>) -> PathBuf {
+        self.ring_metadata_dir(ring).join("keys")
     }
 
     /// Path to local untracked cache directory in the common git dir (shared across worktrees).
@@ -268,9 +288,17 @@ impl GitRepo {
         self.common_dir.join("git-agecrypt")
     }
 
-    /// Ensures `.git/git-agecrypt/` exists with secure owner-only permissions (0700 on Unix).
-    pub fn ensure_local_state_dir(&self) -> Result<PathBuf> {
-        let state_dir = self.local_state_dir();
+    /// Path to local state directory for a ring.
+    pub fn local_state_dir_for_ring(&self, ring: Option<&str>) -> PathBuf {
+        match ring {
+            None | Some("default") | Some("") => self.local_state_dir(),
+            Some(r) => self.local_state_dir().join("rings").join(r),
+        }
+    }
+
+    /// Ensures local state directory for a ring exists with 0700 permissions.
+    pub fn ensure_local_state_dir_for_ring(&self, ring: Option<&str>) -> Result<PathBuf> {
+        let state_dir = self.local_state_dir_for_ring(ring);
         fs::create_dir_all(&state_dir)?;
         #[cfg(unix)]
         {
@@ -295,15 +323,18 @@ impl GitRepo {
 
     /// Path to local untracked master key (`repo.key`).
     pub fn local_master_key_file(&self) -> PathBuf {
-        self.local_state_dir().join("repo.key")
+        self.local_master_key_file_for_ring(None)
     }
 
-    /// Path to local untracked ciphertext cache directory in the common git dir.
-    /// Namespaced by the repository master public key to guarantee that rotating
-    /// keys (rekeying) immediately invalidates and isolates all previous cached ciphertexts.
-    pub fn cache_dir(&self) -> PathBuf {
-        let base_cache = self.local_state_dir().join("cache");
-        let dir = if let Ok(pub_key) = fs::read_to_string(self.public_key_file()) {
+    /// Path to local untracked master key for a ring.
+    pub fn local_master_key_file_for_ring(&self, ring: Option<&str>) -> PathBuf {
+        self.local_state_dir_for_ring(ring).join("repo.key")
+    }
+
+    /// Path to ciphertext cache directory for a ring.
+    pub fn cache_dir_for_ring(&self, ring: Option<&str>) -> PathBuf {
+        let base_cache = self.local_state_dir_for_ring(ring).join("cache");
+        let dir = if let Ok(pub_key) = fs::read_to_string(self.public_key_file_for_ring(ring)) {
             let digest = sha2::Sha256::digest(pub_key.trim().as_bytes());
             let hash_hex = format!("{:x}", digest);
             base_cache.join(&hash_hex[..16])
@@ -317,15 +348,49 @@ impl GitRepo {
     pub fn clear_cache(&self) -> Result<()> {
         let base_cache = self.local_state_dir().join("cache");
         if base_cache.exists() {
-            fs::remove_dir_all(&base_cache)?;
+            let _ = fs::remove_dir_all(&base_cache);
+        }
+        let rings_cache = self.local_state_dir().join("rings");
+        if rings_cache.exists() {
+            let _ = fs::remove_dir_all(&rings_cache);
         }
         self.sweep_orphaned_tmp_files();
         Ok(())
     }
 
-    /// Checks if the repository is currently unlocked.
+    /// Checks if the repository (default ring) is currently unlocked.
     pub fn is_unlocked(&self) -> bool {
-        self.local_master_key_file().exists()
+        self.is_unlocked_for_ring(None)
+    }
+
+    /// Checks if a ring is currently unlocked.
+    pub fn is_unlocked_for_ring(&self, ring: Option<&str>) -> bool {
+        self.local_master_key_file_for_ring(ring).exists()
+    }
+
+    /// List all registered rings in the repository (including "default" if configured).
+    pub fn list_rings(&self) -> Result<Vec<String>> {
+        let mut rings = Vec::new();
+        if self.public_key_file().exists() || self.keys_dir().exists() {
+            rings.push("default".to_string());
+        }
+        let rings_dir = self.agecrypt_metadata_dir().join("rings");
+        if rings_dir.exists() {
+            if let Ok(entries) = fs::read_dir(rings_dir) {
+                for entry in entries.flatten() {
+                    if let Ok(file_type) = entry.file_type() {
+                        if file_type.is_dir() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if !name.starts_with('.') && !rings.contains(&name) {
+                                rings.push(name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        rings.sort();
+        Ok(rings)
     }
 
     /// Path to the write-ahead log (WAL) journal file for lock operations.
@@ -333,9 +398,13 @@ impl GitRepo {
         self.local_state_dir().join("lock.journal")
     }
 
-    /// Atomically stores the master secret key in `.git/git-agecrypt/repo.key`.
-    pub fn save_local_master_key(&self, secret_key: &str) -> Result<()> {
-        let state_dir = self.ensure_local_state_dir()?;
+    /// Atomically stores the master secret key for a specific ring.
+    pub fn save_local_master_key_for_ring(
+        &self,
+        secret_key: &str,
+        ring: Option<&str>,
+    ) -> Result<()> {
+        let state_dir = self.ensure_local_state_dir_for_ring(ring)?;
 
         let temp_path = state_dir.join(format!("repo.key.tmp.{}", std::process::id()));
         {
@@ -368,7 +437,7 @@ impl GitRepo {
             }
         }
 
-        let dest = self.local_master_key_file();
+        let dest = self.local_master_key_file_for_ring(ring);
 
         #[cfg(windows)]
         {
@@ -811,8 +880,12 @@ impl GitRepo {
     /// Atomically stages `repo.key` -> `repo.key.locking`.
     /// If `f()` succeeds: removes `repo.key.locking` and `lock.journal`.
     /// If `f()` fails: restores `repo.key.locking` -> `repo.key` AND replays recovery from `lock.journal`.
-    pub fn transactional_lock<F: FnOnce() -> Result<()>>(&self, f: F) -> Result<()> {
-        let key_file = self.local_master_key_file();
+    pub fn transactional_lock_for_ring<F: FnOnce() -> Result<()>>(
+        &self,
+        ring: Option<&str>,
+        f: F,
+    ) -> Result<()> {
+        let key_file = self.local_master_key_file_for_ring(ring);
         if !key_file.exists() {
             return f();
         }
@@ -838,7 +911,7 @@ impl GitRepo {
                     for path_slice in out.stdout.split(|&b| b == 0) {
                         if !path_slice.is_empty() {
                             let rel_path = String::from_utf8_lossy(path_slice);
-                            if repo_for_wt.is_file_tracked(&rel_path) {
+                            if repo_for_wt.is_file_tracked_for_ring(&rel_path, ring) {
                                 journal_content.push_str(&format!(
                                     "{}\t{}\n",
                                     wt.display(),
@@ -861,7 +934,8 @@ impl GitRepo {
             let _ = jf.sync_all();
         }
 
-        let locking_file = self.local_state_dir().join("repo.key.locking");
+        let state_dir = self.ensure_local_state_dir_for_ring(ring)?;
+        let locking_file = state_dir.join("repo.key.locking");
         if locking_file.exists() {
             let _ = fs::remove_file(&locking_file);
         }
@@ -891,7 +965,12 @@ impl GitRepo {
 
     /// Reads the stored local master key if present.
     pub fn read_local_master_key(&self) -> Result<Option<String>> {
-        let key_file = self.local_master_key_file();
+        self.read_local_master_key_for_ring(None)
+    }
+
+    /// Reads the stored local master key for a specific ring if present.
+    pub fn read_local_master_key_for_ring(&self, ring: Option<&str>) -> Result<Option<String>> {
+        let key_file = self.local_master_key_file_for_ring(ring);
         if !key_file.exists() {
             return Ok(None);
         }
@@ -902,11 +981,16 @@ impl GitRepo {
     /// Checks if the locally saved master key is stale relative to the committed `.git-agecrypt/repo.pub`.
     /// This happens when an upstream teammate re-keyed the repository and the current user pulled changes.
     pub fn is_local_master_key_stale(&self) -> Result<bool> {
-        let pub_file = self.public_key_file();
+        self.is_local_master_key_stale_for_ring(None)
+    }
+
+    /// Checks if the locally saved master key for a specific ring is stale.
+    pub fn is_local_master_key_stale_for_ring(&self, ring: Option<&str>) -> Result<bool> {
+        let pub_file = self.public_key_file_for_ring(ring);
         if !pub_file.exists() {
             return Ok(false);
         }
-        let Some(key_str) = self.read_local_master_key()? else {
+        let Some(key_str) = self.read_local_master_key_for_ring(ring)? else {
             return Ok(false);
         };
         let pub_content = fs::read_to_string(&pub_file)?;
@@ -924,30 +1008,36 @@ impl GitRepo {
         Ok(false)
     }
 
-    /// Attempts to automatically synchronize and unwrap a rotated master key from `.git-agecrypt/keys/*.age`
-    /// using standard SSH/age identity keys on the local system.
-    /// Uses an advisory file lock (`refresh.lock`) with wait-and-adopt polling to prevent race conditions
-    /// between parallel smudge workers (`checkout.workers > 1`), and runs strictly non-interactively.
-    pub fn try_auto_refresh_master_key(&self) -> Result<Option<String>> {
-        let keys_dir = self.keys_dir();
+    /// Attempts to automatically synchronize and unwrap a rotated master key for a specific ring.
+    pub fn try_auto_refresh_master_key_for_ring(
+        &self,
+        ring: Option<&str>,
+    ) -> Result<Option<String>> {
+        let keys_dir = self.keys_dir_for_ring(ring);
         if !keys_dir.exists() {
             return Ok(None);
         }
 
         // Fast-path: check if another worker already refreshed the key
-        if !self.is_local_master_key_stale().unwrap_or(true) {
-            return self.read_local_master_key();
+        if !self
+            .is_local_master_key_stale_for_ring(ring)
+            .unwrap_or(true)
+        {
+            return self.read_local_master_key_for_ring(ring);
         }
 
-        let state_dir = self.ensure_local_state_dir()?;
+        let state_dir = self.ensure_local_state_dir_for_ring(ring)?;
         let lock_path = state_dir.join("refresh.lock");
         let start = std::time::Instant::now();
         let mut _guard = None;
 
         // Acquire advisory lock with wait-and-adopt protocol for parallel smudge workers
         while start.elapsed() < std::time::Duration::from_secs(5) {
-            if !self.is_local_master_key_stale().unwrap_or(true) {
-                return self.read_local_master_key();
+            if !self
+                .is_local_master_key_stale_for_ring(ring)
+                .unwrap_or(true)
+            {
+                return self.read_local_master_key_for_ring(ring);
             }
 
             match fs::OpenOptions::new()
@@ -1024,8 +1114,11 @@ impl GitRepo {
         }
 
         // Check again after acquiring or timing out
-        if !self.is_local_master_key_stale().unwrap_or(true) {
-            return self.read_local_master_key();
+        if !self
+            .is_local_master_key_stale_for_ring(ring)
+            .unwrap_or(true)
+        {
+            return self.read_local_master_key_for_ring(ring);
         }
 
         // Only use non-interactive loader so we never touch stdin or prompt in background filter!
@@ -1044,16 +1137,17 @@ impl GitRepo {
             return Ok(None);
         }
 
-        let expected_pub = if let Ok(pub_content) = fs::read_to_string(self.public_key_file()) {
-            let trimmed = pub_content.trim().to_string();
-            if trimmed.is_empty() {
-                None
+        let expected_pub =
+            if let Ok(pub_content) = fs::read_to_string(self.public_key_file_for_ring(ring)) {
+                let trimmed = pub_content.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
             } else {
-                Some(trimmed)
-            }
-        } else {
-            None
-        };
+                None
+            };
 
         let entries = fs::read_dir(&keys_dir)?;
         for entry in entries {
@@ -1069,7 +1163,7 @@ impl GitRepo {
                 {
                     continue;
                 }
-                self.save_local_master_key(&master_key)?;
+                self.save_local_master_key_for_ring(&master_key, ring)?;
                 return Ok(Some(master_key));
             }
         }
@@ -1133,23 +1227,40 @@ impl GitRepo {
         Ok(None)
     }
 
-    /// Configures the git filter, diff, and merge drivers in local `.git/config`.
-    pub fn configure_git_filters(&self) -> Result<()> {
+    /// Configures the git filter, diff, and merge drivers for a specific ring in local `.git/config`.
+    pub fn configure_git_filters_for_ring(&self, ring: Option<&str>) -> Result<()> {
+        let is_default = matches!(ring, None | Some("default") | Some(""));
+        let driver_name = if is_default {
+            "agecrypt".to_string()
+        } else {
+            format!("agecrypt-{}", ring.unwrap())
+        };
+        let ring_arg = if is_default {
+            "".to_string()
+        } else {
+            format!(" --ring {}", ring.unwrap())
+        };
+
+        let clean_cmd = format!("git-agecrypt clean %f{ring_arg}");
+        let smudge_cmd = format!("git-agecrypt smudge %f{ring_arg}");
+        let textconv_cmd = format!("git-agecrypt textconv{ring_arg}");
+        let merge_cmd = format!("git-agecrypt merge \"%O\" \"%A\" \"%B\" %L \"%P\"{ring_arg}");
+
         let configs = [
-            ("filter.agecrypt.clean", "git-agecrypt clean %f"),
-            ("filter.agecrypt.smudge", "git-agecrypt smudge %f"),
-            ("filter.agecrypt.required", "true"),
-            ("diff.agecrypt.textconv", "git-agecrypt textconv"),
+            (format!("filter.{driver_name}.clean"), clean_cmd),
+            (format!("filter.{driver_name}.smudge"), smudge_cmd),
+            (format!("filter.{driver_name}.required"), "true".to_string()),
+            (format!("diff.{driver_name}.textconv"), textconv_cmd),
+            (format!("merge.{driver_name}.driver"), merge_cmd),
             (
-                "merge.agecrypt.driver",
-                "git-agecrypt merge \"%O\" \"%A\" \"%B\" %L \"%P\"",
+                format!("merge.{driver_name}.name"),
+                format!("git-agecrypt 3-way merge driver ({driver_name})"),
             ),
-            ("merge.agecrypt.name", "git-agecrypt 3-way merge driver"),
         ];
 
         for (key, val) in configs {
             let status = git_cmd_with_path(&self.root)
-                .args(["config", "--local", key, val])
+                .args(["config", "--local", &key, &val])
                 .status()
                 .with_context(|| format!("Failed to set git config '{key}'"))?;
 
@@ -1255,17 +1366,19 @@ impl GitRepo {
         Ok(())
     }
 
-    /// Reads patterns configured for agecrypt from `.gitattributes`.
     /// Reads patterns configured for agecrypt from `.gitattributes` and validates attributes.
     pub fn get_tracked_patterns(&self) -> Result<Vec<String>> {
+        self.get_tracked_patterns_for_ring(None)
+    }
+
+    /// Reads patterns configured for any agecrypt ring from `.gitattributes`.
+    pub fn get_tracked_patterns_all_rings(&self) -> Result<Vec<String>> {
         let gitattributes_path = self.root.join(".gitattributes");
         if !gitattributes_path.exists() {
             return Ok(Vec::new());
         }
-
         let content = fs::read_to_string(&gitattributes_path)?;
         let mut patterns = Vec::new();
-
         for line in content.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -1275,11 +1388,43 @@ impl GitRepo {
                 let parts: Vec<&str> = trimmed.split_whitespace().collect();
                 if let Some(pat) = parts.first() {
                     patterns.push(pat.to_string());
+                }
+            }
+        }
+        Ok(patterns)
+    }
+
+    /// Reads patterns configured for agecrypt (or a specific ring) from `.gitattributes`.
+    pub fn get_tracked_patterns_for_ring(&self, ring: Option<&str>) -> Result<Vec<String>> {
+        let gitattributes_path = self.root.join(".gitattributes");
+        if !gitattributes_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let is_default = matches!(ring, None | Some("default") | Some(""));
+        let filter_needle = if is_default {
+            "filter=agecrypt".to_string()
+        } else {
+            format!("filter=agecrypt-{}", ring.unwrap())
+        };
+
+        let content = fs::read_to_string(&gitattributes_path)?;
+        let mut patterns = Vec::new();
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if trimmed.contains(&filter_needle) {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if let Some(pat) = parts.first() {
+                    patterns.push(pat.to_string());
 
                     // Check for conflicting filter drivers (e.g. filter=lfs)
                     if trimmed.contains("filter=lfs") {
                         eprintln!(
-                            "git-agecrypt [WARNING]: Pattern '{pat}' in .gitattributes specifies both 'filter=agecrypt' and 'filter=lfs'. \
+                            "git-agecrypt [WARNING]: Pattern '{pat}' in .gitattributes specifies both '{filter_needle}' and 'filter=lfs'. \
                              Git does not support filter chaining; one driver will silently override the other!"
                         );
                     }
@@ -1318,27 +1463,65 @@ impl GitRepo {
         false
     }
 
-    /// Checks whether Git assigns the `agecrypt` filter to a file path.
-    /// Uses `git check-attr filter -- <path>` for native multi-level attribute resolution,
-    /// with a fallback to `matches_tracked_pattern`.
-    pub fn is_file_tracked(&self, file_path: &str) -> bool {
+    /// Gets the filter attribute value configured for `file_path`.
+    pub fn get_file_filter(&self, file_path: &str) -> Option<String> {
         let normalized = file_path.replace('\\', "/");
         let output = git_cmd_with_path(&self.root)
             .args(["check-attr", "filter", "--", &normalized])
-            .output();
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                if let Some((_, val)) = line.split_once(": filter: ") {
+                    let v = val.trim();
+                    if v != "unspecified" && v != "unset" {
+                        return Some(v.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
 
-        if let Ok(out) = output
-            && out.status.success()
-        {
-            let text = String::from_utf8_lossy(&out.stdout);
-            // Output format: "<path>: filter: agecrypt"
-            if text.contains(": filter: agecrypt") {
+    /// Checks whether Git assigns the `agecrypt` filter (default or any ring) to a file path.
+    pub fn is_file_tracked(&self, file_path: &str) -> bool {
+        if let Some(actual) = self.get_file_filter(file_path) {
+            if actual == "agecrypt" || actual.starts_with("agecrypt-") {
                 return true;
+            }
+        }
+        // Fallback: check default ring patterns
+        if let Ok(patterns) = self.get_tracked_patterns() {
+            let normalized = file_path.replace('\\', "/");
+            if self.matches_tracked_pattern(&normalized, &patterns) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Checks whether Git assigns the `agecrypt` (or ring-specific) filter to a file path.
+    pub fn is_file_tracked_for_ring(&self, file_path: &str, ring: Option<&str>) -> bool {
+        let is_default = matches!(ring, None | Some("default") | Some(""));
+        let expected_filter = if is_default {
+            "agecrypt".to_string()
+        } else {
+            format!("agecrypt-{}", ring.unwrap())
+        };
+
+        if let Some(actual) = self.get_file_filter(file_path) {
+            if actual == expected_filter {
+                return true;
+            }
+            if actual.starts_with("agecrypt") {
+                return false;
             }
         }
 
         // Fallback: check root .gitattributes patterns
-        if let Ok(patterns) = self.get_tracked_patterns() {
+        if let Ok(patterns) = self.get_tracked_patterns_for_ring(ring) {
+            let normalized = file_path.replace('\\', "/");
             return self.matches_tracked_pattern(&normalized, &patterns);
         }
         false
@@ -1555,14 +1738,13 @@ impl GitRepo {
         let mut corrupted_files = Vec::new();
         let mut untracked_secret_files = Vec::new();
 
-        let master_identity = if let Ok(Some(k)) = self.read_local_master_key() {
-            age::x25519::Identity::from_str(&k).ok()
-        } else {
-            None
-        };
-
         for path_str in paths_to_check {
-            let is_tracked = self.is_file_tracked(&path_str);
+            let filter_name = self.get_file_filter(&path_str);
+            let is_tracked = if let Some(ref f) = filter_name {
+                f == "agecrypt" || f.starts_with("agecrypt-")
+            } else {
+                self.is_file_tracked(&path_str)
+            };
             if is_tracked {
                 // Symlink / gitlink guard: Symlinks (mode 120000) contain target path string,
                 // and submodules (mode 160000) contain commit hashes, not secret payloads
@@ -1579,14 +1761,27 @@ impl GitRepo {
                     let prefix = &header[..prefix_len];
                     if !is_age_ciphertext(prefix) {
                         leaked_files.push(path_str);
-                    } else if let Some(ref id) = master_identity {
-                        // Forward-secrecy & integrity verification: verify staged ciphertext is valid and matches active master key!
+                    } else {
+                        // Forward-secrecy & integrity verification: verify staged ciphertext is valid and matches active master key for its ring!
+                        let file_ring = filter_name
+                            .as_ref()
+                            .and_then(|f| f.strip_prefix("agecrypt-").map(|r| r.to_string()));
+                        let file_master_id = if let Ok(Some(k)) =
+                            self.read_local_master_key_for_ring(file_ring.as_deref())
+                        {
+                            age::x25519::Identity::from_str(&k).ok()
+                        } else {
+                            None
+                        };
+
                         match age::Decryptor::new(&header[..]) {
                             Ok(decryptor) => {
-                                if let Err(age::DecryptError::NoMatchingKeys) =
-                                    decryptor.decrypt(std::iter::once(id as &dyn age::Identity))
-                                {
-                                    foreign_key_files.push(path_str);
+                                if let Some(ref id) = file_master_id {
+                                    if let Err(age::DecryptError::NoMatchingKeys) =
+                                        decryptor.decrypt(std::iter::once(id as &dyn age::Identity))
+                                    {
+                                        foreign_key_files.push(path_str);
+                                    }
                                 }
                             }
                             Err(err) => {
@@ -1799,16 +1994,10 @@ impl GitRepo {
             return Ok(());
         }
 
-        let patterns = self.get_tracked_patterns()?;
+        let patterns = self.get_tracked_patterns_all_rings()?;
         if patterns.is_empty() {
             return Ok(());
         }
-
-        let master_identity = if let Ok(Some(k)) = self.read_local_master_key() {
-            age::x25519::Identity::from_str(&k).ok()
-        } else {
-            None
-        };
 
         let zero_sha = "0000000000000000000000000000000000000000";
         let mut inspected_blobs = std::collections::HashSet::new();
@@ -2000,28 +2189,45 @@ impl GitRepo {
             }
 
             // Verify that all tracked secrets present in the target tip commit can be decrypted with active master key
-            if let Some(ref id) = master_identity {
-                let tree_out = git_cmd_with_path(&self.root)
-                    .args(["ls-tree", "-r", "-z", &local_commit])
-                    .output();
-                if let Ok(to) = tree_out
-                    && to.status.success()
-                {
-                    for slice in to.stdout.split(|&b| b == 0) {
-                        if slice.is_empty() {
-                            continue;
-                        }
-                        let line_str = String::from_utf8_lossy(slice);
-                        if let Some((meta, path)) = line_str.split_once('\t') {
-                            let parts: Vec<&str> = meta.split_whitespace().collect();
-                            if parts.len() >= 3 && parts[1] == "blob" {
-                                if parts[0] == "120000" {
-                                    // Symlinks contain target path text, not secret payloads
-                                    continue;
-                                }
-                                let sha = parts[2];
-                                let norm_path = path.replace('\\', "/");
-                                if self.is_file_tracked(&norm_path)
+            let tree_out = git_cmd_with_path(&self.root)
+                .args(["ls-tree", "-r", "-z", &local_commit])
+                .output();
+            if let Ok(to) = tree_out
+                && to.status.success()
+            {
+                for slice in to.stdout.split(|&b| b == 0) {
+                    if slice.is_empty() {
+                        continue;
+                    }
+                    let line_str = String::from_utf8_lossy(slice);
+                    if let Some((meta, path)) = line_str.split_once('\t') {
+                        let parts: Vec<&str> = meta.split_whitespace().collect();
+                        if parts.len() >= 3 && parts[1] == "blob" {
+                            if parts[0] == "120000" {
+                                // Symlinks contain target path text, not secret payloads
+                                continue;
+                            }
+                            let sha = parts[2];
+                            let norm_path = path.replace('\\', "/");
+                            let filter_name = self.get_file_filter(&norm_path);
+                            let is_tracked = if let Some(ref f) = filter_name {
+                                f == "agecrypt" || f.starts_with("agecrypt-")
+                            } else {
+                                self.is_file_tracked(&norm_path)
+                            };
+                            if is_tracked {
+                                let file_ring = filter_name.as_ref().and_then(|f| {
+                                    f.strip_prefix("agecrypt-").map(|r| r.to_string())
+                                });
+                                let file_master_id = if let Ok(Some(k)) =
+                                    self.read_local_master_key_for_ring(file_ring.as_deref())
+                                {
+                                    age::x25519::Identity::from_str(&k).ok()
+                                } else {
+                                    None
+                                };
+
+                                if let Some(ref id) = file_master_id
                                     && let Some(header) = self.read_blob_header(sha, 64 * 1024)
                                     && let Ok(decryptor) = age::Decryptor::new(&header[..])
                                     && let Err(age::DecryptError::NoMatchingKeys) =

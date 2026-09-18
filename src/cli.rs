@@ -24,6 +24,10 @@ pub enum Commands {
         /// Automatically generate AI agent and IDE ignore files (.cursorignore, .claudeignore, etc.)
         #[arg(long)]
         ai_shield: bool,
+
+        /// Optional scoped recipient ring (e.g. 'prod', 'dev', 'staging')
+        #[arg(long)]
+        ring: Option<String>,
     },
 
     /// Add an age or SSH public key recipient
@@ -39,22 +43,38 @@ pub enum Commands {
         /// Optional name/label for the recipient key file
         #[arg(short, long)]
         name: Option<String>,
+
+        /// Optional scoped recipient ring to add recipient to
+        #[arg(long)]
+        ring: Option<String>,
     },
 
     /// Remove an enrolled recipient public key file (.git-agecrypt/keys/<NAME>.age)
     RemoveRecipient {
         /// Name of the recipient file to remove (with or without .age extension)
         name: String,
+
+        /// Optional scoped recipient ring to remove recipient from
+        #[arg(long)]
+        ring: Option<String>,
     },
 
     /// List all enrolled recipient public keys
-    ListRecipients,
+    ListRecipients {
+        /// Optional scoped recipient ring to list (omitting lists all rings)
+        #[arg(long)]
+        ring: Option<String>,
+    },
 
     /// Rotate repository master key and re-encrypt all working tree secrets (team offboarding)
     Rekey {
         /// Force rekey even if uncommitted non-secret working tree edits exist
         #[arg(short, long)]
         force: bool,
+
+        /// Optional scoped recipient ring to rekey
+        #[arg(long)]
+        ring: Option<String>,
     },
 
     /// Unlock repository secrets using an SSH or Age private key
@@ -66,6 +86,10 @@ pub enum Commands {
         /// Overwrite unstaged changes in working tree during checkout
         #[arg(short, long)]
         force: bool,
+
+        /// Optional scoped recipient ring to unlock
+        #[arg(long)]
+        ring: Option<String>,
     },
 
     /// Lock the repository, wiping credentials and encrypting files in the working tree
@@ -73,6 +97,10 @@ pub enum Commands {
         /// Overwrite unstaged changes in working tree during lock
         #[arg(short, long)]
         force: bool,
+
+        /// Optional scoped recipient ring to lock
+        #[arg(long)]
+        ring: Option<String>,
     },
 
     /// Display git-agecrypt status, lock state, recipients, and tracked files
@@ -103,18 +131,30 @@ pub enum Commands {
     Clean {
         /// Optional relative path of the file being filtered (%f)
         file_path: Option<String>,
+
+        /// Optional scoped recipient ring for this filter
+        #[arg(long)]
+        ring: Option<String>,
     },
 
     /// Git smudge filter driver (reads age ciphertext stdin -> writes plaintext stdout)
     Smudge {
         /// Optional relative path of the file being filtered (%f)
         file_path: Option<String>,
+
+        /// Optional scoped recipient ring for this filter
+        #[arg(long)]
+        ring: Option<String>,
     },
 
     /// Git diff textconv driver (decrypts target file for git diff)
     Textconv {
         /// File path to decrypt for diff
         file: PathBuf,
+
+        /// Optional scoped recipient ring for this driver
+        #[arg(long)]
+        ring: Option<String>,
     },
 
     /// Git 3-way merge driver (%O %A %B %L %P)
@@ -129,6 +169,10 @@ pub enum Commands {
         marker_size: Option<usize>,
         /// Relative path of file being merged (%P)
         file_path: Option<String>,
+
+        /// Optional scoped recipient ring for this merge driver
+        #[arg(long)]
+        ring: Option<String>,
     },
 
     /// Re-encrypt historical or foreign secrets under the active master key (resolves historical merge/cherry-pick deadlocks)
@@ -162,6 +206,14 @@ pub enum Commands {
         /// Specific secret env file to load (defaults to all tracked .env / *.secret.env files)
         #[arg(short, long)]
         env_file: Option<PathBuf>,
+
+        /// Optional scoped recipient ring to load secrets from
+        #[arg(long)]
+        ring: Option<String>,
+
+        /// Pass secrets via an anonymous in-memory file descriptor (Linux memfd_create) rather than environment variables
+        #[arg(long)]
+        fd: bool,
 
         /// Command and arguments to execute
         #[arg(trailing_var_arg = true, required = true)]

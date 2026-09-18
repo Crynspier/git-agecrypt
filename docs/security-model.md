@@ -42,14 +42,49 @@
 
 This separation ensures that adding or removing recipients does not require re-encrypting the entire repository's files.
 
-### 2.3 Keyed Deterministic HMAC Caching
+### 2.3 Cryptographic Cache Validation & Nonce Handling
 
 Standard `age` encryption generates fresh random nonces for every payload, which would produce non-deterministic ciphertexts on every `git add`, causing phantom `git diff` churn.
 
 To solve this securely:
-- `git-agecrypt` computes a cache key using `HMAC-SHA256(master_key, plaintext)`.
+- `git-agecrypt` computes a deterministic cache key using `HMAC-SHA256(master_key, plaintext)`.
 - Because the HMAC uses the secret master key as its cryptographic key, an external attacker cannot precompute rainbow tables or dictionary attacks against secret payloads.
-- If a matching ciphertext exists in `.git/git-agecrypt/cache/`, `git-agecrypt` verifies that the cached file has a valid `age` header structure. If valid, it reuses the ciphertext. If invalid or corrupted, the entry is unlinked and a clean re-encryption is performed.
+- **Cryptographic Cache Verification:** Before reusing any cached ciphertext from `.git/git-agecrypt/cache/`, `git-agecrypt` does not merely inspect header structure; it decrypts the candidate ciphertext in RAM using the master identity and authenticates that `HMAC-SHA256(master_key, decrypted_bytes) == cache_key`. If authentication fails or decryption yields an error (tampered cache file, old key generation, corrupted payload), the corrupted entry is automatically unlinked and a clean re-encryption is performed.
+- **Cache Purge on Rekey:** Whenever the master key is rotated via `git-agecrypt rekey`, all cached ciphertexts across `.git/git-agecrypt/cache/` are immediately purged to prevent key-generation cross-contamination.
+
+### 2.4 Key Hierarchy Specification
+
+`git-agecrypt` formalizes a multi-tier cryptographic key hierarchy:
+
+```text
+[ Developer Identity Key ]
+  (SSH Ed25519 / RSA, Age Identity, Hardware Token / YubiKey)
+           |
+           v (Asymmetric ECDH / Age container decrypt)
+[ Recipient Envelope ] (.git-agecrypt/keys/<user>.age or rings/<name>/keys/<user>.age)
+           |
+           v (Extracts 256-bit symmetric repository secret)
+[ Symmetric Master Key ] (repo.key, 256-bit X25519 identity)
+           |
+           v (ChaCha20-Poly1305 streaming AEAD, 64 KiB chunks)
+[ Data Payload ] (Working tree file contents)
+```
+
+1. **Identity Key Layer:** The user's personal private key (`~/.ssh/id_ed25519`, `~/.ssh/id_rsa`, `AGE-SECRET-KEY-1...`, or hardware token PIN). The private key never enters the Git repository.
+2. **Recipient Envelope Layer:** Located at `.git-agecrypt/keys/<recipient>.age` (or `.git-agecrypt/rings/<ring>/keys/<recipient>.age`). Each file is an encrypted Age container wrapping the 256-bit symmetric master key for that recipient.
+3. **Master Key Layer:** Ephemerally cached inside `.git/git-agecrypt/repo.key` (POSIX permissions `0o600`). Used directly by filter drivers to encrypt and decrypt working tree payloads.
+4. **Data Payload Layer:** Stored in the Git object database as standard `age-encryption.org/v1` ciphertexts using ChaCha20-Poly1305 with Poly1305 MAC authentication tags.
+
+### 2.5 Scoped Recipient Rings (Multi-Environment Isolation)
+
+Repositories often contain secrets with distinct privilege domains (e.g. `production` secrets restricted to infrastructure engineers, `development` secrets accessible to all engineers).
+
+`git-agecrypt` supports Scoped Recipient Rings via `--ring <NAME>`:
+- **Default Ring:** `.git-agecrypt/keys/`, `repo.pub`, and `.git/git-agecrypt/repo.key` (maintains 100% backward compatibility).
+- **Scoped Rings:** `.git-agecrypt/rings/<name>/keys/`, `repo.pub`, and `.git/git-agecrypt/rings/<name>/repo.key`.
+- **Git Filter Routing:** Configured in `.gitattributes` via `filter=agecrypt-<name>` (e.g. `secrets/prod/** filter=agecrypt-prod ...`).
+- **Independent Life-Cycle:** Unlocking, locking, rekeying, and recipient enrollment can be performed per ring (e.g. `git-agecrypt lock --ring prod`) without affecting other rings.
+- **Fail-Closed Separation:** If a developer lacks keys for the `prod` ring, `smudge` safely passes ciphertext through, and safeguard checks verify that only authorized keys can commit changes to that ring.
 
 ---
 
@@ -89,11 +124,12 @@ When processing streams larger than 1 MiB, temporary spill files are stored with
 - Spill data remains on the same filesystem and partition as the Git repository, enabling atomic rename operations.
 - Spill files inherit repository directory access permissions and avoid shared multi-tenant temporary locations.
 
-### 4.3 Crash Durability & Physical Disk Synchronization
+### 4.3 Crash Durability, Physical Disk Synchronization & Fail-Closed Semantics
 
 To prevent data loss or corrupted key files from sudden system reboots or power loss:
-- Key files, journals, and cache files are written to atomic temporary files (`NamedTempFile`).
+- Key files, journals, merge targets, and cache files are written to atomic temporary files (`NamedTempFile`).
 - Before atomically persisting the file into its destination, `git-agecrypt` executes `sync_all()` (`fsync`), ensuring data and metadata are physically written to durable storage before the directory entry is updated.
+- **Strict Fail-Closed Durability:** All filesystem sync operations strictly propagate I/O and synchronization errors (`?`). Neither cache persistence nor merge target updates silently swallow disk flush errors. If durable persistence cannot be guaranteed by the underlying storage subsystem, the operation immediately fails closed.
 
 ### 4.4 Transactional Locking with Write-Ahead Logging (WAL)
 
@@ -127,7 +163,7 @@ When cherry-picking, rebasing, or merging historical branches encrypted under ol
 
 ## 6. Runtime Secret Injection (`git-agecrypt run`)
 
-The `git-agecrypt run` command decrypts secret environment files in memory and injects them directly into child process environment variables without writing cleartext files to disk.
+The `git-agecrypt run` command decrypts secret environment files in memory and injects them directly into child process environments without writing cleartext files to disk.
 
 ### 6.1 Process Memory & `/proc` Boundaries
 
@@ -136,6 +172,15 @@ When executing commands using `run`, consider the operating system process bound
 - **Child Process Inheritance:** Environment variables are inherited by child processes spawned by the target command. Ensure build tools, test runners, or scripts do not echo environment variables to CI logs.
 - **Core Dumps:** Prevent memory-mapped secrets from being written to disk on unexpected crashes by setting `ulimit -c 0` or disabling kernel core dumps (`fs.suid_dumpable = 0`).
 - **Cryptographic Memory Zeroization:** All in-memory buffers holding decrypted plaintext are zeroized using the `zeroize` crate immediately when dropped.
+
+### 6.2 Anonymous In-Memory Secret Passing (`run --fd`)
+
+For high-security Linux runtime environments where `/proc/<pid>/environ` inspection by other co-tenant processes is a threat:
+- `git-agecrypt run --fd -- <cmd>` creates an anonymous in-memory file descriptor via the Linux `SYS_memfd_create` syscall (`MFD_CLOEXEC`).
+- Secrets are written entirely into kernel RAM without touching the filesystem.
+- The descriptor is passed to the child process via `GIT_AGECRYPT_ENV_FD` (and accessible via `/dev/fd/<fd>`).
+- Plaintext secrets are never exposed in `/proc/<pid>/environ` argument arrays or command-line strings.
+- On Windows and macOS platforms, `--fd` gracefully emits a notification and falls back to standard in-memory environment injection.
 
 ---
 

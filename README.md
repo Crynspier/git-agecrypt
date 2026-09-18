@@ -65,10 +65,13 @@ When a team member rotates the master key via `git-agecrypt rekey`, collaborator
 
 - **No GPG required:** Uses standard SSH keys (`~/.ssh/id_ed25519`, `~/.ssh/id_rsa`), native `age` keys, or hardware tokens via Age plugins. No GPG daemon, keyrings, or pinentry prompts.
 - **Hardware token & Age plugin support:** Seamlessly enroll YubiKeys (`age-plugin-yubikey`), Apple Secure Enclave (`age-plugin-se`), and TPM tokens (`age-plugin-tpm`) via standard Age plugin recipients (`age1yubikey1...`, `age1se1...`).
+- **Scoped recipient rings (multi-environment secrets):** Segment secrets across independent access domains (e.g. `--ring prod`, `--ring dev`) with dedicated master keys, recipient sets, and `.gitattributes` filter bindings (`filter=agecrypt-prod`).
 - **Runtime secret injection:** Execute child commands with in-memory decrypted environment variables (`git-agecrypt run -- <cmd>`) without writing cleartext `.env` files to disk.
+- **Anonymous in-memory secret passing (`run --fd`):** Pass secrets via Linux kernel anonymous RAM descriptors (`SYS_memfd_create`), avoiding `/proc/<pid>/environ` inspection or cleartext temporary files.
 - **In-memory clean fast-path:** Small secrets and config files (< 1 MiB) are spooled and encrypted entirely in RAM with zero temporary disk file I/O. Memory buffers are cryptographically zeroized on drop.
 - **Zero memory bloat on large files ($O(1)$ RAM):** Streams larger than 1 MiB automatically spill to disk, processing files in 64 KiB chunks; multi-gigabyte archives or database dumps never exhaust system memory.
-- **Deterministic HMAC ciphertext cache:** Prevents phantom `git diff` churn caused by random encryption nonces, using keyed HMAC-SHA256 digests over plaintext payloads.
+- **Cryptographic cache authentication:** Eliminates phantom `git diff` churn using keyed HMAC-SHA256 digests. Cached ciphertext hits are decrypted and authenticated in RAM before trust, with automatic eviction on corruption and complete cache purge on `rekey`.
+- **Fail-closed durability:** All filesystem operations (`fsync` / `sync_all`) strictly propagate I/O errors across cache persistence, lock journals, and merge targets; partial or un-flushed writes never succeed silently.
 - **Semantic merge conflict detection:** 3-way merge driver detects conflicting duplicate key definitions on concurrent branch edits to `.env` and configuration files and emits actionable warnings.
 - **GitHub user key enrollment:** Add team members directly by GitHub username (`git-agecrypt add-recipient --github <user>`).
 - **Safe locked clones:** Cloning without a configured key succeeds cleanly (exit code 0). Files remain encrypted on disk until unlocked.
@@ -257,16 +260,41 @@ To execute applications or tests without keeping unencrypted secrets on disk, us
 # Decrypt repository .env in memory and inject into child process environment
 git-agecrypt run -- cargo run
 
-# Run a server or script with specific encrypted env file
-git-agecrypt run -e production.secret.env -- node server.js
+# Anonymous in-memory descriptor passing via Linux memfd_create (bypasses /proc/<pid>/environ)
+git-agecrypt run --fd -- ./app_server
+
+# Run a server or script with specific encrypted env file or scoped ring
+git-agecrypt run -e production.secret.env --ring prod -- node server.js
 
 # Run automated tests with injected environment secrets
 git-agecrypt run -- npm test
 ```
 
-Secrets are decrypted entirely in RAM, injected into the child process environment, and immediately zeroized upon exit without creating temporary cleartext files on disk.
+Secrets are decrypted entirely in RAM, injected into the child process environment (or anonymous file descriptor via `GIT_AGECRYPT_ENV_FD`), and immediately zeroized upon exit without creating temporary cleartext files on disk.
 
-### 7. Offboarding and Key Rotation
+### 7. Scoped Recipient Rings (Multi-Environment Secrets)
+
+Segment secrets across different access boundaries (e.g. `prod` vs `dev`):
+
+```bash
+# 1. Initialize a scoped ring
+git-agecrypt init --ring prod
+
+# 2. Configure .gitattributes to route specific paths to the prod ring
+echo "secrets/prod/** filter=agecrypt-prod diff=agecrypt-prod merge=agecrypt-prod -text" >> .gitattributes
+
+# 3. Enroll ops team public keys to the prod ring
+git-agecrypt add-recipient -i ~/.ssh/ops_key.pub --name ops-alice --ring prod
+
+# 4. Lock or unlock rings independently
+git-agecrypt lock --ring prod
+git-agecrypt unlock ~/.ssh/ops_key --ring prod
+
+# 5. Rekey a single ring independently
+git-agecrypt rekey --ring prod
+```
+
+### 8. Offboarding and Key Rotation
 
 When a collaborator leaves:
 
@@ -285,7 +313,7 @@ git push
 
 The offboarded developer cannot decrypt any subsequent commits.
 
-### 8. Resolving Historical Branches (`rewrap`)
+### 9. Resolving Historical Branches (`rewrap`)
 
 When cherry-picking or merging an older commit created under a previous master key:
 
@@ -357,23 +385,23 @@ git commit -m "Migrate from git-crypt to git-agecrypt"
 
 | Command | Options | Description |
 |---|---|---|
-| `init` | `[--gitattributes], [--ai-shield]` | Initialize master key, enroll current SSH key, configure Git filters, and install hooks. |
-| `add-recipient` | `-i, --identity <KEY>`, `--github <USER>`, `-n, --name <NAME>` | Enroll a new recipient public key. |
-| `remove-recipient` | `<NAME>` | Remove an enrolled recipient. |
-| `list-recipients` | *(none)* | Display all enrolled recipients in alphabetical order. |
-| `unlock` | `[KEY_FILE]`, `-f, --force` | Decrypt master key and smudge secret files on disk. |
-| `lock` | `-f, --force` | Re-smudge disk files to ciphertext and remove cached master key. |
-| `rekey` | `-f, --force` | Rotate the master key and re-encrypt all tracked secret files. |
+| `init` | `[--ring <RING>], [--gitattributes], [--ai-shield]` | Initialize master key, enroll current SSH key, configure Git filters, and install hooks. |
+| `add-recipient` | `-i, --identity <KEY>`, `--github <USER>`, `-n, --name <NAME>`, `[--ring <RING>]` | Enroll a new recipient public key. |
+| `remove-recipient` | `<NAME>`, `[--ring <RING>]` | Remove an enrolled recipient. |
+| `list-recipients` | `[--ring <RING>]` | Display all enrolled recipients in alphabetical order. |
+| `unlock` | `[KEY_FILE]`, `-f, --force`, `[--ring <RING>]` | Decrypt master key and smudge secret files on disk. |
+| `lock` | `-f, --force`, `[--ring <RING>]` | Re-smudge disk files to ciphertext and remove cached master key. |
+| `rekey` | `-f, --force`, `[--ring <RING>]` | Rotate the master key and re-encrypt all tracked secret files. |
 | `rewrap` | `[PATH]...`, `-a, --all`, `-i, --identity <KEY>`, `-f, --force` | Re-encrypt historical ciphertexts under the active master key. |
 | `status` | *(none)* | Display repository status, active key fingerprint, and tracked files. |
 | `shield` | `[--check]` | Synchronize AI agent and IDE ignore files (`.cursorignore`, `.claudeignore`, `.aiderignore`, `.aiignore`). |
 | `install-hooks` | *(none)* | Install or update safeguard hooks (`pre-commit`, `pre-merge-commit`, `pre-push`). |
 | `check` | `[--pre-push], [--allow-untracked-secrets]` | Validate staged files or outgoing commits against unencrypted or untracked secret leaks. |
-| `clean` | `[PATH]` | Git clean filter (streams stdin plaintext to stdout ciphertext). |
-| `smudge` | `[PATH]` | Git smudge filter (streams stdin ciphertext to stdout plaintext). |
-| `textconv` | `<PATH>` | Git diff driver (decrypts target for cleartext diffs). |
-| `merge` | `<O> <A> <B> [L] [P]` | Git 3-way merge driver. |
-| `run` | `[-e, --env-file <PATH>] -- <COMMAND>...` | Execute child process with in-memory decrypted secrets injected into environment variables. |
+| `clean` | `[PATH]`, `[--ring <RING>]` | Git clean filter (streams stdin plaintext to stdout ciphertext). |
+| `smudge` | `[PATH]`, `[--ring <RING>]` | Git smudge filter (streams stdin ciphertext to stdout plaintext). |
+| `textconv` | `<PATH>`, `[--ring <RING>]` | Git diff driver (decrypts target for cleartext diffs). |
+| `merge` | `<O> <A> <B> [L] [P]`, `[--ring <RING>]` | Git 3-way merge driver. |
+| `run` | `[-e, --env-file <PATH>], [--fd], [--ring <RING>] -- <COMMAND>...` | Execute child process with in-memory decrypted secrets (environment variables or anonymous Linux memfd). |
 | `migrate-from-git-crypt` | `-i, --identity <KEY>` | Convert an existing git-crypt repository. |
 
 ---

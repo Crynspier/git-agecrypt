@@ -485,7 +485,47 @@ fn encrypt_plaintext_stream<R: Read, W: Write>(
         if cache_file.exists() {
             let is_valid = if let Ok(mut f) = File::open(&cache_file) {
                 let mut prefix = [0u8; AGE_HEADER_MAGIC.len()];
-                f.read_exact(&mut prefix).is_ok() && is_age_ciphertext(&prefix)
+                if f.read_exact(&mut prefix).is_ok() && is_age_ciphertext(&prefix) {
+                    if let (Some(id), Some(key)) = (identity_opt, cache_key) {
+                        // Cryptographically authenticate and verify cache hit:
+                        // Decrypt in RAM and verify decrypted plaintext HMAC equals hash_hex!
+                        let mut cache_bytes = Vec::new();
+                        let mut valid_hit = false;
+                        if File::open(&cache_file)
+                            .and_then(|mut f| f.read_to_end(&mut cache_bytes))
+                            .is_ok()
+                            && let Ok(decryptor) = age::Decryptor::new(&cache_bytes[..])
+                            && let Ok(mut reader) = decryptor.decrypt(std::iter::once(id))
+                        {
+                            let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key valid");
+                            let mut drain_buf = [0u8; 64 * 1024];
+                            let mut read_failed = false;
+                            loop {
+                                match reader.read(&mut drain_buf) {
+                                    Ok(0) => break,
+                                    Ok(n) => mac.update(&drain_buf[..n]),
+                                    Err(_) => {
+                                        read_failed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !read_failed {
+                                let computed_digest =
+                                    format_cache_hash(&mac.finalize().into_bytes());
+                                if computed_digest == *hash_hex {
+                                    valid_hit = true;
+                                }
+                            }
+                        }
+                        valid_hit
+                    } else {
+                        // Structural validity fallback if identity not provided
+                        true
+                    }
+                } else {
+                    false
+                }
             } else {
                 false
             };
@@ -498,9 +538,9 @@ fn encrypt_plaintext_stream<R: Read, W: Write>(
                 output.flush()?;
                 return Ok(());
             } else {
-                // Corrupted or truncated cache entry: treat as cache miss and purge bad entry
+                // Corrupted, truncated, or tampered cache entry: treat as cache miss and purge bad entry
                 eprintln!(
-                    "git-agecrypt clean [WARNING]: Corrupted or truncated cache entry detected ({hash_hex}.age). Purging and re-encrypting."
+                    "git-agecrypt clean [WARNING]: Corrupted or invalid cache entry detected ({hash_hex}.age). Purging and re-encrypting."
                 );
                 let _ = fs::remove_file(&cache_file);
             }
@@ -583,8 +623,8 @@ fn encrypt_plaintext_stream<R: Read, W: Write>(
             output.flush()?;
         }
 
-        // Guarantee physical media sync before atomic rename
-        let _ = cache_temp.as_file().sync_all();
+        // Guarantee physical media sync before atomic rename (fail-closed)
+        cache_temp.as_file().sync_all()?;
 
         let dest = c_dir.join(format!("{hash_hex}.age"));
         if !dest.exists() {

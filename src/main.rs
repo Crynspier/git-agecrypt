@@ -73,23 +73,34 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Init {
             gitattributes,
             ai_shield,
-        } => cmd_init(gitattributes, ai_shield),
+            ring,
+        } => cmd_init(gitattributes, ai_shield, ring.as_deref()),
         Commands::AddRecipient {
             identity,
             github,
             name,
-        } => cmd_add_recipient(identity.as_deref(), github.as_deref(), name.as_deref()),
-        Commands::RemoveRecipient { name } => cmd_remove_recipient(&name),
-        Commands::ListRecipients => cmd_list_recipients(),
-        Commands::Rekey { force } => cmd_rekey(force),
+            ring,
+        } => cmd_add_recipient(
+            identity.as_deref(),
+            github.as_deref(),
+            name.as_deref(),
+            ring.as_deref(),
+        ),
+        Commands::RemoveRecipient { name, ring } => cmd_remove_recipient(&name, ring.as_deref()),
+        Commands::ListRecipients { ring } => cmd_list_recipients(ring.as_deref()),
+        Commands::Rekey { force, ring } => cmd_rekey(force, ring.as_deref()),
         Commands::Rewrap {
             paths,
             all,
             identity,
             force,
         } => cmd_rewrap(&paths, all, identity.as_deref(), force),
-        Commands::Unlock { key_file, force } => cmd_unlock(key_file.as_deref(), force),
-        Commands::Lock { force } => cmd_lock(force),
+        Commands::Unlock {
+            key_file,
+            force,
+            ring,
+        } => cmd_unlock(key_file.as_deref(), force, ring.as_deref()),
+        Commands::Lock { force, ring } => cmd_lock(force, ring.as_deref()),
         Commands::Status => cmd_status(),
         Commands::Shield { check } => cmd_shield(check),
         Commands::InstallHooks => cmd_install_hooks(),
@@ -97,48 +108,84 @@ fn run(cli: Cli) -> Result<()> {
             pre_push,
             allow_untracked_secrets,
         } => cmd_check(pre_push, allow_untracked_secrets),
-        Commands::Clean { file_path } => cmd_clean(file_path.as_deref()),
-        Commands::Smudge { file_path } => cmd_smudge(file_path.as_deref()),
-        Commands::Textconv { file } => cmd_textconv(&file),
+        Commands::Clean { file_path, ring } => cmd_clean(file_path.as_deref(), ring.as_deref()),
+        Commands::Smudge { file_path, ring } => cmd_smudge(file_path.as_deref(), ring.as_deref()),
+        Commands::Textconv { file, ring } => cmd_textconv(&file, ring.as_deref()),
         Commands::Merge {
             base,
             ours,
             theirs,
             marker_size,
             file_path,
-        } => cmd_merge(&base, &ours, &theirs, marker_size, file_path.as_deref()),
+            ring,
+        } => cmd_merge(
+            &base,
+            &ours,
+            &theirs,
+            marker_size,
+            file_path.as_deref(),
+            ring.as_deref(),
+        ),
         Commands::MigrateFromGitCrypt { identity } => cmd_migrate(identity.as_deref()),
-        Commands::Run { env_file, command } => cmd_run(env_file.as_deref(), &command),
+        Commands::Run {
+            env_file,
+            ring,
+            fd,
+            command,
+        } => cmd_run(env_file.as_deref(), ring.as_deref(), fd, &command),
     }
 }
 
-fn cmd_init(create_gitattributes: bool, ai_shield: bool) -> Result<()> {
+fn cmd_init(create_gitattributes: bool, ai_shield: bool, ring_opt: Option<&str>) -> Result<()> {
     let repo = GitRepo::discover()?;
-    eprintln!("Initializing git-agecrypt in {}", repo.root.display());
+    let is_default_ring = matches!(ring_opt, None | Some("default") | Some(""));
 
-    if repo.root.join(".git-crypt").exists() {
+    if is_default_ring {
+        eprintln!("Initializing git-agecrypt in {}", repo.root.display());
+        if repo.root.join(".git-crypt").exists() {
+            eprintln!(
+                "git-agecrypt: Notice: Existing .git-crypt directory found. To migrate an existing git-crypt repository, run 'git-agecrypt migrate-from-git-crypt'."
+            );
+        }
+    } else {
         eprintln!(
-            "git-agecrypt: Notice: Existing .git-crypt directory found. To migrate an existing git-crypt repository, run 'git-agecrypt migrate-from-git-crypt'."
+            "Initializing git-agecrypt ring '{}' in {}",
+            ring_opt.unwrap(),
+            repo.root.display()
         );
     }
 
-    let _meta_dir = repo.agecrypt_metadata_dir();
-    let keys_dir = repo.keys_dir();
+    let keys_dir = repo.keys_dir_for_ring(ring_opt);
     fs::create_dir_all(&keys_dir)?;
 
-    let pub_file = repo.public_key_file();
-    let _master_identity = if pub_file.exists() && repo.is_unlocked() {
-        eprintln!("Repository already initialized. Re-configuring git filters...");
+    let pub_file = repo.public_key_file_for_ring(ring_opt);
+    let _master_identity = if pub_file.exists() && repo.is_unlocked_for_ring(ring_opt) {
+        if is_default_ring {
+            eprintln!("Repository already initialized. Re-configuring git filters...");
+        } else {
+            eprintln!("Ring already initialized. Re-configuring git filters...");
+        }
         let key_str = repo
-            .read_local_master_key()?
+            .read_local_master_key_for_ring(ring_opt)?
             .ok_or_else(|| anyhow!("Failed to read local master key"))?;
         age::x25519::Identity::from_str(&key_str).map_err(|e| anyhow!("{e}"))?
     } else {
         let (identity, recipient) = crypto::generate_master_identity();
+        if let Some(parent) = pub_file.parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(&pub_file, format!("{}\n", recipient))?;
-        repo.save_local_master_key(identity.to_string().expose_secret())?;
-        eprintln!("Generated new 256-bit repository master key.");
-        eprintln!("Public key saved to .git-agecrypt/repo.pub: {recipient}");
+        repo.save_local_master_key_for_ring(identity.to_string().expose_secret(), ring_opt)?;
+        if is_default_ring {
+            eprintln!("Generated new 256-bit repository master key.");
+            eprintln!("Public key saved to .git-agecrypt/repo.pub: {recipient}");
+        } else {
+            eprintln!(
+                "Generated new 256-bit repository master key for ring '{}'.",
+                ring_opt.unwrap()
+            );
+            eprintln!("Public key saved to {}: {recipient}", pub_file.display());
+        }
 
         // Auto-enroll default SSH key if present
         if let Some(ssh_pub) = find_default_ssh_public_key()
@@ -157,37 +204,49 @@ fn cmd_init(create_gitattributes: bool, ai_shield: bool) -> Result<()> {
     };
 
     // Configure git config filters
-    repo.configure_git_filters()?;
-    eprintln!("Configured git filter, diff, and merge drivers in .git/config.");
+    repo.configure_git_filters_for_ring(ring_opt)?;
+    if is_default_ring {
+        eprintln!("Configured git filter, diff, and merge drivers in .git/config.");
 
-    // Install pre-commit, pre-merge-commit, and pre-push hooks
-    repo.install_pre_commit_hook()?;
-    eprintln!(
-        "Installed safeguard hooks into .git/hooks/ (pre-commit, pre-merge-commit, pre-push)."
-    );
+        // Install pre-commit, pre-merge-commit, and pre-push hooks
+        repo.install_pre_commit_hook()?;
+        eprintln!(
+            "Installed safeguard hooks into .git/hooks/ (pre-commit, pre-merge-commit, pre-push)."
+        );
 
-    // Create default .gitattributes template if requested (with -text binary attribute)
-    if create_gitattributes {
-        let gitattributes_path = repo.root.join(".gitattributes");
-        if !gitattributes_path.exists() {
-            let template = r#"# git-agecrypt tracked secrets (binary ciphertext, no CRLF conversion)
+        // Create default .gitattributes template if requested (with -text binary attribute)
+        if create_gitattributes {
+            let gitattributes_path = repo.root.join(".gitattributes");
+            if !gitattributes_path.exists() {
+                let template = r#"# git-agecrypt tracked secrets (binary ciphertext, no CRLF conversion)
 *.secret.env filter=agecrypt diff=agecrypt merge=agecrypt -text
 secrets/** filter=agecrypt diff=agecrypt merge=agecrypt -text
 "#;
-            fs::write(&gitattributes_path, template)?;
-            eprintln!("Created default .gitattributes template (with -text binary safety flag).");
+                fs::write(&gitattributes_path, template)?;
+                eprintln!(
+                    "Created default .gitattributes template (with -text binary safety flag)."
+                );
+            }
         }
-    }
 
-    // Synchronize AI agent and IDE ignore files (.cursorignore, .claudeignore, .aiderignore, .aiignore)
-    let tracked_patterns = repo.get_tracked_patterns()?;
-    if !tracked_patterns.is_empty() {
-        let updated = shield::sync_ai_shields(&repo.root, &tracked_patterns, ai_shield)?;
-        if !updated.is_empty() {
-            eprintln!(
-                "Synchronized AI agent and IDE ignore files (.cursorignore, .claudeignore, .aiderignore, .aiignore)."
-            );
+        // Synchronize AI agent and IDE ignore files (.cursorignore, .claudeignore, .aiderignore, .aiignore)
+        let tracked_patterns = repo.get_tracked_patterns()?;
+        if !tracked_patterns.is_empty() {
+            let updated = shield::sync_ai_shields(&repo.root, &tracked_patterns, ai_shield)?;
+            if !updated.is_empty() {
+                eprintln!(
+                    "Synchronized AI agent and IDE ignore files (.cursorignore, .claudeignore, .aiderignore, .aiignore)."
+                );
+            }
         }
+    } else {
+        let r = ring_opt.unwrap();
+        eprintln!("Configured git filter, diff, and merge drivers for ring '{r}' in .git/config.");
+        eprintln!();
+        eprintln!("Add rules to .gitattributes for this ring:");
+        eprintln!(
+            "  secrets/{r}/** filter=agecrypt-{r} diff=agecrypt-{r} merge=agecrypt-{r} -text"
+        );
     }
 
     eprintln!(
@@ -200,6 +259,7 @@ fn cmd_add_recipient(
     identity: Option<&str>,
     github: Option<&str>,
     name: Option<&str>,
+    ring_opt: Option<&str>,
 ) -> Result<()> {
     if identity.is_some() && github.is_some() {
         return Err(anyhow!(
@@ -208,9 +268,9 @@ fn cmd_add_recipient(
     }
 
     let repo = GitRepo::discover()?;
-    let master_key = repo.read_local_master_key()?.ok_or_else(|| {
+    let master_key = repo.read_local_master_key_for_ring(ring_opt)?.ok_or_else(|| {
         anyhow!(
-            "Repository is locked. You must run 'git-agecrypt unlock' before adding recipients."
+            "Repository/ring is locked. You must run 'git-agecrypt unlock' before adding recipients."
         )
     })?;
 
@@ -265,7 +325,7 @@ fn cmd_add_recipient(
         ));
     }
 
-    let keys_dir = repo.keys_dir();
+    let keys_dir = repo.keys_dir_for_ring(ring_opt);
     fs::create_dir_all(&keys_dir)?;
 
     for (label, key_str) in keys_to_add {
@@ -319,16 +379,33 @@ fn cmd_add_recipient(
         }
 
         fs::write(&dest, wrapped)?;
-        eprintln!("Enrolled recipient '{label}' -> .git-agecrypt/keys/{filename}");
+        let is_default = matches!(ring_opt, None | Some("default") | Some(""));
+        if is_default {
+            eprintln!("Enrolled recipient '{label}' -> .git-agecrypt/keys/{filename}");
+        } else {
+            eprintln!(
+                "Enrolled recipient '{label}' in ring '{}' -> {}",
+                ring_opt.unwrap(),
+                dest.display()
+            );
+        }
     }
 
-    eprintln!("Remember to commit .git-agecrypt/keys/ to share access with team members.");
+    let is_default = matches!(ring_opt, None | Some("default") | Some(""));
+    if is_default {
+        eprintln!("Remember to commit .git-agecrypt/keys/ to share access with team members.");
+    } else {
+        eprintln!(
+            "Remember to commit {} to share access with team members.",
+            keys_dir.display()
+        );
+    }
     Ok(())
 }
 
-fn cmd_remove_recipient(name: &str) -> Result<()> {
+fn cmd_remove_recipient(name: &str, ring_opt: Option<&str>) -> Result<()> {
     let repo = GitRepo::discover()?;
-    let keys_dir = repo.keys_dir();
+    let keys_dir = repo.keys_dir_for_ring(ring_opt);
     let label = name.trim_end_matches(".age");
     let target_name = format!("{label}.age");
 
@@ -364,17 +441,19 @@ fn cmd_remove_recipient(name: &str) -> Result<()> {
         "Deleting their recipient file prevents them from unlocking future re-keyed commits,"
     );
     eprintln!("but they still possess the current symmetric master key.");
-    eprintln!(
-        "Run 'git-agecrypt rekey' now to generate a new master key and re-encrypt all secrets."
-    );
+    let rekey_cmd = match ring_opt {
+        Some(r) if r != "default" && !r.is_empty() => format!("git-agecrypt rekey --ring {r}"),
+        _ => "git-agecrypt rekey".to_string(),
+    };
+    eprintln!("Run '{rekey_cmd}' now to generate a new master key and re-encrypt all secrets.");
     Ok(())
 }
 
-fn cmd_list_recipients() -> Result<()> {
+fn cmd_list_recipients(ring_opt: Option<&str>) -> Result<()> {
     let repo = GitRepo::discover()?;
-    let keys_dir = repo.keys_dir();
+    let keys_dir = repo.keys_dir_for_ring(ring_opt);
     if !keys_dir.exists() {
-        eprintln!("No recipients directory found.");
+        eprintln!("No recipients directory found in {}.", keys_dir.display());
         return Ok(());
     }
 
@@ -410,11 +489,11 @@ fn cmd_list_recipients() -> Result<()> {
     Ok(())
 }
 
-fn cmd_rekey(force: bool) -> Result<()> {
+fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
     let repo = GitRepo::discover()?;
-    if !repo.is_unlocked() {
+    if !repo.is_unlocked_for_ring(ring_opt) {
         return Err(anyhow!(
-            "Repository is locked. You must run 'git-agecrypt unlock' before rekeying."
+            "Repository/ring is locked. You must run 'git-agecrypt unlock' before rekeying."
         ));
     }
 
@@ -440,7 +519,7 @@ fn cmd_rekey(force: bool) -> Result<()> {
         ));
     }
 
-    let keys_dir = repo.keys_dir();
+    let keys_dir = repo.keys_dir_for_ring(ring_opt);
     if !keys_dir.exists() {
         return Err(anyhow!(
             "Keys directory not found in {}",
@@ -448,7 +527,10 @@ fn cmd_rekey(force: bool) -> Result<()> {
         ));
     }
 
-    eprintln!("Starting repository rekeying (rotating symmetric master key)...");
+    let ring_label = ring_opt.unwrap_or("default");
+    eprintln!(
+        "Starting repository rekeying for ring '{ring_label}' (rotating symmetric master key)..."
+    );
 
     // 1. Discover all existing active recipients
     let entries = fs::read_dir(&keys_dir)?;
@@ -505,12 +587,15 @@ fn cmd_rekey(force: bool) -> Result<()> {
         eprintln!("  * Re-wrapped key for {name_display}");
     }
 
-    // 4. Update .git-agecrypt/repo.pub
-    let pub_file = repo.public_key_file();
+    // 4. Update repo.pub
+    let pub_file = repo.public_key_file_for_ring(ring_opt);
+    if let Some(parent) = pub_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
     fs::write(&pub_file, format!("{}\n", new_recipient))?;
 
     // 5. Update local master key in common git dir atomically and clear stale cache
-    repo.save_local_master_key(new_secret_str.expose_secret())?;
+    repo.save_local_master_key_for_ring(new_secret_str.expose_secret(), ring_opt)?;
     let _ = repo.clear_cache();
 
     // 6. Re-stage strictly tracked secret files using targeted pathspecs (never '.'!)
@@ -523,7 +608,9 @@ fn cmd_rekey(force: bool) -> Result<()> {
     for slice in ls_out.stdout.split(|&b: &u8| b == 0) {
         if !slice.is_empty() {
             let rel_str = String::from_utf8_lossy(slice).to_string();
-            if repo.is_file_tracked(&rel_str) && repo.root.join(&rel_str).is_file() {
+            if repo.is_file_tracked_for_ring(&rel_str, ring_opt)
+                && repo.root.join(&rel_str).is_file()
+            {
                 secret_files.push(rel_str);
             }
         }
@@ -600,8 +687,12 @@ fn cmd_rekey(force: bool) -> Result<()> {
         "Rotated master key and re-wrapped for {} active recipient(s).",
         recipients_to_rekey.len()
     );
+    let commit_path = match ring_opt {
+        Some(r) if r != "default" && !r.is_empty() => format!(".git-agecrypt/rings/{r}"),
+        _ => ".git-agecrypt".to_string(),
+    };
     eprintln!("To finalize and commit the rotation:");
-    eprintln!("  git add .git-agecrypt");
+    eprintln!("  git add {commit_path}");
     eprintln!("  git commit -m 'Rotate repository master key (rekey)'");
     Ok(())
 }
@@ -965,12 +1056,13 @@ fn cmd_rewrap(paths: &[PathBuf], all: bool, identity_opt: Option<&str>, force: b
     Ok(())
 }
 
-fn cmd_unlock(key_file: Option<&str>, force: bool) -> Result<()> {
+fn cmd_unlock(key_file: Option<&str>, force: bool, ring_opt: Option<&str>) -> Result<()> {
     let repo = GitRepo::discover()?;
-    let keys_dir = repo.keys_dir();
+    let keys_dir = repo.keys_dir_for_ring(ring_opt);
     if !keys_dir.exists() {
         return Err(anyhow!(
-            "Repository does not have .git-agecrypt/keys directory"
+            "Repository does not have {} directory",
+            keys_dir.display()
         ));
     }
 
@@ -1009,7 +1101,7 @@ fn cmd_unlock(key_file: Option<&str>, force: bool) -> Result<()> {
         ));
     }
 
-    // 2. Iterate through all .git-agecrypt/keys/*.age and attempt unwrapping
+    // 2. Iterate through all keys/*.age and attempt unwrapping
     let entries = fs::read_dir(&keys_dir)?;
     let mut unwrapped_key: Option<String> = None;
 
@@ -1031,22 +1123,33 @@ fn cmd_unlock(key_file: Option<&str>, force: bool) -> Result<()> {
     }
 
     let master_key = unwrapped_key.ok_or_else(|| {
-        anyhow!("None of the provided private keys match any recipient in .git-agecrypt/keys/")
+        anyhow!(
+            "None of the provided private keys match any recipient in {}",
+            keys_dir.display()
+        )
     })?;
 
     // 3. Atomically save unwrapped master key
-    repo.save_local_master_key(&master_key)?;
+    repo.save_local_master_key_for_ring(&master_key, ring_opt)?;
 
     // 4. Safe checkout / refresh working trees across all linked worktrees
     repo.refresh_all_worktrees(force)?;
 
-    eprintln!(
-        "Repository unlocked successfully. Tracked secrets are now decrypted in your working tree."
-    );
+    let is_default = matches!(ring_opt, None | Some("default") | Some(""));
+    if is_default {
+        eprintln!(
+            "Repository unlocked successfully. Tracked secrets are now decrypted in your working tree."
+        );
+    } else {
+        eprintln!(
+            "Repository ring '{}' unlocked successfully. Tracked secrets are now decrypted in your working tree.",
+            ring_opt.unwrap()
+        );
+    }
     Ok(())
 }
 
-fn cmd_lock(force: bool) -> Result<()> {
+fn cmd_lock(force: bool, ring_opt: Option<&str>) -> Result<()> {
     let repo = GitRepo::discover()?;
 
     if let Some(op) = repo.check_active_git_operations()?
@@ -1101,9 +1204,22 @@ fn cmd_lock(force: bool) -> Result<()> {
     // Cleanliness and uncommitted edits across all worktrees were already strictly validated above.
     // Pass force=true to refresh_all_worktrees so that re-checking git status while repo.key is staged
     // does not falsely trigger dirty detection due to racy git timestamp cache differences.
-    repo.transactional_lock(|| repo.refresh_all_worktrees(true))?;
-    let _ = repo.clear_cache();
-    eprintln!("Repository locked across all linked worktrees. Local credentials removed.");
+    if let Some(r) = ring_opt {
+        repo.transactional_lock_for_ring(Some(r), || repo.refresh_all_worktrees(true))?;
+        let _ = repo.clear_cache();
+        eprintln!("Ring '{r}' locked across all linked worktrees. Local credentials removed.");
+    } else {
+        repo.transactional_lock_for_ring(None, || repo.refresh_all_worktrees(true))?;
+        if let Ok(rings) = repo.list_rings() {
+            for r in rings {
+                if r != "default" {
+                    let _ = repo.transactional_lock_for_ring(Some(&r), || Ok(()));
+                }
+            }
+        }
+        let _ = repo.clear_cache();
+        eprintln!("Repository locked across all linked worktrees. Local credentials removed.");
+    }
     Ok(())
 }
 
@@ -1204,7 +1320,7 @@ fn cmd_check(pre_push: bool, allow_untracked_secrets: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_clean(file_path: Option<&str>) -> Result<()> {
+fn cmd_clean(file_path: Option<&str>, ring_opt: Option<&str>) -> Result<()> {
     // Git clean filter: reads stdin, writes stdout.
     // ALL LOGGING MUST BE ON STDERR.
     let repo = GitRepo::discover().context("git-agecrypt clean: failed to discover git repo")?;
@@ -1226,17 +1342,18 @@ fn cmd_clean(file_path: Option<&str>) -> Result<()> {
         }
     }
 
-    let pub_file = repo.public_key_file();
+    let pub_file = repo.public_key_file_for_ring(ring_opt);
     if !pub_file.exists() {
         return Err(anyhow!(
-            "git-agecrypt clean: .git-agecrypt/repo.pub not found. Run 'git-agecrypt init'"
+            "git-agecrypt clean: public key file not found: {}. Run 'git-agecrypt init'",
+            pub_file.display()
         ));
     }
 
-    let pub_key_str = fs::read_to_string(pub_file)?;
+    let pub_key_str = fs::read_to_string(&pub_file)?;
     let recipient = crypto::parse_recipient(&pub_key_str)?;
 
-    let master_key_opt = repo.read_local_master_key()?;
+    let master_key_opt = repo.read_local_master_key_for_ring(ring_opt)?;
     let identity_opt: Option<age::x25519::Identity> = if let Some(ref key_str) = master_key_opt {
         age::x25519::Identity::from_str(key_str).ok()
     } else {
@@ -1248,7 +1365,7 @@ fn cmd_clean(file_path: Option<&str>) -> Result<()> {
 
     let reader = BufReader::new(stdin.lock());
     let writer = BufWriter::new(stdout.lock());
-    let cache_dir = repo.cache_dir();
+    let cache_dir = repo.cache_dir_for_ring(ring_opt);
     let cache_key = master_key_opt.as_deref().map(|s| s.as_bytes());
     let staged_blob = if let Some(path_str) = file_path {
         repo.get_staged_blob(path_str)
@@ -1273,15 +1390,17 @@ fn cmd_clean(file_path: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_smudge(file_path: Option<&str>) -> Result<()> {
+fn cmd_smudge(file_path: Option<&str>, ring_opt: Option<&str>) -> Result<()> {
     // Git smudge filter: reads stdin, writes stdout.
     // ALL LOGGING MUST BE ON STDERR.
     let repo = GitRepo::discover().context("git-agecrypt smudge: failed to discover git repo")?;
 
-    let is_stale = repo.is_local_master_key_stale().unwrap_or(false);
+    let is_stale = repo
+        .is_local_master_key_stale_for_ring(ring_opt)
+        .unwrap_or(false);
     let master_key_opt = if is_stale {
         // Master key was rotated upstream! Attempt automatic transparent re-unlock
-        if let Ok(Some(new_key)) = repo.try_auto_refresh_master_key() {
+        if let Ok(Some(new_key)) = repo.try_auto_refresh_master_key_for_ring(ring_opt) {
             eprintln!(
                 "git-agecrypt smudge: Upstream master key was rotated; automatically synchronized credentials."
             );
@@ -1295,7 +1414,7 @@ fn cmd_smudge(file_path: Option<&str>) -> Result<()> {
             None
         }
     } else {
-        repo.read_local_master_key()?
+        repo.read_local_master_key_for_ring(ring_opt)?
     };
 
     let identity_opt: Option<age::x25519::Identity> = if let Some(ref key_str) = master_key_opt {
@@ -1309,7 +1428,7 @@ fn cmd_smudge(file_path: Option<&str>) -> Result<()> {
 
     let reader = BufReader::new(stdin.lock());
     let writer = BufWriter::new(stdout.lock());
-    let cache_dir = repo.cache_dir();
+    let cache_dir = repo.cache_dir_for_ring(ring_opt);
     let cache_key = master_key_opt.as_deref().map(|s| s.as_bytes());
 
     if let Err(err) = crypto::smudge_stream(
@@ -1330,16 +1449,19 @@ fn cmd_smudge(file_path: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_textconv(file: &Path) -> Result<()> {
+fn cmd_textconv(file: &Path, ring_opt: Option<&str>) -> Result<()> {
     let repo = GitRepo::discover()?;
-    let key_opt = if repo.is_local_master_key_stale().unwrap_or(false) {
-        if let Ok(Some(new_key)) = repo.try_auto_refresh_master_key() {
+    let key_opt = if repo
+        .is_local_master_key_stale_for_ring(ring_opt)
+        .unwrap_or(false)
+    {
+        if let Ok(Some(new_key)) = repo.try_auto_refresh_master_key_for_ring(ring_opt) {
             Some(new_key)
         } else {
-            repo.read_local_master_key()?
+            repo.read_local_master_key_for_ring(ring_opt)?
         }
     } else {
-        repo.read_local_master_key()?
+        repo.read_local_master_key_for_ring(ring_opt)?
     };
 
     let target_file = if file.exists() {
@@ -1400,24 +1522,28 @@ fn cmd_merge(
     theirs: &Path,
     marker_size: Option<usize>,
     file_path: Option<&str>,
+    ring_opt: Option<&str>,
 ) -> Result<()> {
     let repo = GitRepo::discover()?;
-    let key_str = if repo.is_local_master_key_stale().unwrap_or(false) {
-        if let Ok(Some(new_key)) = repo.try_auto_refresh_master_key() {
+    let key_str = if repo
+        .is_local_master_key_stale_for_ring(ring_opt)
+        .unwrap_or(false)
+    {
+        if let Ok(Some(new_key)) = repo.try_auto_refresh_master_key_for_ring(ring_opt) {
             new_key
         } else {
-            repo.read_local_master_key()?.ok_or_else(|| {
+            repo.read_local_master_key_for_ring(ring_opt)?.ok_or_else(|| {
                 anyhow!("Repository is locked. Cannot execute 3-way merge on encrypted files. Run 'git-agecrypt unlock' first.")
             })?
         }
     } else {
-        repo.read_local_master_key()?.ok_or_else(|| {
+        repo.read_local_master_key_for_ring(ring_opt)?.ok_or_else(|| {
             anyhow!("Repository is locked. Cannot execute 3-way merge on encrypted files. Run 'git-agecrypt unlock' first.")
         })?
     };
 
     let identity = age::x25519::Identity::from_str(&key_str).map_err(|e| anyhow!("{e}"))?;
-    let pub_file = repo.public_key_file();
+    let pub_file = repo.public_key_file_for_ring(ring_opt);
     let pub_key_str = fs::read_to_string(pub_file)?;
     let recipient = crypto::parse_recipient(&pub_key_str)?;
 
@@ -1466,10 +1592,10 @@ fn cmd_migrate(identity: Option<&str>) -> Result<()> {
     eprintln!("Updated .gitattributes: migrated filter=git-crypt -> filter=agecrypt");
 
     // Run init
-    cmd_init(false, false)?;
+    cmd_init(false, false, None)?;
 
     if let Some(id) = identity {
-        cmd_add_recipient(Some(id), None, Some("migration-recipient"))?;
+        cmd_add_recipient(Some(id), None, Some("migration-recipient"), None)?;
     }
 
     // Renormalize git index so clean filter is invoked on existing files
@@ -1516,7 +1642,64 @@ fn find_default_ssh_public_key() -> Option<String> {
     None
 }
 
-fn cmd_run(env_file_opt: Option<&Path>, command: &[String]) -> Result<()> {
+#[cfg(target_os = "linux")]
+fn pass_via_memfd(
+    env_vars: &std::collections::HashMap<String, String>,
+    command: &[String],
+) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let mut content = String::new();
+    for (k, v) in env_vars {
+        content.push_str(&format!("{k}={v}\n"));
+    }
+
+    let name = CString::new("git_agecrypt_env")?;
+    let fd = unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), 0) } as i32;
+    if fd < 0 {
+        return Err(anyhow!(
+            "memfd_create failed: {}",
+            io::Error::last_os_error()
+        ));
+    }
+
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    use std::io::Seek;
+    file.seek(io::SeekFrom::Start(0))?;
+
+    let raw_fd_val = std::mem::ManuallyDrop::new(file).as_raw_fd();
+
+    let mut child = process::Command::new(&command[0]);
+    child.args(&command[1..]);
+    child.env("GIT_AGECRYPT_ENV_FD", raw_fd_val.to_string());
+    child.env("GIT_AGECRYPT_ENV_FILE", format!("/dev/fd/{raw_fd_val}"));
+
+    let status = child
+        .status()
+        .with_context(|| format!("Failed to execute command '{}'", command[0]))?;
+    process::exit(status.code().unwrap_or(1));
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pass_via_memfd(
+    _env_vars: &std::collections::HashMap<String, String>,
+    _command: &[String],
+) -> Result<()> {
+    eprintln!(
+        "git-agecrypt run [NOTICE]: In-memory anonymous file descriptor passing (--fd / memfd_create) is only supported on Linux. Falling back to standard child process environment variable injection."
+    );
+    Ok(())
+}
+
+fn cmd_run(
+    env_file_opt: Option<&Path>,
+    ring_opt: Option<&str>,
+    fd_flag: bool,
+    command: &[String],
+) -> Result<()> {
     if command.is_empty() {
         return Err(anyhow!("No command specified to run"));
     }
@@ -1538,11 +1721,21 @@ fn cmd_run(env_file_opt: Option<&Path>, command: &[String]) -> Result<()> {
         vec![full]
     } else {
         let mut env_files = Vec::new();
+        if let Some(r) = ring_opt {
+            let ring_env = repo.root.join(format!(".env.{r}"));
+            if ring_env.exists() {
+                env_files.push(ring_env);
+            }
+            let ring_dir_env = repo.root.join(format!("secrets/{r}/.env"));
+            if ring_dir_env.exists() && !env_files.contains(&ring_dir_env) {
+                env_files.push(ring_dir_env);
+            }
+        }
         let default_env = repo.root.join(".env");
-        if default_env.exists() {
+        if default_env.exists() && !env_files.contains(&default_env) {
             env_files.push(default_env);
         }
-        if let Ok(patterns) = repo.get_tracked_patterns() {
+        if let Ok(patterns) = repo.get_tracked_patterns_for_ring(ring_opt) {
             for pat in patterns {
                 let lower = pat.to_lowercase();
                 if lower.ends_with(".env")
@@ -1581,12 +1774,12 @@ fn cmd_run(env_file_opt: Option<&Path>, command: &[String]) -> Result<()> {
         let prefix_len = std::cmp::min(bytes.len(), crypto::AGE_HEADER_MAGIC.len());
         let plaintext = if crypto::is_age_ciphertext(&bytes[..prefix_len]) {
             if master_key_opt.is_none() {
-                if let Ok(Some(key)) = repo.read_local_master_key() {
+                if let Ok(Some(key)) = repo.read_local_master_key_for_ring(ring_opt) {
                     master_key_opt = Some(key);
-                } else if let Ok(Some(key)) = repo.try_auto_refresh_master_key() {
+                } else if let Ok(Some(key)) = repo.try_auto_refresh_master_key_for_ring(ring_opt) {
                     master_key_opt = Some(key);
                 } else {
-                    let keys_dir = repo.keys_dir();
+                    let keys_dir = repo.keys_dir_for_ring(ring_opt);
                     if keys_dir.exists() {
                         let mut identities = Vec::new();
                         for candidate in crypto::get_default_identity_paths() {
@@ -1671,6 +1864,10 @@ fn cmd_run(env_file_opt: Option<&Path>, command: &[String]) -> Result<()> {
                 }
             }
         }
+    }
+
+    if fd_flag {
+        pass_via_memfd(&env_vars, command)?;
     }
 
     let mut child = process::Command::new(&command[0]);

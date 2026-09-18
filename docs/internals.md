@@ -110,8 +110,10 @@ Because `age` uses randomized nonces, re-encrypting identical plaintext normally
 ```
 
 1. **Stage 0 Index Deduplication:** Prior to encryption, `git-agecrypt` checks `:0:<path>` in the Git index. If that blob decrypts to the current plaintext, the exact existing ciphertext is reused.
-2. **Keyed HMAC Cache:** If the index entry is unavailable or different, `git-agecrypt` computes `HMAC-SHA256(master_key, plaintext)`. The digest addresses the cache file at `.git/git-agecrypt/cache/<digest>`.
-3. **Cache Validation & Invalidation:** When a cache hit occurs, `git-agecrypt` performs a lightweight check on the header (`is_age_ciphertext`). If a cached file was truncated or corrupted, it is automatically unlinked and treated as a cache miss, ensuring corrupted data is never emitted into the Git index.
+2. **Keyed HMAC Cache:** If the index entry is unavailable or different, `git-agecrypt` computes `HMAC-SHA256(master_key, plaintext)`. The digest addresses the cache file at `.git/git-agecrypt/cache/<fingerprint>/<digest>`.
+3. **Cryptographic Cache Authentication:** When a cache hit candidate is discovered, `git-agecrypt` does NOT simply trust the file structure. It decrypts the cached ciphertext in RAM using the active master identity and verifies that `HMAC-SHA256(master_key, decrypted_bytes) == digest`. If the HMAC matches and decryption succeeds, the ciphertext is safely emitted.
+4. **Automatic Eviction & Fail-Closed Fallback:** If the candidate cache file has been tampered with, originates from a foreign key epoch, or contains bit flips, `git-agecrypt` automatically removes the corrupted entry (`fs::remove_file`) and falls back to a clean encryption of the genuine working tree file.
+5. **Key Epoch Cache Purging:** During `git-agecrypt rekey`, all cached ciphertexts across `.git/git-agecrypt/cache/` are immediately purged to prevent ciphertext reuse across different master key generations.
 
 ---
 
@@ -157,3 +159,69 @@ $$\text{merge driver invocation: } \texttt{git-agecrypt merge <\%O> <\%A> <\%B> 
 
 1. **Outgoing Commit Validation:** Scans the revision range `origin/branch..HEAD` to verify that every commit about to leave the local repository has all sensitive files properly encrypted.
 2. **Key Epoch Verification:** Verifies that all outgoing encrypted files are decryptable with the currently active master key, preventing developers from pushing commits encrypted under outdated or revoked keys.
+
+---
+
+## 6. Scoped Recipient Rings Architecture
+
+`git-agecrypt` supports partitioned recipient access domains known as **Scoped Recipient Rings**.
+
+### 6.1 Directory & State Hierarchy
+
+```text
+Repository Root
+├── .gitattributes
+├── .git-agecrypt/
+│   ├── keys/                         # Default ring recipient envelopes
+│   │   ├── alice.age
+│   │   └── bob.age
+│   ├── repo.pub                      # Default ring public identity
+│   └── rings/
+│       ├── prod/                     # Scoped ring "prod"
+│       │   ├── keys/
+│       │   │   └── ops_lead.age
+│       │   └── repo.pub
+│       └── dev/                      # Scoped ring "dev"
+│           ├── keys/
+│           │   └── team.age
+│           └── repo.pub
+└── .git/
+    └── git-agecrypt/
+        ├── repo.key                  # Ephemeral unlocked default master key
+        ├── cache/                    # HMAC ciphertext cache
+        ├── spool/                    # RAM-to-disk large file spools
+        └── rings/
+            ├── prod/
+            │   └── repo.key          # Ephemeral unlocked prod master key
+            └── dev/
+                └── repo.key          # Ephemeral unlocked dev master key
+```
+
+### 6.2 Driver Binding & Filter Routing
+
+Scoped rings bind Git filters through `.gitattributes`:
+- `*.secret.env filter=agecrypt diff=agecrypt merge=agecrypt -text` routes to the default ring.
+- `secrets/prod/** filter=agecrypt-prod diff=agecrypt-prod merge=agecrypt-prod -text` routes to ring `prod`.
+
+When `git-agecrypt clean %f --ring prod` or `git-agecrypt smudge %f --ring prod` executes:
+1. It queries `.git/git-agecrypt/rings/prod/repo.key`.
+2. If unlocked, it decrypts/encrypts using the `prod` master key.
+3. If locked, `smudge` safely passes ciphertext through without breaking Git checkout or branch switching.
+4. During pre-commit and pre-push validation, `git-agecrypt check` dynamically inspects each staged file's assigned filter attribute and validates ciphertext against that specific ring's key epoch.
+
+---
+
+## 7. Anonymous In-Memory Secret Passing (`memfd_create`)
+
+To eliminate exposure of decrypted environment variables via `/proc/<pid>/environ` on Linux hosts:
+
+### 7.1 Linux Kernel In-Memory File Descriptors
+
+When `git-agecrypt run --fd -- <cmd>` is executed on Linux:
+1. **Syscall Invocation:** `git-agecrypt` invokes `libc::syscall(SYS_memfd_create, name, MFD_CLOEXEC)`.
+2. **Anonymous RAM Allocation:** The Linux kernel allocates an anonymous, RAM-backed file descriptor that has no path on the physical filesystem.
+3. **Decryption & Spooling:** The encrypted `.env` file is decrypted in RAM and written into the file descriptor.
+4. **File Offset Rewind:** The file position is rewound to 0 (`lseek(fd, 0, SEEK_SET)`).
+5. **FD Exposure:** The descriptor is configured with `GIT_AGECRYPT_ENV_FD=<fd>`. Child processes can read secrets via `/dev/fd/<fd>` or `open("/proc/self/fd/<fd>", O_RDONLY)`.
+6. **Zero Disk Footprint:** When the parent or child process terminates, the kernel frees the memory automatically. Cleartext secrets never touch disk or swap partitions.
+

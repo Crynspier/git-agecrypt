@@ -461,6 +461,7 @@ fn cmd_remove_recipient(name: &str, ring_opt: Option<&str>) -> Result<()> {
 
     fs::remove_file(&key_file)
         .with_context(|| format!("Failed to remove recipient file: {}", key_file.display()))?;
+    git::crash_point("after_old_delete");
 
     eprintln!("Removed recipient '{label}' ({})", key_file.display());
     eprintln!();
@@ -627,6 +628,7 @@ fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
     // 5. Update local master key in common git dir atomically and clear stale cache
     repo.save_local_master_key_for_ring(new_secret_str.expose_secret(), ring_opt)?;
     repo.clear_cache_for_ring(ring_opt, true)?;
+    git::crash_point("after_old_delete");
 
     // 6. Re-stage strictly tracked secret files using targeted pathspecs (never '.'!)
     let ls_out = git::git_cmd_with_path(&repo.root)

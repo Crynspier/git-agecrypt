@@ -1,0 +1,2 @@
+# Ring name with Cyrillic homoglyph (looks like 'admin' but uses Cyrillic 'а')
+аdmin=secret_value_1234

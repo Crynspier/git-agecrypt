@@ -292,6 +292,7 @@ pub struct SemanticConflict {
 }
 
 /// Detects duplicate conflicting key definitions in merged key-value or .env files.
+/// Gracefully handles multiline quoted strings and trailing comments.
 pub fn find_semantic_conflicts(content: &[u8], file_path: &str) -> Vec<SemanticConflict> {
     let lower_path = file_path.to_lowercase();
     let is_key_val = lower_path.ends_with(".env")
@@ -308,8 +309,37 @@ pub fn find_semantic_conflicts(content: &[u8], file_path: &str) -> Vec<SemanticC
     if let Ok(text) = std::str::from_utf8(content) {
         let mut seen_keys: std::collections::HashMap<String, (usize, String)> =
             std::collections::HashMap::new();
+        let mut in_multiline: Option<(String, usize, char, String)> = None;
+
         for (line_idx, raw_line) in text.lines().enumerate() {
             let line = raw_line.trim();
+
+            if let Some((key, start_line, quote_char, mut acc)) = in_multiline.take() {
+                if let Some(idx) = line.find(quote_char) {
+                    acc.push('\n');
+                    acc.push_str(&line[..idx]);
+                    let final_val = acc.trim().to_string();
+                    if let Some((prev_line, prev_val)) = seen_keys.get(&key) {
+                        if prev_val != &final_val {
+                            conflicts.push(SemanticConflict {
+                                key: key.clone(),
+                                prev_line: *prev_line,
+                                curr_line: start_line,
+                                prev_val: prev_val.clone(),
+                                curr_val: final_val.clone(),
+                            });
+                        }
+                    } else {
+                        seen_keys.insert(key, (start_line, final_val));
+                    }
+                } else {
+                    acc.push('\n');
+                    acc.push_str(line);
+                    in_multiline = Some((key, start_line, quote_char, acc));
+                }
+                continue;
+            }
+
             if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
                 continue;
             }
@@ -323,18 +353,39 @@ pub fn find_semantic_conflicts(content: &[u8], file_path: &str) -> Vec<SemanticC
                 let key = key.trim();
                 let val = val.trim();
                 if !key.is_empty() {
+                    // Check if value opens a multiline quote
+                    if (val.starts_with('"') && !val[1..].contains('"'))
+                        || (val.starts_with('\'') && !val[1..].contains('\''))
+                    {
+                        let quote_char = val.chars().next().unwrap();
+                        let initial = val[1..].to_string();
+                        in_multiline = Some((key.to_string(), line_idx + 1, quote_char, initial));
+                        continue;
+                    }
+
+                    // Strip inline trailing comment if outside quotes
+                    let cleaned_val = if !val.starts_with('"') && !val.starts_with('\'') {
+                        if let Some((v, _)) = val.split_once('#') {
+                            v.trim()
+                        } else {
+                            val
+                        }
+                    } else {
+                        val
+                    };
+
                     if let Some((prev_line, prev_val)) = seen_keys.get(key) {
-                        if prev_val != val {
+                        if prev_val != cleaned_val {
                             conflicts.push(SemanticConflict {
                                 key: key.to_string(),
                                 prev_line: *prev_line,
                                 curr_line: line_idx + 1,
                                 prev_val: prev_val.clone(),
-                                curr_val: val.to_string(),
+                                curr_val: cleaned_val.to_string(),
                             });
                         }
                     } else {
-                        seen_keys.insert(key.to_string(), (line_idx + 1, val.to_string()));
+                        seen_keys.insert(key.to_string(), (line_idx + 1, cleaned_val.to_string()));
                     }
                 }
             }
@@ -390,6 +441,21 @@ mod tests {
         // Incomplete markers (missing separator or closing) should not trigger
         let incomplete = b"<<<<<<< HEAD (ours)\nKEY1=val1\n";
         assert!(!contains_conflict_markers(incomplete));
+    }
+
+    #[test]
+    fn test_multiline_and_comment_semantic_conflicts() {
+        let multiline_doc = b"CERT=\"line1\nline2\"\nCERT=\"diff1\ndiff2\"\n";
+        let conflicts = find_semantic_conflicts(multiline_doc, ".env");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].key, "CERT");
+
+        let comments_doc = b"TOKEN=abc # trailing comment\nTOKEN=def # another comment\n";
+        let c2 = find_semantic_conflicts(comments_doc, ".env");
+        assert_eq!(c2.len(), 1);
+        assert_eq!(c2[0].key, "TOKEN");
+        assert_eq!(c2[0].prev_val, "abc");
+        assert_eq!(c2[0].curr_val, "def");
     }
 
     proptest::proptest! {

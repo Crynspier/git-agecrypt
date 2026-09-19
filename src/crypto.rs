@@ -396,7 +396,6 @@ impl SpoolBuffer {
         }
     }
 
-    #[cfg(test)]
     pub fn is_in_memory(&self) -> bool {
         matches!(self, SpoolBuffer::Memory(_))
     }
@@ -448,6 +447,7 @@ pub fn spool_stream<R: Read>(
             mem_buf.shrink_to_fit();
             disk_file = Some(df);
         }
+        crate::git::crash_point("spool_chunk");
     }
 
     if let Some(ref mut df) = disk_file {
@@ -603,6 +603,7 @@ fn encrypt_plaintext_stream<R: Read, W: Write>(
     }
 
     // Cache miss or no cache: encrypt plaintext
+    let _was_in_memory = spool.is_in_memory();
     let mut reader = spool.reader()?;
     let encryptor = age::Encryptor::with_recipients(std::iter::once(recipient))
         .map_err(|e| anyhow!("Failed to initialize age encryptor for clean filter: {e}"))?;
@@ -616,6 +617,7 @@ fn encrypt_plaintext_stream<R: Read, W: Write>(
         io::copy(&mut reader, &mut age_writer)
             .context("Failed to encrypt stream during clean filter")?;
         age_writer.finish()?.flush()?;
+        crate::git::crash_point("after_ciphertext_write");
 
         {
             let mut cache_read = File::open(cache_temp.path())?;
@@ -625,6 +627,7 @@ fn encrypt_plaintext_stream<R: Read, W: Write>(
 
         // Guarantee physical media sync before atomic rename (fail-closed)
         cache_temp.as_file().sync_all()?;
+        crate::git::crash_point("after_ciphertext_fsync");
 
         let dest = c_dir.join(format!("{hash_hex}.age"));
         if !dest.exists() {

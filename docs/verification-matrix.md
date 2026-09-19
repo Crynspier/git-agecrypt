@@ -1,48 +1,47 @@
-# High-Assurance Verification & Invariant Mapping Matrix (v0.4.0)
+# High-Assurance Verification & Invariant Mapping Matrix (v0.5.0)
 
 This document provides the exhaustive, bi-directional verification matrix mapping every architectural invariant and critique item to its concrete implementation and automated test suites in `git-agecrypt`.
 
 ---
 
-## 1. Critique Items Verification Matrix
+## 1. Critique Items Verification Matrix (v0.5.0)
 
 | # | Critique Domain | Architectural Implementation | Primary Automated Test Suite |
 |---|---|---|---|
-| **#1** | Randomized Git state-machine harness | In-memory shadow model + seeded PRNG (`rand_chacha`) | [`tests/test_stateful_random_harness.rs`](../tests/test_stateful_random_harness.rs) |
-| **#2** | Ring $\times$ generation $\times$ Git operations | Multi-tier ring envelope routing + independent key rotation | [`tests/test_combinatorial_rings_generations.rs`](../tests/test_combinatorial_rings_generations.rs) |
-| **#3** | Real in-flight kill point testing | Atomic staging + WAL journal deterministic recovery (`recover_interrupted_transaction`) | [`tests/test_fault_injection_kill.rs`](../tests/test_fault_injection_kill.rs) |
-| **#4** | Filesystem / crash durability testing | POSIX directory `sync_dir` + `sync_all` on temporary files before rename | [`tests/test_durability.rs`](../tests/test_durability.rs), [`tests/test_fault_injection_kill.rs`](../tests/test_fault_injection_kill.rs) |
-| **#5** | Complete `run --fd` security lifecycle | Parent `MFD_CLOEXEC` + child `pre_exec` unset + exit code propagation | [`tests/test_run_fd_isolation.rs`](../tests/test_run_fd_isolation.rs), [`tests/test_run_fd.rs`](../tests/test_run_fd.rs) |
-| **#6** | `/proc` & memory inspection boundary | `libc::prctl(PR_SET_DUMPABLE, 0)` in child `pre_exec` | [`src/main.rs`](../src/main.rs), [`tests/test_run_fd_isolation.rs`](../tests/test_run_fd_isolation.rs) |
-| **#7** | Mixed-operation concurrency stress | Parallel thread workers executing clean, smudge, and cache reads | [`tests/test_mixed_concurrency_stress.rs`](../tests/test_mixed_concurrency_stress.rs) |
-| **#8** | Cache race & stress testing | Keyed HMAC validation with automatic eviction of stale entries | [`tests/test_mixed_concurrency_stress.rs`](../tests/test_mixed_concurrency_stress.rs), [`tests/test_concurrency.rs`](../tests/test_concurrency.rs) |
-| **#9** | Symlink / TOCTOU redirection attacks | `ensure_not_symlink_or_reparse` validates all sensitive paths | [`tests/test_case_collision_and_symlinks.rs`](../tests/test_case_collision_and_symlinks.rs) |
-| **#10** | Cross-platform case-insensitive collisions | `check_ring_case_collision` blocks case-variant collisions (`prod` vs `PROD`) | [`tests/test_case_collision_and_symlinks.rs`](../tests/test_case_collision_and_symlinks.rs) |
-| **#11** | Deep merge truth-table matrix | 3-way semantic merge driver with comment, unicode, and duplicate key checks | [`tests/test_deep_merge_matrix.rs`](../tests/test_deep_merge_matrix.rs) |
-| **#12** | Multi-generation branch DAG topology | Rekey tracking across forked DAG branches and cross-branch merges | [`tests/test_combinatorial_rings_generations.rs`](../tests/test_combinatorial_rings_generations.rs), [`tests/test_rekey_chains.rs`](../tests/test_rekey_chains.rs) |
-| **#13** | Revocation across complex histories | Epoch-based recipient envelope rotation with historical commit access | [`tests/test_revocation_history.rs`](../tests/test_revocation_history.rs) |
-| **#14** | Submodule recursive hierarchy | Independent keys and filter drivers across nested submodules | [`tests/test_submodule_recursion.rs`](../tests/test_submodule_recursion.rs), [`tests/test_submodules_worktrees.rs`](../tests/test_submodules_worktrees.rs) |
-| **#15** | Large-file interruption testing | Two-tier spooling (> 1 MiB spills to disk in 64 KiB streaming chunks) | [`tests/test_forensic_canary_sweeps.rs`](../tests/test_forensic_canary_sweeps.rs), [`tests/test_large_files.rs`](../tests/test_large_files.rs) |
-| **#16** | Plaintext temp file forensic sweeps | Recursive disk scan across `.git/`, spool, and system temp | [`tests/test_forensic_canary_sweeps.rs`](../tests/test_forensic_canary_sweeps.rs) |
-| **#17** | Error-path secret leakage prevention | Error formatting audits; raw secrets are never formatted into errors | [`tests/test_adversarial_harness.rs`](../tests/test_adversarial_harness.rs) |
-| **#18** | Hardware-token failure matrix | Deterministic fail-closed behavior on missing, corrupt, or wrong keys | [`tests/test_hardware_token_matrix.rs`](../tests/test_hardware_token_matrix.rs) |
-| **#19** | Proper fuzzing campaign | Proptest property-based fuzzing of clean, smudge, and merge parsers | [`src/crypto.rs`](../src/crypto.rs), [`src/merge.rs`](../src/merge.rs), [`tests/test_fuzz_boundaries.rs`](../tests/test_fuzz_boundaries.rs) |
-| **#20** | Stateful fuzzing of application | Generative random operation loop comparing against shadow state | [`tests/test_stateful_random_harness.rs`](../tests/test_stateful_random_harness.rs) |
-| **#21** | Declarative invariant framework | Formal invariant assertion suite (`assert_inv_a` through `assert_inv_f`) | [`tests/common/invariants.rs`](../tests/common/invariants.rs) |
-| **#22** | Performance benchmarking | Keyed HMAC-SHA256 cache hits eliminate ChaCha20-Poly1305 re-encryption | [`src/crypto.rs`](../src/crypto.rs), [`tests/test_durability.rs`](../tests/test_durability.rs) |
-| **#23** | Memory lifetime & hygiene | Sensitive buffers wrapped in `Zeroizing<Vec<u8>>` wiped on drop | [`src/crypto.rs`](../src/crypto.rs), [`tests/test_memory_hygiene.rs`](../tests/test_memory_hygiene.rs) |
-| **#24** | Dependency & unsafe-code audit | Audited `unsafe` blocks for `memfd_create`, `libc::close`, and `prctl` | [`src/main.rs`](../src/main.rs), [`src/git.rs`](../src/git.rs) |
-| **#25** | CI matrix expansion | Multi-platform CI runners (Ubuntu, macOS ARM64/x86_64, Windows) | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) |
-| **#26** | Release regression corpus | 117-test regression suite covering historical boundary conditions | [`tests/integration_tests.rs`](../tests/integration_tests.rs) |
-| **#27** | Documentation $\leftrightarrow$ Implementation sync | Formal invariants A–F and architecture guides verified by tests | [`docs/security-model.md`](security-model.md), [`docs/internals.md`](internals.md) |
+| **#1** | Real SIGKILL / crash-point injection | 14 in-flight crash hooks (`GIT_AGECRYPT_CRASH_POINT`) terminating via `SIGKILL` / `TerminateProcess` | [`tests/test_sigkill_crash_injection.rs`](../tests/test_sigkill_crash_injection.rs) |
+| **#2** | Expanded randomized Git state machine | 24-operation generative state machine testing branches, stashes, rebases, and commits | [`tests/test_generative_shadow_state_machine.rs`](../tests/test_generative_shadow_state_machine.rs) |
+| **#3** | In-memory shadow model tracking rings | `ShadowModel` reference engine tracking rings, generations, recipients, and lock states | [`tests/common/shadow_model.rs`](../tests/common/shadow_model.rs), [`tests/test_generative_shadow_state_machine.rs`](../tests/test_generative_shadow_state_machine.rs) |
+| **#4** | Random ring $\times$ generation $\times$ Git DAG | Generative DAG branching, independent ring rekeys, and cross-ring merges | [`tests/test_generative_ring_dag.rs`](../tests/test_generative_ring_dag.rs) |
+| **#5** | Real mixed-operation concurrency | Concurrent clean/smudge threads racing against active rekeys and cache updates | [`tests/test_advanced_cache_races.rs`](../tests/test_advanced_cache_races.rs), [`tests/test_mixed_concurrency_stress.rs`](../tests/test_mixed_concurrency_stress.rs) |
+| **#6** | TOCTOU filesystem elimination | Descriptor-pinned `openat(..., O_NOFOLLOW)` (Unix) and `FILE_FLAG_OPEN_REPARSE_POINT` (Windows) | [`src/git.rs`](../src/git.rs), [`tests/test_toctou_racing.rs`](../tests/test_toctou_racing.rs) |
+| **#7** | Hostile-process `/proc` testing for `run --fd` | Real child secret consumption with concurrent `/proc/<pid>/mem` and `ptrace` inspection | [`tests/test_hostile_proc_snooping.rs`](../tests/test_hostile_proc_snooping.rs) |
+| **#8** | FD lifetime and process crash bounds | Child exit codes (0, 42), crash handling, early close, and descriptor cleanup | [`tests/test_fd_lifecycle_crash.rs`](../tests/test_fd_lifecycle_crash.rs) |
+| **#9** | Continuous coverage-guided fuzzing | Dedicated GitHub Actions nightly workflow for continuous parser fuzzing | [`.github/workflows/nightly-fuzz.yml`](../.github/workflows/nightly-fuzz.yml) |
+| **#10** | Permanent regression corpus | Byte-level regression corpus runner in standard CI | [`tests/regressions/`](../tests/regressions/), [`tests/test_regression_corpus.rs`](../tests/test_regression_corpus.rs) |
+| **#11** | Power-loss & crash durability testing | Write $\to$ fsync $\to$ rename $\to$ crash $\to$ restart verification across 14 state boundaries | [`tests/test_sigkill_crash_injection.rs`](../tests/test_sigkill_crash_injection.rs), [`tests/test_durability.rs`](../tests/test_durability.rs) |
+| **#12** | Large-file interrupted streaming | 4 MiB stream killed in-flight with recursive forensic canary disk sweeps | [`tests/test_large_file_crash_spool.rs`](../tests/test_large_file_crash_spool.rs) |
+| **#13** | Strict 3-tier submodule hierarchy | Strict parent $\to$ child $\to$ grandchild hierarchy testing with assertion rigor | [`tests/test_strict_submodules_matrix.rs`](../tests/test_strict_submodules_matrix.rs) |
+| **#14** | Expanded 3-way merge matrix | 18-case merge matrix: non-overlapping, comments, quotes, JSON, conflict markers | [`tests/test_deep_merge_matrix_expanded.rs`](../tests/test_deep_merge_matrix_expanded.rs) |
+| **#15** | Historical revocation semantics | Alice, Bob, Charlie multi-generation epoch access and forward-secrecy proofs | [`tests/test_historical_revocation_epochs.rs`](../tests/test_historical_revocation_epochs.rs) |
+| **#16** | Hardware-token failure matrix | Missing, corrupt, truncated, and empty identity streams fail closed | [`tests/test_hardware_token_failure_matrix.rs`](../tests/test_hardware_token_failure_matrix.rs) |
+| **#17** | Memory-hygiene under crash & errors | Forensic canary sweeps and zero secret retention in core dumps / crash files | [`tests/test_large_file_crash_spool.rs`](../tests/test_large_file_crash_spool.rs), [`tests/test_memory_hygiene.rs`](../tests/test_memory_hygiene.rs) |
+| **#18** | Performance benchmarking | Throughput (MB/s) and latency microbenchmarks across payload sizes | [`benches/bench_main.rs`](../benches/bench_main.rs) |
+| **#19** | Cross-platform adversarial testing | Active symlink and junction racing on NTFS and POSIX | [`tests/test_toctou_racing.rs`](../tests/test_toctou_racing.rs), [`tests/test_case_collision_and_symlinks.rs`](../tests/test_case_collision_and_symlinks.rs) |
+| **#20** | Advanced cache race testing | Cache hit $\times$ rekey races, atomic persistence, and cache corruption recovery | [`tests/test_advanced_cache_races.rs`](../tests/test_advanced_cache_races.rs) |
+| **#21** | Expanded invariant framework | Continuous evaluation of Invariants A through G after every operation | [`tests/common/invariants.rs`](../tests/common/invariants.rs) |
+| **#22** | Configurable random-run depth | Seedable PRNG (`GIT_AGECRYPT_SEED`) with configurable operation count (`GIT_AGECRYPT_OPS`) | [`tests/test_generative_shadow_state_machine.rs`](../tests/test_generative_shadow_state_machine.rs) |
+| **#23** | Documentation & specification tightening | Formal specification of security model, threat boundaries, and revocation guarantees | [`docs/spec-guarantees.md`](spec-guarantees.md) |
+| **#24** | Dependency & unsafe hardening | Documented `unsafe` blocks for `openat`, `TerminateProcess`, and `prctl` | [`src/git.rs`](../src/git.rs), [`src/main.rs`](../src/main.rs) |
+| **#25** | CI matrix & nightly automation | Multi-OS testing matrix + dedicated nightly deep fuzz workflow | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), [`.github/workflows/nightly-fuzz.yml`](../.github/workflows/nightly-fuzz.yml) |
 
 ---
 
-## 2. Invariants A through F Verification Mapping
+## 2. Invariants A through G Verification Mapping
 
-- **Invariant A (Working Tree Plaintext $\iff$ Git Objects Ciphertext):** Verified continuously by [`assert_invariant_a`](../tests/common/mod.rs) across [`test_stateful_random_harness.rs`](../tests/test_stateful_random_harness.rs), [`test_stateful_git.rs`](../tests/test_stateful_git.rs), and [`test_adversarial_harness.rs`](../tests/test_adversarial_harness.rs).
-- **Invariant B (Crash Durability & Fail-Closed Flush):** Verified by [`test_durability.rs`](../tests/test_durability.rs) and [`test_fault_injection_kill.rs`](../tests/test_fault_injection_kill.rs).
-- **Invariant C (Cross-Ring Isolation):** Verified by [`test_scoped_rings.rs`](../tests/test_scoped_rings.rs) and [`test_combinatorial_rings_generations.rs`](../tests/test_combinatorial_rings_generations.rs).
+- **Invariant A (Working Tree Plaintext $\iff$ Git Objects Ciphertext):** Verified continuously across [`test_generative_shadow_state_machine.rs`](../tests/test_generative_shadow_state_machine.rs), [`test_stateful_random_harness.rs`](../tests/test_stateful_random_harness.rs), and [`test_deep_merge_matrix_expanded.rs`](../tests/test_deep_merge_matrix_expanded.rs).
+- **Invariant B (Crash Durability & Fail-Closed Flush):** Verified across all 14 crash points in [`test_sigkill_crash_injection.rs`](../tests/test_sigkill_crash_injection.rs) and [`test_durability.rs`](../tests/test_durability.rs).
+- **Invariant C (Cross-Ring Isolation):** Verified by [`test_generative_ring_dag.rs`](../tests/test_generative_ring_dag.rs) and [`test_scoped_rings.rs`](../tests/test_scoped_rings.rs).
 - **Invariant D (Path Traversal & Device Name Safety):** Verified by [`test_case_collision_and_symlinks.rs`](../tests/test_case_collision_and_symlinks.rs) and [`test_filesystem_security.rs`](../tests/test_filesystem_security.rs).
 - **Invariant E (Zero-Plaintext Memory Hygiene):** Verified by [`test_memory_hygiene.rs`](../tests/test_memory_hygiene.rs) and [`test_run_fd_isolation.rs`](../tests/test_run_fd_isolation.rs).
-- **Invariant F (Idempotent Git State Machine):** Verified by [`test_stateful_random_harness.rs`](../tests/test_stateful_random_harness.rs) and [`test_stateful_git.rs`](../tests/test_stateful_git.rs).
+- **Invariant F (Idempotent Git State Machine):** Verified by [`test_generative_shadow_state_machine.rs`](../tests/test_generative_shadow_state_machine.rs) and [`test_stateful_git.rs`](../tests/test_stateful_git.rs).
+- **Invariant G (Zero Plaintext Canary Leaks):** Verified by [`test_large_file_crash_spool.rs`](../tests/test_large_file_crash_spool.rs), [`test_forensic_canary_sweeps.rs`](../tests/test_forensic_canary_sweeps.rs), and continuous state machine sweeps.

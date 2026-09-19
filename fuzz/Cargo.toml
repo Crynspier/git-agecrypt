@@ -1,0 +1,37 @@
+[package]
+name = "git-agecrypt-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+git-agecrypt = { path = ".." }
+age = { version = "0.12.1", features = ["ssh", "armor", "cli-common", "plugin"] }
+
+[[bin]]
+name = "fuzz_age_ciphertext"
+path = "fuzz_targets/fuzz_age_ciphertext.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_wal_journal"
+path = "fuzz_targets/fuzz_wal_journal.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_merge_parser"
+path = "fuzz_targets/fuzz_merge_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_gitattributes"
+path = "fuzz_targets/fuzz_gitattributes.rs"
+test = false
+doc = false

@@ -1,0 +1,2 @@
+/invalid/path/missing/tabs/and/separators
+\0\0\0NULL_BYTES_CORRUPTED_ENTRY

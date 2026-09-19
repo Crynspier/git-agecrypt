@@ -1,6 +1,6 @@
 [package]
 name = "git-agecrypt"
-version = "0.4.0"
+version = "0.5.0"
 rust-version = "1.85.0"
 # Rust language edition (RFC 3501, requires Rust 1.85+ for let-chains; valid values: 2015, 2018, 2021, 2024)
 edition = "2024"
@@ -11,6 +11,10 @@ readme = "README.md"
 repository = "https://github.com/Crynspier/git-agecrypt"
 keywords = ["git", "age", "encryption", "secrets", "security"]
 categories = ["command-line-utilities", "cryptography", "development-tools::version-control"]
+
+[lib]
+name = "git_agecrypt"
+path = "src/lib.rs"
 
 [dependencies]
 age = { version = "0.12.1", features = ["ssh", "armor", "cli-common", "plugin"] }
@@ -40,4 +44,8 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[[bench]]
+name = "bench_main"
+harness = false
 

@@ -1,0 +1,58 @@
+name: Nightly Fuzz & Deep Invariant Verification
+
+on:
+  schedule:
+    - cron: '0 3 * * *' # Run at 03:00 UTC every night
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deep-generative-test:
+    name: Deep Generative Model Check (1,000 ops)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run 1,000 Step Generative State Machine
+        env:
+          GIT_AGECRYPT_OPS: "1000"
+          GIT_AGECRYPT_SEED: "42424242"
+        run: cargo test --test test_generative_shadow_state_machine --verbose -- --nocapture
+
+  crash-injection-matrix:
+    name: 14-Point Crash Injection Matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Deterministic SIGKILL Crash Suite
+        run: cargo test --test test_sigkill_crash_injection --verbose -- --nocapture
+
+  regression-corpus:
+    name: Permanent Regression Corpus
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Regression Corpus
+        run: cargo test --test test_regression_corpus --verbose -- --nocapture
+
+  coverage-guided-fuzz:
+    name: Coverage-Guided Fuzzing (cargo-fuzz)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Fuzz WAL Journal (60s)
+        run: cargo fuzz run fuzz_wal_journal -- -max_total_time=60
+      - name: Fuzz Merge Parser (60s)
+        run: cargo fuzz run fuzz_merge_parser -- -max_total_time=60
+      - name: Fuzz Gitattributes (60s)
+        run: cargo fuzz run fuzz_gitattributes -- -max_total_time=60

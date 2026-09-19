@@ -40,3 +40,29 @@ pub fn assert_inv_d_ring_grammar_safe(repo: &Path, ring_name: &str) -> bool {
         .unwrap();
     out.status.success()
 }
+
+/// Invariant G: Zero plaintext canary leaks in reachable or unreachable Git repository objects/spool.
+pub fn assert_inv_g_zero_canary_leaks(repo: &Path, canary: &[u8]) {
+    let git_dir = repo.join(".git");
+    fn scan_dir(dir: &Path, canary: &[u8]) -> bool {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    if scan_dir(&p, canary) {
+                        return true;
+                    }
+                } else if let Ok(data) = fs::read(&p) {
+                    if data.windows(canary.len()).any(|w| w == canary) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+    assert!(
+        !scan_dir(&git_dir, canary),
+        "Invariant G violation: Plaintext canary detected in .git directory"
+    );
+}

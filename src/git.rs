@@ -66,6 +66,94 @@ pub fn set_permissions_writable(perms: &mut fs::Permissions) {
     }
 }
 
+/// In-flight deterministic crash hook for testing crash consistency under SIGKILL/TerminateProcess.
+/// Activated only when the environment variable `GIT_AGECRYPT_CRASH_POINT` matches `point_name`.
+#[inline]
+pub fn crash_point(point_name: &'static str) {
+    if let Ok(target) = std::env::var("GIT_AGECRYPT_CRASH_POINT") {
+        if target == point_name {
+            #[cfg(unix)]
+            unsafe {
+                libc::raise(libc::SIGKILL);
+            }
+            #[cfg(windows)]
+            unsafe {
+                #[link(name = "kernel32")]
+                unsafe extern "system" {
+                    fn GetCurrentProcess() -> isize;
+                    fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
+                }
+                TerminateProcess(GetCurrentProcess(), 137);
+            }
+        }
+    }
+}
+
+/// Opens a file inside parent_dir while guaranteeing protection against TOCTOU symlink swaps.
+/// On Unix, uses `openat(..., O_NOFOLLOW)` on the directory descriptor.
+/// On Windows, opens with `FILE_FLAG_OPEN_REPARSE_POINT` and verifies no reparse point.
+pub fn open_pinned_secret_file(
+    parent_dir: &Path,
+    file_name: &str,
+    create_excl: bool,
+) -> Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+        let dir_file = File::open(parent_dir)
+            .with_context(|| format!("Failed to open parent dir {}", parent_dir.display()))?;
+        let dir_fd = dir_file.into_raw_fd();
+        let c_name = std::ffi::CString::new(file_name)?;
+        let mut flags = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        if create_excl {
+            flags |= libc::O_CREAT | libc::O_EXCL;
+        }
+        let fd = unsafe { libc::openat(dir_fd, c_name.as_ptr(), flags, 0o600) };
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(dir_fd);
+        }
+        if fd < 0 {
+            return Err(anyhow!("Failed to open pinned file '{file_name}': {err}"));
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let full_path = parent_dir.join(file_name);
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).write(true);
+        if create_excl {
+            opts.create_new(true);
+        } else {
+            opts.create(true);
+        }
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+        opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = opts
+            .open(&full_path)
+            .with_context(|| format!("Failed to open pinned file {}", full_path.display()))?;
+        ensure_not_symlink_or_reparse(&full_path)?;
+        Ok(file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let full_path = parent_dir.join(file_name);
+        ensure_not_symlink_or_reparse(&full_path)?;
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).write(true);
+        if create_excl {
+            opts.create_new(true);
+        } else {
+            opts.create(true);
+        }
+        let file = opts.open(&full_path)?;
+        ensure_not_symlink_or_reparse(&full_path)?;
+        Ok(file)
+    }
+}
+
 /// Validates that a ring name conforms to strict security grammar:
 /// - Must match ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$
 /// - Length must be between 1 and 64 characters
@@ -554,12 +642,15 @@ impl GitRepo {
             ensure_not_symlink_or_reparse(&dest)?;
         }
 
-        let temp_path = state_dir.join(format!("repo.key.tmp.{}", std::process::id()));
+        let temp_filename = format!("repo.key.tmp.{}", std::process::id());
+        let temp_path = state_dir.join(&temp_filename);
+        crash_point("after_tmp_create");
         {
-            let mut file = File::create(&temp_path)?;
+            let mut file = open_pinned_secret_file(&state_dir, &temp_filename, true)?;
             file.write_all(secret_key.trim().as_bytes())?;
             file.flush()?;
             file.sync_all()?;
+            crash_point("after_plaintext_write");
 
             #[cfg(unix)]
             {
@@ -629,7 +720,9 @@ impl GitRepo {
         {
             fs::rename(&temp_path, &dest)?;
         }
+        crash_point("after_key_rename");
         sync_dir(&state_dir)?;
+        crash_point("after_dir_fsync");
         Ok(())
     }
 
@@ -1043,6 +1136,8 @@ impl GitRepo {
             return f();
         }
 
+        crash_point("before_tx_begin");
+
         // 1. Preflight check: ensure all secret files across all worktrees can be written to
         self.preflight_check_writable()
             .context("Aborting lock due to locked file(s)")?;
@@ -1079,6 +1174,7 @@ impl GitRepo {
 
         let mut jf =
             File::create(&journal_file).context("Failed to create lock WAL journal file")?;
+        crash_point("after_journal_create");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1086,8 +1182,10 @@ impl GitRepo {
         }
         jf.write_all(journal_content.as_bytes())
             .context("Failed to write lock WAL journal file")?;
+        crash_point("after_journal_transition");
         jf.sync_all()
             .context("Failed to synchronize lock journal")?;
+        crash_point("after_journal_fsync");
         if let Some(parent) = journal_file.parent() {
             sync_dir(parent)?;
         }
@@ -1098,10 +1196,13 @@ impl GitRepo {
             let _ = fs::remove_file(&locking_file);
         }
         fs::rename(&key_file, &locking_file).context("Failed to stage master key for locking")?;
+        crash_point("after_key_rename");
         sync_dir(&state_dir)?;
+        crash_point("after_dir_fsync");
 
         match f() {
             Ok(()) => {
+                crash_point("before_cleanup");
                 if locking_file.exists() {
                     let _ = fs::remove_file(&locking_file);
                 }
@@ -1109,6 +1210,7 @@ impl GitRepo {
                     let _ = fs::remove_file(&journal_file);
                 }
                 let _ = sync_dir(&state_dir);
+                crash_point("after_cleanup");
                 Ok(())
             }
             Err(err) => {

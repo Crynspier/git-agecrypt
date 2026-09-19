@@ -1,6 +1,7 @@
 #![allow(unused)]
 
 pub mod invariants;
+pub mod shadow_model;
 
 pub use assert_cmd::prelude::*;
 use std::ffi::OsString;
@@ -76,6 +77,24 @@ pub fn run_git_output(repo: &Path, args: &[&str]) -> Output {
         .env("PATH", &new_path)
         .output()
         .unwrap_or_else(|e| panic!("Failed to execute git {:?}: {}", args, e))
+}
+
+pub fn git_out_res(repo: &Path, args: &[&str]) -> std::result::Result<Vec<u8>, String> {
+    let bd = bin_dir();
+    let new_path = prepend_to_path(&bd);
+
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .env("PATH", &new_path)
+        .output()
+        .map_err(|e| format!("Failed to execute git {:?}: {}", args, e))?;
+
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
 }
 
 pub fn init_repo(repo: &Path) {

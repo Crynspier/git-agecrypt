@@ -2,7 +2,6 @@
 unmaintained = "none"
 
 [licenses]
-unlicensed = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -11,6 +10,8 @@ allow = [
     "Unicode-3.0",
     "CC0-1.0",
     "Zlib",
+    "ISC",
+    "OpenSSL",
 ]
 
 [bans]

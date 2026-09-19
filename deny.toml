@@ -1,5 +1,11 @@
 [advisories]
 unmaintained = "none"
+ignore = [
+    # RUSTSEC-2023-0071: Marvin timing side-channel attack on rsa crate (transitive dep of age 0.12.1).
+    # No patched release exists yet from upstream. git-agecrypt runs as a local Git filter driver
+    # and is not exposed as a remote network decryption oracle.
+    "RUSTSEC-2023-0071",
+]
 
 [licenses]
 allow = [

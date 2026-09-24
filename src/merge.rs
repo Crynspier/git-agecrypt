@@ -100,6 +100,8 @@ pub fn run_3way_merge(
     fs::write(temp_theirs.path(), strip_cr(&theirs_bytes))?;
 
     // 3. Run git merge-file on the decrypted temporary files
+    crate::git::crash_point("after_merge_decrypt");
+
     let merge_dir = match ours.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -123,6 +125,8 @@ pub fn run_3way_merge(
 
     let status = cmd.status().context("Failed to execute 'git merge-file'")?;
     let exit_code = status.code().unwrap_or(1);
+
+    crate::git::crash_point("after_merge_file");
 
     // Line-ending canonicalization: git merge-file on Windows writes conflict markers with \r\n,
     // which can cause double-CR (\r\r\n) or mixed line endings when %A used LF.
@@ -225,6 +229,7 @@ pub fn run_3way_merge(
 
         // Ensure disk flush before atomic rename (fail-closed durability)
         temp_target.as_file().sync_all()?;
+        crate::git::crash_point("after_merge_fsync");
 
         // Atomically replace `ours` with retry for antivirus software on Windows
         let mut to_persist = temp_target;
@@ -254,6 +259,8 @@ pub fn run_3way_merge(
                 err_msg
             ));
         }
+
+        crate::git::crash_point("after_merge_rename");
     }
 
     Ok(final_exit_code)

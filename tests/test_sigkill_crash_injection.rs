@@ -24,6 +24,16 @@ fn test_all_14_crash_points_deterministic_sigkill_and_recovery() {
         "before_cleanup",
         "after_cleanup",
         "spool_chunk",
+        "after_unwrap_key",
+        "after_unlock_key_saved",
+        "after_unlock_refresh",
+        "after_rekey_pub_write",
+        "after_rekey_key_saved",
+        "after_rekey_cache_purge",
+        "after_merge_decrypt",
+        "after_merge_file",
+        "after_merge_fsync",
+        "after_merge_rename",
     ];
 
     for point in crash_points {
@@ -53,7 +63,8 @@ fn test_all_14_crash_points_deterministic_sigkill_and_recovery() {
         op_cmd.env("GIT_AGECRYPT_CRASH_POINT", point);
 
         match point {
-            "after_tmp_create" | "after_plaintext_write" => {
+            "after_tmp_create" | "after_plaintext_write" | "after_rekey_pub_write"
+            | "after_rekey_key_saved" | "after_rekey_cache_purge" => {
                 // Key generation / rekey writes local master key
                 op_cmd.args(["rekey", "-f"]);
             }
@@ -67,6 +78,45 @@ fn test_all_14_crash_points_deterministic_sigkill_and_recovery() {
                 op_cmd.stdin(Stdio::piped());
                 op_cmd.stdout(Stdio::null());
                 op_cmd.stderr(Stdio::null());
+            }
+            "after_unwrap_key" | "after_unlock_key_saved" | "after_unlock_refresh" => {
+                // Unlock path: write a valid identity to a key file and unlock
+                let id_file = repo.join("unlock_key.txt");
+                fs::write(&id_file, &_sec_id).unwrap();
+                op_cmd.args(["unlock", id_file.to_str().unwrap()]);
+            }
+            "after_merge_decrypt" | "after_merge_file" | "after_merge_fsync" | "after_merge_rename" => {
+                // Merge path: create a merge scenario, then run git merge with crash point env
+                run_git(repo, &["checkout", "-b", "merge_branch"]);
+                fs::write(repo.join("vault.secret.env"), "MERGE_BRANCH=conflict\n").unwrap();
+                run_git(repo, &["commit", "-am", "Branch change"]);
+                run_git(repo, &["checkout", "main"]);
+                fs::write(repo.join("vault.secret.env"), "MERGE_MAIN=conflict\n").unwrap();
+                run_git(repo, &["commit", "-am", "Main change"]);
+
+                // Run git merge with the crash point env var set
+                let output = std::process::Command::new("git")
+                    .args(["merge", "merge_branch", "-m", "Merge"])
+                    .current_dir(repo)
+                    .env("GIT_AGECRYPT_CRASH_POINT", point)
+                    .output()
+                    .expect("Failed to run git merge");
+                assert!(
+                    !output.status.success(),
+                    "Process with crash point {point} must exit non-zero"
+                );
+                // Continue to recovery
+                let status_out = agecrypt_cmd(repo)
+                    .env_remove("GIT_AGECRYPT_CRASH_POINT")
+                    .arg("status")
+                    .output()
+                    .expect("Failed to run status for recovery");
+                assert!(
+                    status_out.status.success(),
+                    "Recovery command on repo must succeed after crash point {point}"
+                );
+                assert_inv_b_durability_consistent(repo);
+                continue;
             }
             _ => {
                 // Lock transaction triggers journal and rename crash points
@@ -113,13 +163,23 @@ fn test_all_14_crash_points_deterministic_sigkill_and_recovery() {
         // 5. Verify formal invariants
         assert_inv_b_durability_consistent(repo);
 
-        // 6. Working tree must be valid plaintext
+        // 6. Working tree must be valid plaintext — formally classified as OldValid or NewValid
         let read_back = fs::read_to_string(repo.join("vault.secret.env")).unwrap_or_default();
+        let recovered_state = if read_back == secret_content {
+            RecoveredState::OldValid
+        } else if read_back.is_empty() {
+            // Empty file after recovery is acceptable for lock operations (old state = file existed, new state = file locked)
+            // But we must verify it's not a partial write
+            RecoveredState::NewValid
+        } else if read_back.starts_with("SECRET_DATA_KEY=") {
+            RecoveredState::NewValid
+        } else {
+            RecoveredState::Partial
+        };
         assert!(
-            read_back == secret_content
-                || read_back.is_empty()
-                || read_back.starts_with("SECRET_DATA_KEY="),
-            "Working tree secret after recovery must not be corrupted: got '{read_back}'"
+            recovered_state != RecoveredState::Partial,
+            "Recovery must produce OldValid or NewValid state, not Partial. Got: {:?}",
+            read_back
         );
     }
 }

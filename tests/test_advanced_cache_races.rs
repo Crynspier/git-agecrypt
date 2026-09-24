@@ -65,9 +65,15 @@ fn test_cache_hit_versus_rekey_race_and_corruption_recovery() {
     });
 
     // Worker thread 2: Concurrently rotate master key (rekey)
-    for _ in 0..3 {
+    for i in 0..3 {
         let rekey_out = agecrypt_cmd(repo).args(["rekey", "-f"]).output();
-        let _ = rekey_out;
+        if let Ok(res) = rekey_out {
+            assert!(
+                res.status.success(),
+                "Rekey must succeed even under concurrent clean load (iteration {})",
+                i
+            );
+        }
         thread::sleep(Duration::from_millis(15));
     }
 

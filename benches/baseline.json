@@ -1,0 +1,20 @@
+{
+  "crypto.spool.1KB": { "micros": 19, "detail": "50.34 MB/s" },
+  "crypto.clean.1KB": { "micros": 274, "detail": "3.56 MB/s" },
+  "crypto.smudge.1KB": { "micros": 12127, "detail": "0.08 MB/s" },
+  "crypto.spool.100KB": { "micros": 210, "detail": "463.93 MB/s" },
+  "crypto.clean.100KB": { "micros": 766, "detail": "127.36 MB/s" },
+  "crypto.smudge.100KB": { "micros": 11223, "detail": "8.70 MB/s" },
+  "crypto.spool.1MB": { "micros": 1160, "detail": "861.70 MB/s" },
+  "crypto.clean.1MB": { "micros": 5313, "detail": "188.21 MB/s" },
+  "crypto.smudge.1MB": { "micros": 15875, "detail": "62.99 MB/s" },
+  "crypto.spool.4MB": { "micros": 3709, "detail": "1078.37 MB/s" },
+  "crypto.clean.4MB": { "micros": 28847, "detail": "138.66 MB/s" },
+  "crypto.smudge.4MB": { "micros": 27366, "detail": "146.16 MB/s" },
+  "e2e.clean_file": { "micros": 124532, "detail": "4 KiB via stdin" },
+  "e2e.bulk_clean_20x4KiB": { "micros": 2602546, "detail": "git add over 20 filter files" },
+  "e2e.lock": { "micros": 6266342, "detail": "20 files" },
+  "e2e.unlock": { "micros": 4198537, "detail": "20 files" },
+  "e2e.rekey": { "micros": 4409214, "detail": "20 files" },
+  "e2e.status": { "micros": 116956, "detail": "20 files" }
+}

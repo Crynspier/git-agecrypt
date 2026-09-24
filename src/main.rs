@@ -625,9 +625,13 @@ fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
     }
     fs::write(&pub_file, format!("{}\n", new_recipient))?;
 
+    git::crash_point("after_rekey_pub_write");
+
     // 5. Update local master key in common git dir atomically and clear stale cache
     repo.save_local_master_key_for_ring(new_secret_str.expose_secret(), ring_opt)?;
+    git::crash_point("after_rekey_key_saved");
     repo.clear_cache_for_ring(ring_opt, true)?;
+    git::crash_point("after_rekey_cache_purge");
     git::crash_point("after_old_delete");
 
     // 6. Re-stage strictly tracked secret files using targeted pathspecs (never '.'!)
@@ -1162,8 +1166,12 @@ fn cmd_unlock(key_file: Option<&str>, force: bool, ring_opt: Option<&str>) -> Re
         )
     })?;
 
+    git::crash_point("after_unwrap_key");
+
     // 3. Atomically save unwrapped master key
     repo.save_local_master_key_for_ring(&master_key, ring_opt)?;
+
+    git::crash_point("after_unlock_key_saved");
 
     // 4. Safe checkout / refresh working trees across all linked worktrees
     if ring_opt.is_none() {
@@ -1171,6 +1179,8 @@ fn cmd_unlock(key_file: Option<&str>, force: bool, ring_opt: Option<&str>) -> Re
     } else {
         repo.refresh_all_worktrees_for_ring(force, ring_opt)?;
     }
+
+    git::crash_point("after_unlock_refresh");
 
     let is_default = matches!(ring_opt, None | Some("default") | Some(""));
     if is_default {

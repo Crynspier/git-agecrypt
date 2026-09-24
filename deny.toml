@@ -22,8 +22,9 @@ allow = [
 unused-allowed-license = "allow"
 
 [bans]
-multiple-versions = "allow"
-wildcards = "allow"
+# M10: flag duplicate crate versions and forbid wildcard (unbounded) dependencies.
+multiple-versions = "warn"
+wildcards = "deny"
 
 [sources]
 unknown-registry = "deny"

@@ -4,77 +4,124 @@ on:
   push:
     tags:
       - 'v*'
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v0.1.0)'
+        description: 'Release tag (e.g. v0.5.0)'
         required: true
-        default: 'v0.1.0'
+        default: 'v0.5.0'
 
+# Least privilege by default; individual jobs elevate only where required.
 permissions:
-  contents: write
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Tag resolved outside of shell contexts to prevent workflow script injection.
+  RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
 
 jobs:
-  create-release:
-    name: Ensure Release Exists
+  # H7: a release must never ship bits that have not passed the full test suite.
+  release-gate:
+    name: Release Gate (Full Test Suite)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Configure Git user identity for tests
+        run: |
+          git config --global user.name "CI Runner"
+          git config --global user.email "ci@example.com"
+      - name: Validate tag matches Cargo.toml version
+        run: |
+          set -euo pipefail
+          if ! echo "$RELEASE_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
+            echo "Invalid release tag '$RELEASE_TAG': must be a semantic version tag like v1.2.3"
+            exit 1
+          fi
+          EXPECTED="${RELEASE_TAG#v}"
+          ACTUAL=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "Tag '$RELEASE_TAG' does not match Cargo.toml version '$ACTUAL'"
+            exit 1
+          fi
+          echo "Version check OK: $ACTUAL"
+      - name: Build workspace
+        run: cargo build --workspace --locked --verbose
+      - name: Run full test suite
+        run: cargo test --workspace --locked --verbose
+
+  create-release:
+    name: Ensure Release Exists
+    needs: release-gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
       - name: Ensure GitHub Release exists
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.event.release.tag_name || github.ref_name || 'v0.1.0' }}"
-          gh release view "$TAG" || gh release create "$TAG" --title "$TAG" --generate-notes
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" || gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes
 
   build-assets:
-    name: Build & Upload (${{ matrix.target }})
+    name: Build ${{ matrix.asset_name }}
     needs: create-release
-    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: git-agecrypt
             asset_name: git-agecrypt-linux-x86_64.tar.gz
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact_name: git-agecrypt
-            asset_name: git-agecrypt-macos-x86_64.tar.gz
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: git-agecrypt
-            asset_name: git-agecrypt-macos-aarch64.tar.gz
+            binary_name: git-agecrypt
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: git-agecrypt.exe
             asset_name: git-agecrypt-windows-x86_64.zip
-
+            binary_name: git-agecrypt.exe
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-      - name: Build target
-        run: cargo build --release --target ${{ matrix.target }}
-      - name: Package asset (Unix)
-        if: runner.os != 'Windows'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Build binary
+        run: cargo build --release --target ${{ matrix.target }} --verbose
+      - name: Package asset (Linux)
+        if: runner.os == 'Linux'
         run: |
-          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} .
-          tar -czf ${{ matrix.asset_name }} ${{ matrix.artifact_name }} README.md LICENSE-MIT LICENSE-APACHE
+          tar -czvf "${{ matrix.asset_name }}" -C target/${{ matrix.target }}/release "${{ matrix.binary_name }}"
       - name: Package asset (Windows)
         if: runner.os == 'Windows'
         run: |
-          Compress-Archive -Path target/${{ matrix.target }}/release/${{ matrix.artifact_name }}, README.md, LICENSE-MIT, LICENSE-APACHE -DestinationPath ${{ matrix.asset_name }} -Force
-      - name: Upload to GitHub Release
-        shell: bash
+          Compress-Archive -Path target/${{ matrix.target }}/release/${{ matrix.binary_name }} -DestinationPath "${{ matrix.asset_name }}"
+      # H7: emit a SHA256 checksum so users can verify integrity.
+      - name: Generate checksum (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sha256sum "${{ matrix.asset_name }}" > "${{ matrix.asset_name }}.sha256"
+          cat "${{ matrix.asset_name }}.sha256"
+      - name: Generate checksum (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $h = (Get-FileHash -Algorithm SHA256 "${{ matrix.asset_name }}").Hash.ToLower()
+          "$h  ${{ matrix.asset_name }}" | Out-File -FilePath "${{ matrix.asset_name }}.sha256" -Encoding ascii
+          Get-Content "${{ matrix.asset_name }}.sha256"
+      # H7: Sigstore build-provenance attestation for the release asset.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: ${{ matrix.asset_name }}
+      - name: Upload asset to GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.event.release.tag_name || github.ref_name || 'v0.1.0' }}"
-          gh release upload "$TAG" "${{ matrix.asset_name }}" --clobber
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" "${{ matrix.asset_name }}" "${{ matrix.asset_name }}.sha256" --clobber

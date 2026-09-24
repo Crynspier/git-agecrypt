@@ -349,10 +349,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Option A: Download standalone pre-compiled release binary
+      # Option A: Download standalone pre-compiled release binary (checksum-verified)
       - name: Install git-agecrypt
         run: |
-          curl -sSL https://github.com/Crynspier/git-agecrypt/releases/latest/download/git-agecrypt-linux-x86_64.tar.gz | tar -xz
+          curl -sSLO https://github.com/Crynspier/git-agecrypt/releases/latest/download/git-agecrypt-linux-x86_64.tar.gz
+          curl -sSLO https://github.com/Crynspier/git-agecrypt/releases/latest/download/git-agecrypt-linux-x86_64.tar.gz.sha256
+          sha256sum -c git-agecrypt-linux-x86_64.tar.gz.sha256
+          tar -xzf git-agecrypt-linux-x86_64.tar.gz
           sudo mv git-agecrypt /usr/local/bin/
 
       # Option B (if Rust toolchain is already installed):

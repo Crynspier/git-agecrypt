@@ -1,4 +1,4 @@
-﻿mod common;
+mod common;
 
 use common::invariants::*;
 use common::*;
@@ -14,10 +14,15 @@ use tempfile::tempdir;
 /// locks, unlocks, and verifies per-recipient access matrices.
 #[test]
 fn test_generative_ring_generation_dag_matrix() {
-    let seed: u64 = std::env::var("GIT_AGECRYPT_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0x1234_5678_9ABC_DEF0);
+    // M9: hard-fail on an unparsable seed instead of silently collapsing distinct
+    // CI matrix legs onto the default seed.
+    let seed: u64 = match std::env::var("GIT_AGECRYPT_SEED") {
+        Ok(s) => s
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("GIT_AGECRYPT_SEED must be a decimal u64 (got '{s}')")),
+        Err(_) => 0x1234_5678_9ABC_DEF0,
+    };
 
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
@@ -32,7 +37,13 @@ fn test_generative_ring_generation_dag_matrix() {
     // Initialize default ring
     agecrypt_cmd(repo).arg("init").assert().success();
     agecrypt_cmd(repo)
-        .args(["add-recipient", "-i", &identities[0].1, "--name", &identity_names[0]])
+        .args([
+            "add-recipient",
+            "-i",
+            &identities[0].1,
+            "--name",
+            &identity_names[0],
+        ])
         .assert()
         .success();
 
@@ -46,7 +57,8 @@ fn test_generative_ring_generation_dag_matrix() {
     }
 
     // Configure .gitattributes for ring routing
-    let mut gitattrs = String::from("*.secret.env filter=agecrypt diff=agecrypt merge=agecrypt -text\n");
+    let mut gitattrs =
+        String::from("*.secret.env filter=agecrypt diff=agecrypt merge=agecrypt -text\n");
     for ring in &ring_names[1..] {
         gitattrs.push_str(&format!("*.{ring}.secret.env filter=agecrypt-{ring} diff=agecrypt-{ring} merge=agecrypt-{ring} -text\n"));
     }
@@ -108,7 +120,12 @@ fn test_generative_ring_generation_dag_matrix() {
                     format!("app.{ring}.secret.env")
                 };
                 let generation = ring_generations[ring];
-                let content = format!("SECRET_{}=val_g{}_step{}\n", ring.to_uppercase(), generation, step);
+                let content = format!(
+                    "SECRET_{}=val_g{}_step{}\n",
+                    ring.to_uppercase(),
+                    generation,
+                    step
+                );
                 fs::write(repo.join(&filename), &content).unwrap();
                 let _ = git_out_res(repo, &["commit", "-am", &format!("Commit {step}")]);
                 commit_count += 1;
@@ -121,7 +138,15 @@ fn test_generative_ring_generation_dag_matrix() {
                 let generation = ring_generations[ring];
                 let name = format!("{}_g{}", identity_names[recip_idx], generation);
                 let res = agecrypt_cmd(repo)
-                    .args(["add-recipient", "-i", &identities[recip_idx].1, "--name", &name, "--ring", ring])
+                    .args([
+                        "add-recipient",
+                        "-i",
+                        &identities[recip_idx].1,
+                        "--name",
+                        &name,
+                        "--ring",
+                        ring,
+                    ])
                     .output();
                 if res.map(|r| r.status.success()).unwrap_or(false) {
                     access_matrix.insert((name, ring.to_string(), generation), true);
@@ -133,7 +158,8 @@ fn test_generative_ring_generation_dag_matrix() {
                 let ring = ring_names[ring_idx];
                 let generation = ring_generations[ring];
                 // Find a recipient to remove
-                let recipients: Vec<_> = access_matrix.keys()
+                let recipients: Vec<_> = access_matrix
+                    .keys()
                     .filter(|(_, r, g)| r == ring && *g == generation)
                     .map(|(n, _, _)| n.clone())
                     .collect();
@@ -201,7 +227,12 @@ fn test_generative_ring_generation_dag_matrix() {
                     format!("secret_{step}.{ring}.secret.env")
                 };
                 let generation = ring_generations[ring];
-                let content = format!("NEW_SECRET_{}=val_g{}_step{}\n", ring.to_uppercase(), generation, step);
+                let content = format!(
+                    "NEW_SECRET_{}=val_g{}_step{}\n",
+                    ring.to_uppercase(),
+                    generation,
+                    step
+                );
                 fs::write(repo.join(&filename), &content).unwrap();
                 let _ = git_out_res(repo, &["add", &filename]);
                 let _ = git_out_res(repo, &["commit", "-m", &format!("Add secret {step}")]);
@@ -215,12 +246,16 @@ fn test_generative_ring_generation_dag_matrix() {
 
     // Final verification: lock all rings and verify per-recipient access
     for ring in &ring_names {
-        let _ = agecrypt_cmd(repo).args(["lock", "-f", "--ring", ring]).output();
+        let _ = agecrypt_cmd(repo)
+            .args(["lock", "-f", "--ring", ring])
+            .output();
     }
 
     // Verify that all ciphertext in git objects is valid age ciphertext
     assert_inv_g_zero_canary_leaks(repo, b"SECRET_");
 
-    println!("Completed generative ring DAG test with seed 0x{:016X}, {} commits", seed, commit_count);
+    println!(
+        "Completed generative ring DAG test with seed 0x{:016X}, {} commits",
+        seed, commit_count
+    );
 }
-

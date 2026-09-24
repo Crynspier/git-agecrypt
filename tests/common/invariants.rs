@@ -44,6 +44,7 @@ pub fn assert_inv_b_durability_consistent(repo: &Path) {
 }
 
 /// Invariant C: Cross-ring isolation. Ring A secrets cannot be read or touched by Ring B.
+#[allow(clippy::too_many_arguments)]
 pub fn assert_inv_c_cross_ring_isolation(
     repo: &Path,
     ring_a: &str,
@@ -106,12 +107,7 @@ pub fn assert_inv_d_ring_grammar_safe(repo: &Path, ring_name: &str) -> bool {
 }
 
 /// Invariant E: Zero-plaintext memory hygiene. No plaintext canary leaks to stdout, stderr, or temp files.
-pub fn assert_inv_e_zero_plaintext_memory(
-    repo: &Path,
-    canary: &str,
-    stdout: &[u8],
-    stderr: &[u8],
-) {
+pub fn assert_inv_e_zero_plaintext_memory(repo: &Path, canary: &str, stdout: &[u8], stderr: &[u8]) {
     let stdout_str = String::from_utf8_lossy(stdout);
     let stderr_str = String::from_utf8_lossy(stderr);
     assert!(

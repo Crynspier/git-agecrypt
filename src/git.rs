@@ -67,9 +67,18 @@ pub fn set_permissions_writable(perms: &mut fs::Permissions) {
 }
 
 /// In-flight deterministic crash hook for testing crash consistency under SIGKILL/TerminateProcess.
-/// Activated only when the environment variable `GIT_AGECRYPT_CRASH_POINT` matches `point_name`.
+///
+/// H4: fires only when BOTH `GIT_AGECRYPT_CRASH_HOOKS_ARMED=1` (explicit test-harness opt-in,
+/// set by tests/common/mod.rs) AND `GIT_AGECRYPT_CRASH_POINT` matches `point_name`. Requiring the
+/// separate arming flag prevents a stray `GIT_AGECRYPT_CRASH_POINT` in a production environment
+/// from silently killing real clean/smudge/rekey processes.
 #[inline]
 pub fn crash_point(point_name: &'static str) {
+    if std::env::var_os("GIT_AGECRYPT_CRASH_HOOKS_ARMED").as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+    {
+        return;
+    }
     if let Ok(target) = std::env::var("GIT_AGECRYPT_CRASH_POINT") {
         if target == point_name {
             #[cfg(unix)]
@@ -213,6 +222,18 @@ pub fn validate_ring_name(ring: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Returns true if a repository-relative path is safe to embed in Git filter/merge driver
+/// command strings. Git expands `%f` / `%O` / `%A` / `%B` / `%P` in driver commands *through
+/// the shell* without quoting, so characters such as `"`, backtick, `$`, or `\` in a tracked
+/// filename would allow shell command injection in every clone of the repository (C2).
+/// Control characters are rejected as well because NUL would panic `std::process::Command`
+/// and newlines can corrupt `.gitattributes`.
+pub fn is_shell_safe_repo_path(path: &str) -> bool {
+    !path
+        .bytes()
+        .any(|b| matches!(b, b'"' | b'`' | b'$' | b'\\' | 0x00..=0x1f | 0x7f))
 }
 
 /// Flushes the parent directory entry to durable storage on POSIX filesystems (directory fsync).
@@ -666,12 +687,27 @@ impl GitRepo {
                 {
                     let path_str = temp_path.to_string_lossy().replace('/', "\\");
                     let grant_arg = format!("{user}:(R,W)");
-                    let _ = Command::new("icacls")
+                    // H6: never ignore the result - a failed ACL means the plaintext temp
+                    // file is readable by other local users, which must be surfaced.
+                    match Command::new("icacls")
                         .arg(&path_str)
                         .arg("/inheritance:r")
                         .arg("/grant:r")
                         .arg(&grant_arg)
-                        .output();
+                        .output()
+                    {
+                        Ok(out) if out.status.success() => {}
+                        Ok(out) => eprintln!(
+                            "git-agecrypt [WARNING]: failed to restrict permissions on {}: icacls exited {}: {}",
+                            temp_path.display(),
+                            out.status,
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        ),
+                        Err(e) => eprintln!(
+                            "git-agecrypt [WARNING]: could not run icacls to restrict permissions on {}: {e}",
+                            temp_path.display()
+                        ),
+                    }
                 }
             }
         }
@@ -959,18 +995,35 @@ impl GitRepo {
     }
 
     /// Fetches the raw staged blob from the Git index for `rel_path` (:0:<clean_path>) if present.
+    ///
+    /// M4: the blob is streamed with a hard 512 MiB cap instead of being buffered unbounded
+    /// into memory via `.output()`, so a maliciously huge staged blob cannot OOM the
+    /// pre-commit / merge hooks.
     pub fn get_staged_blob(&self, rel_path: &str) -> Option<Vec<u8>> {
+        const MAX_STAGED_BLOB_BYTES: u64 = 512 * 1024 * 1024;
         let clean_path = rel_path
             .trim_matches('"')
             .trim_matches('\'')
             .trim_start_matches('/')
             .trim_start_matches('\\');
-        let out = git_cmd_with_path(&self.root)
+        let mut child = git_cmd_with_path(&self.root)
             .args(["cat-file", "blob", &format!(":0:{clean_path}")])
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
             .ok()?;
-        if out.status.success() && !out.stdout.is_empty() {
-            Some(out.stdout)
+
+        let mut buf = Vec::new();
+        if let Some(mut stdout) = child.stdout.take() {
+            let _ = (&mut stdout)
+                .take(MAX_STAGED_BLOB_BYTES + 1)
+                .read_to_end(&mut buf);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+
+        if !buf.is_empty() && (buf.len() as u64) <= MAX_STAGED_BLOB_BYTES {
+            Some(buf)
         } else {
             None
         }
@@ -1375,6 +1428,17 @@ impl GitRepo {
                     std::thread::sleep(std::time::Duration::from_millis(30));
                 }
             }
+        }
+
+        // H8: fail SAFE, not open. Without the advisory lock we must not race a
+        // concurrent refresh and interleave a key rotation; degrade to the current key.
+        if _guard.is_none() {
+            eprintln!(
+                "git-agecrypt [WARNING]: refresh.lock held by another process for over 5s; \
+                 skipping automatic key refresh to avoid a concurrent key rotation. \
+                 Run 'git-agecrypt unlock' to retry."
+            );
+            return self.read_local_master_key_for_ring(ring);
         }
 
         // Check again after acquiring or timing out
@@ -2002,6 +2066,37 @@ impl GitRepo {
             return Err(anyhow!(
                 "Commit aborted: secret renamed to unencrypted destination"
             ));
+        }
+
+        // C2: filenames end up UNQUOTED in shell-expanded Git filter/merge driver commands
+        // (%f / %O / %A / %B / %P). Reject shell-active names outright so a committed
+        // filename cannot inject shell commands on every clone of the repository.
+        for path in &paths_to_check {
+            if !is_shell_safe_repo_path(path) {
+                eprintln!();
+                eprintln!(
+                    "================================================================================"
+                );
+                eprintln!("  SECURITY ALERT: FILENAME UNSAFE FOR SHELL-EXPANDED DRIVER COMMANDS!");
+                eprintln!(
+                    "================================================================================"
+                );
+                eprintln!("  - '{path}'");
+                eprintln!();
+                eprintln!(
+                    "Git expands %f/%O/%A/%B/%P in filter and merge driver commands through the"
+                );
+                eprintln!(
+                    "shell without quoting. Filenames containing double quotes, backticks, '$',"
+                );
+                eprintln!(
+                    "backslashes, or control characters would enable shell command injection."
+                );
+                eprintln!("Rename the file to a safe name before committing.");
+                return Err(anyhow!(
+                    "Commit aborted: staged filename '{path}' is unsafe for Git driver shell expansion"
+                ));
+            }
         }
 
         let mut leaked_files = Vec::new();

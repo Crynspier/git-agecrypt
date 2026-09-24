@@ -1,4 +1,4 @@
-﻿mod common;
+mod common;
 
 use common::*;
 use std::fs;
@@ -27,7 +27,10 @@ fn test_run_fd_inheritance_boundaries() {
 
     let secret_content = "INHERITANCE_SECRET=fd_test_value_12345\n";
     fs::write(repo.join("app.secret.env"), secret_content).unwrap();
-    run_git(repo, &["add", ".gitattributes", ".git-agecrypt", "app.secret.env"]);
+    run_git(
+        repo,
+        &["add", ".gitattributes", ".git-agecrypt", "app.secret.env"],
+    );
     run_git(repo, &["commit", "-m", "Commit secret"]);
 
     // On Linux, test FD inheritance through fork/exec
@@ -35,7 +38,14 @@ fn test_run_fd_inheritance_boundaries() {
     {
         // Test 1: Direct child can read FD
         let mut cmd = agecrypt_cmd(repo);
-        cmd.args(["run", "--fd", "--", "sh", "-c", "cat /dev/fd/$GIT_AGECRYPT_ENV_FD"]);
+        cmd.args([
+            "run",
+            "--fd",
+            "--",
+            "sh",
+            "-c",
+            "cat /dev/fd/$GIT_AGECRYPT_ENV_FD",
+        ]);
         let out = cmd.output().unwrap();
         assert!(out.status.success(), "Direct child must read FD");
         assert!(
@@ -114,7 +124,10 @@ fn test_run_fd_no_env_leakage() {
 
     let secret_content = "ENV_LEAK_SECRET=must_not_appear_in_env\n";
     fs::write(repo.join("app.secret.env"), secret_content).unwrap();
-    run_git(repo, &["add", ".gitattributes", ".git-agecrypt", "app.secret.env"]);
+    run_git(
+        repo,
+        &["add", ".gitattributes", ".git-agecrypt", "app.secret.env"],
+    );
     run_git(repo, &["commit", "-m", "Commit secret"]);
 
     #[cfg(target_os = "linux")]
@@ -139,4 +152,3 @@ fn test_run_fd_no_env_leakage() {
         );
     }
 }
-

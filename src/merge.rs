@@ -1,25 +1,37 @@
 use anyhow::{Context, Result, anyhow};
 use content_inspector::ContentType;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 use tempfile::NamedTempFile;
 
 use crate::crypto::{clean_stream, smudge_stream};
 
-/// Inspects the beginning of a file to check if it contains binary data.
+/// Detects binary content by inspecting the WHOLE file. Sampling only the first bytes
+/// (as before) let an attacker front-load benign text and then place NUL/binary content
+/// later in the file to smuggle a binary payload past the merge driver's text-only
+/// guard (H1).
 pub fn is_file_binary(path: &Path) -> Result<bool> {
-    let mut file = File::open(path)?;
-    let mut buf = vec![0u8; 8192];
-    let n = file.read(&mut buf)?;
-    buf.truncate(n);
-    Ok(content_inspector::inspect(&buf) == ContentType::BINARY)
+    let data = fs::read(path)?;
+    Ok(content_inspector::inspect(&data) == ContentType::BINARY)
 }
 
 /// Decrypts a file (or copies if plaintext) to a temporary file via streaming.
-fn decrypt_to_temp(path: &Path, identity: &dyn age::Identity) -> Result<NamedTempFile> {
-    let mut temp_file =
-        NamedTempFile::new().context("Failed to create temporary file for merge")?;
+/// When `temp_dir` is provided, the file is created inside the repository's restricted
+/// spool directory rather than the shared (often world-readable) system temp dir (C1).
+fn decrypt_to_temp(
+    path: &Path,
+    identity: &dyn age::Identity,
+    temp_dir: Option<&Path>,
+) -> Result<NamedTempFile> {
+    let mut temp_file = match temp_dir {
+        Some(dir) => {
+            fs::create_dir_all(dir).context("Failed to create merge temp directory")?;
+            NamedTempFile::new_in(dir)
+        }
+        None => NamedTempFile::new(),
+    }
+    .context("Failed to create temporary file for merge")?;
     if !path.exists() || fs::metadata(path)?.len() == 0 {
         // Empty or non-existent file: leave temp file empty
         return Ok(temp_file);
@@ -46,6 +58,7 @@ fn decrypt_to_temp(path: &Path, identity: &dyn age::Identity) -> Result<NamedTem
 /// Executes a 3-way merge on encrypted files %O (base), %A (ours), %B (theirs).
 /// The merged result is re-encrypted back into %A.
 /// Returns the exit code of `git merge-file` (0 on clean merge, >0 if conflicts marked).
+#[allow(clippy::too_many_arguments)]
 pub fn run_3way_merge(
     base: &Path,
     ours: &Path,
@@ -54,11 +67,12 @@ pub fn run_3way_merge(
     file_path: &str,
     identity: &dyn age::Identity,
     recipient: &dyn age::Recipient,
+    temp_dir: Option<&Path>,
 ) -> Result<i32> {
     // 1. Decrypt all 3 versions to temporary files
-    let temp_base = decrypt_to_temp(base, identity)?;
-    let temp_ours = decrypt_to_temp(ours, identity)?;
-    let temp_theirs = decrypt_to_temp(theirs, identity)?;
+    let temp_base = decrypt_to_temp(base, identity, temp_dir)?;
+    let temp_ours = decrypt_to_temp(ours, identity, temp_dir)?;
+    let temp_theirs = decrypt_to_temp(theirs, identity, temp_dir)?;
 
     // 2. Binary collision guard: do not attempt text 3-way merge on binary assets!
     if is_file_binary(temp_ours.path())?

@@ -40,8 +40,15 @@ fn setup_locked_repo() -> (tempfile::TempDir, std::path::PathBuf, String) {
         "*.secret.env filter=agecrypt diff=agecrypt merge=agecrypt -text\n",
     )
     .unwrap();
-    fs::write(repo.join("token.secret.env"), format!("{CANARY}=hardware_protected\n")).unwrap();
-    run_git(&repo, &["add", ".gitattributes", ".git-agecrypt", "token.secret.env"]);
+    fs::write(
+        repo.join("token.secret.env"),
+        format!("{CANARY}=hardware_protected\n"),
+    )
+    .unwrap();
+    run_git(
+        &repo,
+        &["add", ".gitattributes", ".git-agecrypt", "token.secret.env"],
+    );
     run_git(&repo, &["commit", "-m", "Token secret commit"]);
 
     agecrypt_cmd(&repo).args(["lock", "-f"]).assert().success();
@@ -63,7 +70,12 @@ fn setup_locked_repo() -> (tempfile::TempDir, std::path::PathBuf, String) {
 }
 
 /// Asserts the fail-closed contract after a failed plugin-mediated unlock attempt.
-fn assert_fail_closed(repo: &Path, ciphertext_before: &[u8], out: &std::process::Output, ctx: &str) {
+fn assert_fail_closed(
+    repo: &Path,
+    ciphertext_before: &[u8],
+    out: &std::process::Output,
+    ctx: &str,
+) {
     assert!(
         !out.status.success(),
         "{ctx}: unlock must FAIL when the hardware token / plugin is unavailable or broken"
@@ -79,8 +91,14 @@ fn assert_fail_closed(repo: &Path, ciphertext_before: &[u8], out: &std::process:
     // No plaintext may leak to stdout/stderr.
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!stdout.contains(CANARY), "{ctx}: plaintext canary leaked to stdout");
-    assert!(!stderr.contains(CANARY), "{ctx}: plaintext canary leaked to stderr");
+    assert!(
+        !stdout.contains(CANARY),
+        "{ctx}: plaintext canary leaked to stdout"
+    );
+    assert!(
+        !stderr.contains(CANARY),
+        "{ctx}: plaintext canary leaked to stderr"
+    );
 
     // No dangling temp/locking artifacts in the local state dir.
     let state_dir = repo.join(".git").join("git-agecrypt");
@@ -103,7 +121,10 @@ fn assert_recovery(repo: &Path, sec_id: &str, ctx: &str) {
         .write_stdin(sec_id.as_bytes())
         .output()
         .unwrap();
-    assert!(out.status.success(), "{ctx}: recovery unlock with real identity must succeed");
+    assert!(
+        out.status.success(),
+        "{ctx}: recovery unlock with real identity must succeed"
+    );
     let disk = fs::read_to_string(repo.join("token.secret.env")).unwrap();
     assert_eq!(
         disk,
@@ -230,8 +251,12 @@ fn test_plugin_ipc_failure_matrix() {
             .output()
             .unwrap();
 
-        assert_fail_closed(&repo, &ciphertext_before, &out, &format!("plugin mode {mode}"));
+        assert_fail_closed(
+            &repo,
+            &ciphertext_before,
+            &out,
+            &format!("plugin mode {mode}"),
+        );
         assert_recovery(&repo, &sec_id, &format!("plugin mode {mode}"));
     }
 }
-

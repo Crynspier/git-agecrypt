@@ -26,10 +26,15 @@ enum Operation {
 
 #[test]
 fn test_stateful_random_git_state_machine() {
-    let seed: u64 = std::env::var("GIT_AGECRYPT_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0x4242_1337_CAFE_BABE);
+    // M9: hard-fail on an unparsable seed instead of silently collapsing distinct
+    // CI matrix legs onto the default seed.
+    let seed: u64 = match std::env::var("GIT_AGECRYPT_SEED") {
+        Ok(s) => s
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("GIT_AGECRYPT_SEED must be a decimal u64 (got '{s}')")),
+        Err(_) => 0x4242_1337_CAFE_BABE,
+    };
 
     println!("Starting stateful randomized harness with seed: 0x{seed:016X}");
     let mut rng = ChaCha8Rng::seed_from_u64(seed);

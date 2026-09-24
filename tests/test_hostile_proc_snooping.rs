@@ -104,7 +104,8 @@ fn test_run_fd_child_reads_secret_and_proc_snooping_denied() {
                                     if let Ok(status) = std::fs::read_to_string(&status_path) {
                                         for line in status.lines() {
                                             if line.starts_with("Dumpable:") {
-                                                let val = line.trim_start_matches("Dumpable:").trim();
+                                                let val =
+                                                    line.trim_start_matches("Dumpable:").trim();
                                                 if val == "0" {
                                                     found_non_dumpable = true;
                                                 }

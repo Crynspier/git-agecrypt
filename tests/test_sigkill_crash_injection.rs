@@ -63,8 +63,11 @@ fn test_all_14_crash_points_deterministic_sigkill_and_recovery() {
         op_cmd.env("GIT_AGECRYPT_CRASH_POINT", point);
 
         match point {
-            "after_tmp_create" | "after_plaintext_write" | "after_rekey_pub_write"
-            | "after_rekey_key_saved" | "after_rekey_cache_purge" => {
+            "after_tmp_create"
+            | "after_plaintext_write"
+            | "after_rekey_pub_write"
+            | "after_rekey_key_saved"
+            | "after_rekey_cache_purge" => {
                 // Key generation / rekey writes local master key
                 op_cmd.args(["rekey", "-f"]);
             }
@@ -85,7 +88,10 @@ fn test_all_14_crash_points_deterministic_sigkill_and_recovery() {
                 fs::write(&id_file, &_sec_id).unwrap();
                 op_cmd.args(["unlock", id_file.to_str().unwrap()]);
             }
-            "after_merge_decrypt" | "after_merge_file" | "after_merge_fsync" | "after_merge_rename" => {
+            "after_merge_decrypt"
+            | "after_merge_file"
+            | "after_merge_fsync"
+            | "after_merge_rename" => {
                 // Merge path: create a merge scenario, then run git merge with crash point env
                 run_git(repo, &["checkout", "-b", "merge_branch"]);
                 fs::write(repo.join("vault.secret.env"), "MERGE_BRANCH=conflict\n").unwrap();
@@ -99,6 +105,7 @@ fn test_all_14_crash_points_deterministic_sigkill_and_recovery() {
                     .args(["merge", "merge_branch", "-m", "Merge"])
                     .current_dir(repo)
                     .env("GIT_AGECRYPT_CRASH_POINT", point)
+                    .env("GIT_AGECRYPT_CRASH_HOOKS_ARMED", "1")
                     .output()
                     .expect("Failed to run git merge");
                 assert!(

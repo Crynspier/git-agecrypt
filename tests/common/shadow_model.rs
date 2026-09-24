@@ -1,4 +1,4 @@
-﻿use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -146,8 +146,10 @@ impl ShadowModel {
     pub fn reset_to_commit(&mut self, sha: &str) {
         if let Some(snapshot) = self.commits.iter().find(|c| c.sha == sha) {
             self.files = snapshot.files.clone();
-            self.branch_files.insert(self.current_branch.clone(), snapshot.files.clone());
-            self.branch_heads.insert(self.current_branch.clone(), sha.to_string());
+            self.branch_files
+                .insert(self.current_branch.clone(), snapshot.files.clone());
+            self.branch_heads
+                .insert(self.current_branch.clone(), sha.to_string());
         }
         self.staged_files.clear();
     }
@@ -162,8 +164,10 @@ impl ShadowModel {
             let full_path = repo.join(path);
             if full_path.exists() {
                 if let Ok(content) = std::fs::read_to_string(&full_path) {
-                    if !content.starts_with("age-encryption.org/v1
-") {
+                    if !content.starts_with(
+                        "age-encryption.org/v1
+",
+                    ) {
                         new_files.insert(path.clone(), content);
                     }
                 }
@@ -177,9 +181,12 @@ impl ShadowModel {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         if name.ends_with(".secret.env") {
                             if let Ok(content) = std::fs::read_to_string(&path) {
-                                if !content.starts_with("age-encryption.org/v1
-") {
-                                    let rel = path.strip_prefix(repo).unwrap_or(&path).to_path_buf();
+                                if !content.starts_with(
+                                    "age-encryption.org/v1
+",
+                                ) {
+                                    let rel =
+                                        path.strip_prefix(repo).unwrap_or(&path).to_path_buf();
                                     new_files.entry(rel).or_insert(content);
                                 }
                             }
@@ -198,7 +205,9 @@ impl ShadowModel {
         {
             if output.status.success() {
                 for path_slice in output.stdout.split(|&b| b == 0) {
-                    if path_slice.is_empty() { continue; }
+                    if path_slice.is_empty() {
+                        continue;
+                    }
                     let name = String::from_utf8_lossy(path_slice).to_string();
                     if name.ends_with(".secret.env") {
                         let rel = PathBuf::from(&name);
@@ -209,7 +218,8 @@ impl ShadowModel {
                 }
             }
         }
-        self.branch_files.insert(self.current_branch.clone(), committed);
+        self.branch_files
+            .insert(self.current_branch.clone(), committed);
         self.staged_files.clear();
     }
 
@@ -252,7 +262,9 @@ impl ShadowModel {
         {
             if output.status.success() {
                 for path_slice in output.stdout.split(|&b| b == 0) {
-                    if path_slice.is_empty() { continue; }
+                    if path_slice.is_empty() {
+                        continue;
+                    }
                     let name = String::from_utf8_lossy(path_slice).to_string();
                     if name.ends_with(".secret.env") {
                         let blob_ref = format!(":0:{}", name);
@@ -286,7 +298,9 @@ impl ShadowModel {
         {
             if output.status.success() {
                 for path_slice in output.stdout.split(|&b| b == 0) {
-                    if path_slice.is_empty() { continue; }
+                    if path_slice.is_empty() {
+                        continue;
+                    }
                     let name = String::from_utf8_lossy(path_slice).to_string();
                     if name.ends_with(".secret.env") {
                         let cat_ref = format!("HEAD:{}", name);

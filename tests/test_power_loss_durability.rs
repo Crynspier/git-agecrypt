@@ -68,7 +68,9 @@ fn classify_file_violation(path: &Path, rel: &str, plaintext_canary: &str) -> Op
         let complete = text.contains("-----BEGIN AGE ENCRYPTED FILE-----")
             && text.contains("-----END AGE ENCRYPTED FILE-----");
         if !complete {
-            return Some(format!("{rel}: torn armored key file (missing header/footer)"));
+            return Some(format!(
+                "{rel}: torn armored key file (missing header/footer)"
+            ));
         }
         return None;
     }
@@ -76,7 +78,10 @@ fn classify_file_violation(path: &Path, rel: &str, plaintext_canary: &str) -> Op
     if name == "repo.key" {
         // Local master key: must be complete (non-empty, plausible key material).
         if data.len() < 10 {
-            return Some(format!("{rel}: torn local master key ({} bytes)", data.len()));
+            return Some(format!(
+                "{rel}: torn local master key ({} bytes)",
+                data.len()
+            ));
         }
         return None;
     }
@@ -91,7 +96,9 @@ fn classify_file_violation(path: &Path, rel: &str, plaintext_canary: &str) -> Op
         let text = String::from_utf8_lossy(&data);
         if text.starts_with("-----BEGIN AGE ENCRYPTED FILE-----") {
             if !text.contains("-----END AGE ENCRYPTED FILE-----") {
-                return Some(format!("{rel}: truncated armored ciphertext in working tree"));
+                return Some(format!(
+                    "{rel}: truncated armored ciphertext in working tree"
+                ));
             }
             return None;
         }
@@ -99,7 +106,9 @@ fn classify_file_violation(path: &Path, rel: &str, plaintext_canary: &str) -> Op
             return None;
         }
         if !data.is_empty() && data != plaintext_canary.as_bytes() {
-            return Some(format!("{rel}: working tree secret is neither complete plaintext nor complete ciphertext"));
+            return Some(format!(
+                "{rel}: working tree secret is neither complete plaintext nor complete ciphertext"
+            ));
         }
         return None;
     }
@@ -112,9 +121,16 @@ fn audit_no_torn_files(repo: &Path, plaintext_canary: &str) {
     let mut violations = Vec::new();
     let mut stack = vec![repo.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display())).flatten() {
+        for entry in fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+            .flatten()
+        {
             let path = entry.path();
-            let rel = path.strip_prefix(repo).unwrap_or(&path).to_string_lossy().to_string();
+            let rel = path
+                .strip_prefix(repo)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
             let ft = entry.file_type().unwrap();
             if ft.is_dir() {
                 if path == repo.join(".git") {
@@ -134,7 +150,11 @@ fn audit_no_torn_files(repo: &Path, plaintext_canary: &str) {
             }
         }
     }
-    assert!(violations.is_empty(), "torn-write violations:\n{}", violations.join("\n"));
+    assert!(
+        violations.is_empty(),
+        "torn-write violations:\n{}",
+        violations.join("\n")
+    );
 }
 
 /// Asserts no transient transaction artifacts remain in the local state dir.
@@ -171,7 +191,10 @@ fn setup_unlocked_repo() -> (tempfile::TempDir, PathBuf, String, String) {
     .unwrap();
     let plaintext = "POWER_LOSS_CANARY=super_secure_vault_value\n".to_string();
     fs::write(repo.join("vault.secret.env"), &plaintext).unwrap();
-    run_git(&repo, &["add", ".gitattributes", ".git-agecrypt", "vault.secret.env"]);
+    run_git(
+        &repo,
+        &["add", ".gitattributes", ".git-agecrypt", "vault.secret.env"],
+    );
     run_git(&repo, &["commit", "-m", "Initial secret commit"]);
 
     (temp, repo, sec_id, plaintext)
@@ -235,8 +258,11 @@ fn test_power_loss_torn_write_audit() {
         );
         let rekey_point = matches!(
             point,
-            "after_tmp_create" | "after_plaintext_write" | "after_rekey_pub_write"
-                | "after_rekey_key_saved" | "after_rekey_cache_purge"
+            "after_tmp_create"
+                | "after_plaintext_write"
+                | "after_rekey_pub_write"
+                | "after_rekey_key_saved"
+                | "after_rekey_cache_purge"
         );
 
         // Trigger the crash.
@@ -268,7 +294,10 @@ fn test_power_loss_torn_write_audit() {
                 }
             }
             let out = op_cmd.output().expect("run crashed op");
-            assert!(!out.status.success(), "{point}: crashed op must exit non-zero");
+            assert!(
+                !out.status.success(),
+                "{point}: crashed op must exit non-zero"
+            );
         }
 
         // LAYER 1: no torn writes anywhere (pre-recovery audit).
@@ -296,7 +325,10 @@ fn test_power_loss_torn_write_audit() {
                 .assert()
                 .success();
             let disk = fs::read_to_string(repo.join("vault.secret.env")).unwrap();
-            assert_eq!(disk, plaintext, "{point}: unlock retry must restore exact plaintext");
+            assert_eq!(
+                disk, plaintext,
+                "{point}: unlock retry must restore exact plaintext"
+            );
         } else if rekey_point {
             agecrypt_cmd(&repo).args(["rekey", "-f"]).assert().success();
         } else if point == "after_old_delete" {
@@ -314,7 +346,10 @@ fn test_power_loss_torn_write_audit() {
                 .assert()
                 .success();
             let disk = fs::read_to_string(repo.join("vault.secret.env")).unwrap();
-            assert_eq!(disk, plaintext, "{point}: post-crash unlock must restore exact plaintext");
+            assert_eq!(
+                disk, plaintext,
+                "{point}: post-crash unlock must restore exact plaintext"
+            );
         }
 
         // Final structural audit after recovery.
@@ -422,8 +457,12 @@ mod dm_flakey {
         ])
         .expect("dmsetup create flakey");
         run(&["mkfs.ext4", "-q", &format!("/dev/mapper/{dm_name}")]).expect("mkfs.ext4");
-        run(&["mount", &format!("/dev/mapper/{dm_name}"), &mnt.to_string_lossy()])
-            .expect("mount flakey");
+        run(&[
+            "mount",
+            &format!("/dev/mapper/{dm_name}"),
+            &mnt.to_string_lossy(),
+        ])
+        .expect("mount flakey");
 
         // Build a working repo on the flakey filesystem.
         let repo = mnt.join("repo");
@@ -442,7 +481,10 @@ mod dm_flakey {
         .unwrap();
         let plaintext = "POWER_CUT_CANARY=flakey_block_layer\n".to_string();
         fs::write(repo.join("vault.secret.env"), &plaintext).unwrap();
-        run_git(&repo, &["add", ".gitattributes", ".git-agecrypt", "vault.secret.env"]);
+        run_git(
+            &repo,
+            &["add", ".gitattributes", ".git-agecrypt", "vault.secret.env"],
+        );
         run_git(&repo, &["commit", "-m", "secret"]);
         // Establish a locked baseline so unlock runs a real transaction.
         agecrypt_cmd(&repo).args(["lock", "-f"]).assert().success();
@@ -455,7 +497,10 @@ mod dm_flakey {
             .env("GIT_AGECRYPT_CRASH_POINT", "after_unwrap_key")
             .output()
             .expect("crashed unlock");
-        assert!(!out.status.success(), "crash point must terminate the process");
+        assert!(
+            !out.status.success(),
+            "crash point must terminate the process"
+        );
 
         // TRUE POWER CUT: drop all in-flight writes at the block layer, kill the fs.
         run(&["dmsetup", "suspend", &dm_name]).expect("dm suspend");
@@ -480,8 +525,12 @@ mod dm_flakey {
             &format!("0 {sectors} flakey {loop_dev} 0 0 0"),
         ])
         .expect("dm recreate");
-        run(&["mount", &format!("/dev/mapper/{dm_name}"), &mnt.to_string_lossy()])
-            .expect("remount after power loss");
+        run(&[
+            "mount",
+            &format!("/dev/mapper/{dm_name}"),
+            &mnt.to_string_lossy(),
+        ])
+        .expect("remount after power loss");
 
         // POST-POWER-LOSS RECOVERY: repo must be coherent and recoverable.
         audit_no_torn_files(&repo, &plaintext);
@@ -500,7 +549,10 @@ mod dm_flakey {
             String::from_utf8_lossy(&retry.stderr)
         );
         let disk = fs::read_to_string(repo.join("vault.secret.env")).unwrap();
-        assert_eq!(disk, plaintext, "post-power-loss unlock must restore exact plaintext");
+        assert_eq!(
+            disk, plaintext,
+            "post-power-loss unlock must restore exact plaintext"
+        );
 
         drop(guard);
     }
@@ -513,4 +565,3 @@ fn test_dm_flakey_true_power_loss() {
     #[cfg(not(target_os = "linux"))]
     println!("dm-flakey power-loss test is Linux-only; skipping on this platform");
 }
-

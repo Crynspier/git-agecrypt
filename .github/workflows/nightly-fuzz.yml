@@ -1,58 +1,85 @@
-name: Nightly Fuzz & Deep Invariant Verification
+name: Nightly Fuzz and Security
 
 on:
   schedule:
     - cron: '0 3 * * *' # Run at 03:00 UTC every night
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  deep-generative-test:
-    name: Deep Generative Model Check (1,000 ops)
+  deep-generative:
+    name: Deep Generative Model Check (1000 ops)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Run 1,000 Step Generative State Machine
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Configure Git user identity for tests
+        run: |
+          git config --global user.name "CI Runner"
+          git config --global user.email "ci@example.com"
+      - name: Run Deep Generative State Machine
         env:
           GIT_AGECRYPT_OPS: "1000"
           GIT_AGECRYPT_SEED: "42424242"
         run: cargo test --test test_generative_shadow_state_machine --verbose -- --nocapture
 
   crash-injection-matrix:
-    name: 14-Point Crash Injection Matrix
+    name: Crash Injection Matrix (24 points)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Run Deterministic SIGKILL Crash Suite
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Configure Git user identity for tests
+        run: |
+          git config --global user.name "CI Runner"
+          git config --global user.email "ci@example.com"
+      - name: Run Crash Injection Suite
         run: cargo test --test test_sigkill_crash_injection --verbose -- --nocapture
 
   regression-corpus:
-    name: Permanent Regression Corpus
+    name: Regression Corpus Replay (fixed seeds)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Run Regression Corpus
-        run: cargo test --test test_regression_corpus --verbose -- --nocapture
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Configure Git user identity for tests
+        run: |
+          git config --global user.name "CI Runner"
+          git config --global user.email "ci@example.com"
+      - name: Replay Regression Corpus
+        run: cargo test --test test_stateful_random_harness --verbose -- --nocapture
 
-  coverage-guided-fuzz:
-    name: Coverage-Guided Fuzzing (cargo-fuzz)
+  fuzz:
+    name: Cargo Fuzz (libfuzzer)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
-      - name: Fuzz WAL Journal (60s)
-        run: cargo fuzz run fuzz_wal_journal -- -max_total_time=60
-      - name: Fuzz Merge Parser (60s)
-        run: cargo fuzz run fuzz_merge_parser -- -max_total_time=60
-      - name: Fuzz Gitattributes (60s)
-        run: cargo fuzz run fuzz_gitattributes -- -max_total_time=60
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz Gitattributes Parser
+        run: cargo fuzz run fuzz_gitattributes -- -max_total_time=600
+      - name: Fuzz Merge Parser
+        run: cargo fuzz run fuzz_merge_parser -- -max_total_time=600
+      - name: Fuzz WAL Journal Parser
+        run: cargo fuzz run fuzz_wal_journal -- -max_total_time=600
+      # M5: this target previously existed but was never exercised in CI.
+      - name: Fuzz Age Ciphertext Parser
+        run: cargo fuzz run fuzz_age_ciphertext -- -max_total_time=600
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts/

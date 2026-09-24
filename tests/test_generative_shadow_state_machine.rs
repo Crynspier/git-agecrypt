@@ -240,7 +240,11 @@ fn op_to_line(op: &Operation) -> String {
             h(p.as_bytes())
         ),
         AgecryptRemoveRecipient(r, n) => {
-            format!("AgecryptRemoveRecipient|{}|{}", h(r.as_bytes()), h(n.as_bytes()))
+            format!(
+                "AgecryptRemoveRecipient|{}|{}",
+                h(r.as_bytes()),
+                h(n.as_bytes())
+            )
         }
     }
 }
@@ -422,7 +426,10 @@ fn execute_op(h: &mut Harness, op: &Operation) -> (bool, Option<String>) {
                 return (false, Some(format!("skipped: file index {i} out of range")));
             }
             if h.all_files.contains(new_name) {
-                return (false, Some("skipped: rename target already tracked".to_string()));
+                return (
+                    false,
+                    Some("skipped: rename target already tracked".to_string()),
+                );
             }
             let old_name = h.all_files[*i].clone();
             let content = fs::read_to_string(repo.join(&old_name)).unwrap_or_default();
@@ -475,9 +482,7 @@ fn execute_op(h: &mut Harness, op: &Operation) -> (bool, Option<String>) {
                 h.commit_shas.push(sha);
             }
             let commit_ok = res.is_ok();
-            if commit_ok
-                && let Ok(sha_out) = git_out_res(&repo, &["rev-parse", "HEAD"])
-            {
+            if commit_ok && let Ok(sha_out) = git_out_res(&repo, &["rev-parse", "HEAD"]) {
                 let sha = String::from_utf8_lossy(&sha_out).trim().to_string();
                 h.shadow.record_commit(&sha);
             }
@@ -591,7 +596,10 @@ fn execute_op(h: &mut Harness, op: &Operation) -> (bool, Option<String>) {
         }
         GitDeleteBranch(branch) => {
             if branch == "main" || !h.shadow.branches.contains(branch) {
-                return (false, Some(format!("skipped: branch {branch} not deletable")));
+                return (
+                    false,
+                    Some(format!("skipped: branch {branch} not deletable")),
+                );
             }
             let res = git_out_res(&repo, &["branch", "-D", branch]);
             if res.is_ok() {
@@ -634,7 +642,10 @@ fn execute_op(h: &mut Harness, op: &Operation) -> (bool, Option<String>) {
         }
         AgecryptInitRing(ring) => {
             if ring == "default" {
-                return (false, Some("skipped: default ring always exists".to_string()));
+                return (
+                    false,
+                    Some("skipped: default ring always exists".to_string()),
+                );
             }
             let res = agecrypt_cmd(&repo).args(["init", "--ring", ring]).output();
             let success = res.map(|r| r.status.success()).unwrap_or(false);
@@ -644,7 +655,9 @@ fn execute_op(h: &mut Harness, op: &Operation) -> (bool, Option<String>) {
             (success, None)
         }
         AgecryptLock(ring) => {
-            let res = agecrypt_cmd(&repo).args(["lock", "-f", "--ring", ring]).output();
+            let res = agecrypt_cmd(&repo)
+                .args(["lock", "-f", "--ring", ring])
+                .output();
             let success = res.map(|r| r.status.success()).unwrap_or(false);
             if success {
                 h.shadow.set_locked(ring, true);
@@ -665,7 +678,9 @@ fn execute_op(h: &mut Harness, op: &Operation) -> (bool, Option<String>) {
             (success, None)
         }
         AgecryptRekey(ring) => {
-            let res = agecrypt_cmd(&repo).args(["rekey", "-f", "--ring", ring]).output();
+            let res = agecrypt_cmd(&repo)
+                .args(["rekey", "-f", "--ring", ring])
+                .output();
             let success = res.map(|r| r.status.success()).unwrap_or(false);
             if success {
                 h.shadow.rekey_ring(ring);
@@ -675,7 +690,15 @@ fn execute_op(h: &mut Harness, op: &Operation) -> (bool, Option<String>) {
         }
         AgecryptAddRecipient(ring, name, new_pub) => {
             let res = agecrypt_cmd(&repo)
-                .args(["add-recipient", "-i", new_pub, "--name", name, "--ring", ring])
+                .args([
+                    "add-recipient",
+                    "-i",
+                    new_pub,
+                    "--name",
+                    name,
+                    "--ring",
+                    ring,
+                ])
                 .output();
             let success = res.map(|r| r.status.success()).unwrap_or(false);
             if success {
@@ -938,10 +961,15 @@ fn default_ops_log_path(seed: u64) -> PathBuf {
 
 #[test]
 fn test_deep_generative_shadow_model_state_machine() {
-    let seed: u64 = std::env::var("GIT_AGECRYPT_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0xDEAD_BEEF_CAFE_1234);
+    // M9: hard-fail on an unparsable seed instead of silently collapsing distinct
+    // CI matrix legs onto the default seed.
+    let seed: u64 = match std::env::var("GIT_AGECRYPT_SEED") {
+        Ok(s) => s
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("GIT_AGECRYPT_SEED must be a decimal u64 (got '{s}')")),
+        Err(_) => 0xDEAD_BEEF_CAFE_1234,
+    };
 
     let op_count: usize = std::env::var("GIT_AGECRYPT_OPS")
         .ok()
@@ -954,10 +982,17 @@ fn test_deep_generative_shadow_model_state_machine() {
         .map(PathBuf::from)
         .unwrap_or_else(|| default_ops_log_path(seed));
     let mut log = fs::File::create(&log_path).expect("Failed to create ops log");
-    writeln!(log, "# git-agecrypt generative ops log seed=0x{seed:016X} ops={op_count}").unwrap();
+    writeln!(
+        log,
+        "# git-agecrypt generative ops log seed=0x{seed:016X} ops={op_count}"
+    )
+    .unwrap();
     log.flush().unwrap();
 
-    println!("Starting generative state machine with seed: 0x{:016X}, ops: {}", seed, op_count);
+    println!(
+        "Starting generative state machine with seed: 0x{:016X}, ops: {}",
+        seed, op_count
+    );
     println!("Ops log: {}", log_path.display());
     println!(
         "To replay:  GIT_AGECRYPT_REPLAY=\"{}\" cargo test --test test_generative_shadow_state_machine -- --exact test_replay_ops_log --nocapture",
@@ -1062,7 +1097,8 @@ fn load_ops_log(path: &str) -> Vec<Operation> {
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .enumerate()
         .map(|(i, l)| {
-            op_from_line(l).unwrap_or_else(|| panic!("invalid op at {} line {}: {}", path, i + 1, l))
+            op_from_line(l)
+                .unwrap_or_else(|| panic!("invalid op at {} line {}: {}", path, i + 1, l))
         })
         .collect()
 }
@@ -1077,12 +1113,14 @@ fn test_replay_ops_log() {
         }
     };
     let ops = load_ops_log(&path);
-    let fail_seq = std::env::var("GIT_AGECRYPT_FAIL_IF_EXEC_SEQ").ok().map(|v| {
-        v.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-    });
+    let fail_seq = std::env::var("GIT_AGECRYPT_FAIL_IF_EXEC_SEQ")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        });
     let fast = std::env::var("GIT_AGECRYPT_FAST_REPLAY").is_ok();
     println!("Replaying {} operations from {}", ops.len(), path);
     run_replay_ops(&ops, fail_seq, fast);
@@ -1091,7 +1129,11 @@ fn test_replay_ops_log() {
 /// Re-runs `test_replay_ops_log` in a fresh subprocess against the given ops lines.
 /// Returns true when the replay FAILS (exit non-zero or timeout) — i.e. "interesting"
 /// in delta-debugging terms.
-fn replay_subprocess_fails(ops_lines: &[String], extra_env: &[(&str, &str)], timeout: Duration) -> bool {
+fn replay_subprocess_fails(
+    ops_lines: &[String],
+    extra_env: &[(&str, &str)],
+    timeout: Duration,
+) -> bool {
     let dir = tempdir().expect("Failed to create shrink workspace");
     let file = dir.path().join("ops.log");
     let mut body = ops_lines.join("\n");
@@ -1100,16 +1142,21 @@ fn replay_subprocess_fails(ops_lines: &[String], extra_env: &[(&str, &str)], tim
 
     let exe = std::env::current_exe().expect("Failed to locate current test binary");
     let mut cmd = Command::new(exe);
-    cmd.args(["--exact", "test_replay_ops_log", "--nocapture", "--test-threads=1"])
-        .env("GIT_AGECRYPT_REPLAY", &file)
-        // The nested run must never recurse into generation or shrinking paths.
-        .env_remove("GIT_AGECRYPT_SEED")
-        .env_remove("GIT_AGECRYPT_OPS")
-        .env_remove("GIT_AGECRYPT_OPS_LOG")
-        .env_remove("GIT_AGECRYPT_SHRINK")
-        .env_remove("GIT_AGECRYPT_CRASH_POINT")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    cmd.args([
+        "--exact",
+        "test_replay_ops_log",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env("GIT_AGECRYPT_REPLAY", &file)
+    // The nested run must never recurse into generation or shrinking paths.
+    .env_remove("GIT_AGECRYPT_SEED")
+    .env_remove("GIT_AGECRYPT_OPS")
+    .env_remove("GIT_AGECRYPT_OPS_LOG")
+    .env_remove("GIT_AGECRYPT_SHRINK")
+    .env_remove("GIT_AGECRYPT_CRASH_POINT")
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -1192,6 +1239,7 @@ fn test_ddmin_shrinker_selftest() {
         return;
     }
 
+    #[allow(clippy::useless_vec)] // fixed shrink-oracle scenario; array-vs-vec churn not worth it
     let ops = vec![
         Operation::EditSecret(0, "SHRINK_NOISE_A=1\n".to_string()),
         Operation::GitStashPush,
@@ -1215,9 +1263,15 @@ fn test_ddmin_shrinker_selftest() {
         "sanity: a prefix without GitStashPop must not trigger"
     );
 
-    let shrunk = ddmin(lines.clone(), |cand| replay_subprocess_fails(cand, env, timeout));
+    let shrunk = ddmin(lines.clone(), |cand| {
+        replay_subprocess_fails(cand, env, timeout)
+    });
 
-    println!("ddmin self-test shrunk {} ops to {}:", lines.len(), shrunk.len());
+    println!(
+        "ddmin self-test shrunk {} ops to {}:",
+        lines.len(),
+        shrunk.len()
+    );
     for l in &shrunk {
         println!("  {l}");
     }
@@ -1264,7 +1318,9 @@ fn test_ddmin_shrink_real_failure() {
         "The provided ops log does not reproduce a failure; nothing to shrink"
     );
 
-    let shrunk = ddmin(lines.clone(), |cand| replay_subprocess_fails(cand, &[], timeout));
+    let shrunk = ddmin(lines.clone(), |cand| {
+        replay_subprocess_fails(cand, &[], timeout)
+    });
 
     let out_path = format!("{path}.min");
     let mut body = shrunk.join("\n");

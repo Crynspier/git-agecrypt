@@ -14,7 +14,14 @@ pub const AGE_HEADER_MAGIC: &[u8] = b"age-encryption.org/v1\n";
 /// Provides 2^128 collision resistance (astronomically safe for local cache)
 /// while reclaiming 32 path characters to prevent Windows MAX_PATH overflows.
 pub fn format_cache_hash(mac_bytes: &[u8]) -> String {
-    mac_bytes[..16].iter().map(|b| format!("{b:02x}")).collect()
+    // H11: never panic on short slices - a corrupted or externally supplied MAC
+    // buffer shorter than 16 bytes previously panicked (`mac_bytes[..16]`).
+    mac_bytes
+        .get(..16)
+        .unwrap_or(mac_bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Computes a keyed HMAC-SHA256 cache filename using the master key.
@@ -793,7 +800,8 @@ pub fn clean_stream<R: Read, W: Write>(
 /// If `input` is NOT age ciphertext, passes through directly (e.g. newly created plaintext file).
 ///
 /// If `input` IS age ciphertext:
-/// - If `identity` is None (repo is locked), returns an error so Git aborts or handles it.
+/// - If `identity` is None (repo is locked), passes the ciphertext through unchanged so
+///   locked clones/checkouts succeed (fail-open-by-design; inspect with `git-agecrypt status`).
 /// - If `identity` is Some, decrypts using the repository identity.
 /// - If `cache_dir` and `cache_key` are Some, caches the incoming ciphertext keyed by HMAC-SHA256(master_key, plaintext).
 ///
@@ -823,10 +831,27 @@ pub fn smudge_stream<R: Read, W: Write>(
     };
 
     if let (Some(c_dir), Some(key)) = (cache_dir, cache_key) {
-        fs::create_dir_all(c_dir)?;
-        let mut cipher_temp = tempfile::NamedTempFile::new_in(c_dir)?;
-        io::copy(&mut stream, &mut cipher_temp)?;
-        cipher_temp.flush()?;
+        // H13: the ciphertext cache is auxiliary. If the cache directory cannot be created
+        // or written (permissions, quota, read-only mount), fall back to passing the raw
+        // ciphertext through instead of aborting the user's checkout.
+        let spooled = fs::create_dir_all(c_dir)
+            .and_then(|_| tempfile::NamedTempFile::new_in(c_dir))
+            .and_then(|mut t| {
+                io::copy(&mut stream, &mut t)?;
+                t.flush()?;
+                Ok(t)
+            });
+        let cipher_temp = match spooled {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "git-agecrypt smudge [WARNING]: ciphertext cache unavailable ({e}); leaving raw ciphertext on disk."
+                );
+                io::copy(&mut stream, &mut output)?;
+                output.flush()?;
+                return Ok(());
+            }
+        };
 
         let hash_hex: String = {
             let cipher_file = File::open(cipher_temp.path())?;

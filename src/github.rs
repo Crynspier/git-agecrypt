@@ -29,6 +29,9 @@ pub fn fetch_github_keys(username: &str) -> Result<Vec<String>> {
     let url = format!("https://github.com/{clean_user}.keys");
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(10))
+        // H2: never follow redirects; a redirect could steer key retrieval to an
+        // attacker-controlled or plaintext-HTTP endpoint.
+        .redirects(0)
         .build();
     let response = agent
         .get(&url)
@@ -41,6 +44,13 @@ pub fn fetch_github_keys(username: &str) -> Result<Vec<String>> {
             ),
             other => anyhow!("Failed to fetch keys for GitHub user '{clean_user}': {other}"),
         })?;
+
+    if (300..400).contains(&response.status()) {
+        return Err(anyhow!(
+            "Unexpected HTTP redirect ({}) when fetching keys for GitHub user '{clean_user}'; redirects are disabled for security.",
+            response.status()
+        ));
+    }
 
     let mut buf = Vec::new();
     let reader = response.into_reader();
@@ -67,6 +77,15 @@ pub fn fetch_github_keys(username: &str) -> Result<Vec<String>> {
             "No compatible SSH keys (ssh-ed25519 or ssh-rsa) found for GitHub user '{clean_user}'"
         ));
     }
+
+    // H3: the GitHub .keys endpoint is authenticated only by TLS to github.com, not to
+    // the account owner. Surface the enrolled keys so users can verify them out-of-band
+    // (e.g. against the keys shown in the account's GitHub SSH settings).
+    eprintln!("git-agecrypt [NOTICE]: Enrolled SSH public key(s) for GitHub user '{clean_user}':");
+    for key in &keys {
+        eprintln!("  * {key}");
+    }
+    eprintln!("Verify these match the keys in the account's GitHub settings before trusting them.");
 
     Ok(keys)
 }

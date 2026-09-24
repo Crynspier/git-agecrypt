@@ -28,7 +28,11 @@ pub fn agecrypt_cmd(repo: &Path) -> Command {
     let mut cmd = Command::cargo_bin("git-agecrypt").unwrap();
     let bd = bin_dir();
     let new_path = prepend_to_path(&bd);
-    cmd.current_dir(repo).env("PATH", &new_path);
+    // H4: crash hooks require this explicit arming flag in addition to
+    // GIT_AGECRYPT_CRASH_POINT, so production environments can never trip them.
+    cmd.current_dir(repo)
+        .env("PATH", &new_path)
+        .env("GIT_AGECRYPT_CRASH_HOOKS_ARMED", "1");
     cmd
 }
 
@@ -36,7 +40,9 @@ pub fn agecrypt_assert_cmd(repo: &Path) -> assert_cmd::Command {
     let mut cmd = assert_cmd::Command::cargo_bin("git-agecrypt").unwrap();
     let bd = bin_dir();
     let new_path = prepend_to_path(&bd);
-    cmd.current_dir(repo).env("PATH", &new_path);
+    cmd.current_dir(repo)
+        .env("PATH", &new_path)
+        .env("GIT_AGECRYPT_CRASH_HOOKS_ARMED", "1");
     cmd
 }
 

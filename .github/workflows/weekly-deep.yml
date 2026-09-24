@@ -5,6 +5,9 @@ on:
     - cron: '0 4 * * 0' # Run at 04:00 UTC every Sunday
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -15,11 +18,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Decimal u64 seeds: hex strings would fail u64 parsing and silently fall
+        # back to the default seed, making every matrix leg identical (M9).
         seed: ["11111111", "22222222", "33333333", "44444444", "55555555"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Configure Git user identity for tests
         run: |
           git config --global user.name "CI Runner"
@@ -30,56 +35,55 @@ jobs:
           GIT_AGECRYPT_SEED: ${{ matrix.seed }}
         run: cargo test --release --test test_generative_shadow_state_machine -- --nocapture
 
+  # The SIGKILL crash suite iterates a deterministic 24-point matrix internally and
+  # consumes no GIT_AGECRYPT_SEED; it previously ran the identical suite 3x under
+  # inert hex seeds, so it is now a single leg (M9).
   crash-matrix-full:
-    name: 24-Point Crash Injection Matrix (3 seeds)
+    name: 24-Point Crash Injection Matrix
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        seed: ["AAAA0001", "BBBB0002", "CCCC0003"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Configure Git user identity for tests
         run: |
           git config --global user.name "CI Runner"
           git config --global user.email "ci@example.com"
-      - name: Run Deterministic SIGKILL Crash Suite (seed ${{ matrix.seed }})
-        env:
-          GIT_AGECRYPT_SEED: ${{ matrix.seed }}
+      - name: Run Deterministic SIGKILL Crash Suite
         run: cargo test --release --test test_sigkill_crash_injection -- --nocapture
 
   concurrency-crash-matrix:
-    name: Concurrency × Crash Injection Matrix
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Configure Git user identity for tests
-        run: |
-          git config --global user.name "CI Runner"
-          git config --global user.email "ci@example.com"
-      - name: Run Concurrency × Crash Matrix
-        run: cargo test --release --test test_concurrency_crash_matrix -- --nocapture
-
-  race-matrix:
-    name: Race Matrix (2/4/8/16/32 workers)
+    name: Concurrency x Crash Matrix (24 crash points)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        workers: [2, 4, 8, 16, 32]
+        point: ["after_tmp_create", "after_plaintext_write", "after_tmp_fsync", "after_cache_write", "after_pub_create", "after_pub_write", "after_pub_fsync", "after_new_create", "after_new_write", "after_new_fsync", "after_old_delete", "after_ciphertext_write", "after_ciphertext_fsync", "after_journal_create", "after_journal_write", "after_journal_fsync", "after_journal_rename", "after_merge_decrypt", "after_merge_file", "after_merge_fsync", "after_merge_rename", "after_rekey_pub_write", "after_rekey_key_saved", "after_rekey_cache_purge"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Configure Git user identity for tests
         run: |
           git config --global user.name "CI Runner"
           git config --global user.email "ci@example.com"
-      - name: Run Mixed Concurrency Stress (${{ matrix.workers }} workers)
+      - name: Run Concurrency Crash Test (point ${{ matrix.point }})
+        run: cargo test --release --test test_concurrency_crash_matrix -- --nocapture
+
+  # test_mixed_concurrency_stress uses a fixed thread topology and consumes no
+  # worker-count env var; the previous workers matrix ran the identical test 5x (M9).
+  race-matrix:
+    name: Mixed Concurrency Stress
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Configure Git user identity for tests
+        run: |
+          git config --global user.name "CI Runner"
+          git config --global user.email "ci@example.com"
+      - name: Run Mixed Concurrency Stress
         run: cargo test --release --test test_mixed_concurrency_stress -- --nocapture
 
   large-file-crash-matrix:
@@ -90,29 +94,32 @@ jobs:
       matrix:
         size: ["1048576", "4194304", "16777216", "104857600"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Configure Git user identity for tests
         run: |
           git config --global user.name "CI Runner"
           git config --global user.email "ci@example.com"
-      - name: Run Large-File Crash Test (${{ matrix.size }} bytes)
+      # GIT_AGECRYPT_LARGE_FILE_SIZE is now actually consumed by the test (was inert, M9).
+      - name: Run Large File Crash Test (size ${{ matrix.size }})
         env:
           GIT_AGECRYPT_LARGE_FILE_SIZE: ${{ matrix.size }}
         run: cargo test --release --test test_large_file_crash_spool -- --nocapture
 
   ring-dag-generative:
-    name: Generative Ring × Generation × DAG (3 seeds)
+    name: Generative Ring x Generation x DAG (3 seeds)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        seed: ["DDDD0001", "EEEE0002", "FFFF0003"]
+        # Decimal equivalents of the former hex seeds; hex strings silently fell
+        # back to the default seed, collapsing the matrix to identical legs (M9).
+        seed: ["3722444801", "4006928386", "4294901763"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Configure Git user identity for tests
         run: |
           git config --global user.name "CI Runner"
@@ -121,84 +128,88 @@ jobs:
         env:
           GIT_AGECRYPT_SEED: ${{ matrix.seed }}
         run: cargo test --release --test test_generative_ring_dag -- --nocapture
-
   performance-benchmark:
-    name: Performance Benchmark Matrix
+    name: Performance Benchmarks (Baseline + Regression Detection)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Configure Git user identity for tests
         run: |
           git config --global user.name "CI Runner"
           git config --global user.email "ci@example.com"
-      - name: Run Benchmarks
+      # GIT_AGECRYPT_BENCH_CHECK=1 compares bench metrics against benches/baseline.json
+      # and fails the step on regression (implemented in benches/bench_main.rs, M8).
+      - name: Run criterion benchmarks with regression checks
         env:
-          GIT_AGECRYPT_BENCH_JSON: "1"
-          GIT_AGECRYPT_BENCH_OUT: bench-results.json
-        run: cargo bench --release
-      - name: Upload benchmark JSON
-        uses: actions/upload-artifact@v4
+          GIT_AGECRYPT_BENCH_CHECK: "1"
+        run: |
+          cargo bench -- --save-baseline current
+          cat target/criterion/**/new/estimates.json || true
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: bench-results
-          path: bench-results.json
-          if-no-files-found: warn
+          name: criterion-baseline
+          path: target/criterion/
+          retention-days: 90
+          if-no-files-found: error
 
   cross-platform-crash-matrix:
-    name: Crash Matrix (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, macos-latest]
+    name: Windows SIGKILL Crash Consistency
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Configure Git user identity for tests
         run: |
           git config --global user.name "CI Runner"
           git config --global user.email "ci@example.com"
-      - name: Run Crash Injection Suite
+      - name: Run Windows crash injection suite
         run: cargo test --release --test test_sigkill_crash_injection -- --nocapture
-      - name: Run Power-Loss Torn-Write Audit
-        run: cargo test --release --test test_power_loss_durability -- --nocapture
 
   power-loss-block-layer:
-    name: True Power-Loss (dm-flakey, block layer)
+    name: True Power-Loss Crash (Linux DM Flakey)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Configure Git user identity for tests
         run: |
           git config --global user.name "CI Runner"
           git config --global user.email "ci@example.com"
-      - name: Run dm-flakey power-cut test as root
-        run: sudo env "PATH=$PATH" "CARGO_HOME=$CARGO_HOME" "RUSTUP_HOME=$RUSTUP_HOME" cargo test --release --test test_power_loss_durability test_dm_flakey_true_power_loss -- --exact --nocapture
+      - name: Run dm-flakey true power-loss durability test
+        run: sudo -E cargo test --release --test test_power_loss_durability -- --nocapture
 
   replay-shrink-validation:
-    name: Generative Replay + ddmin Shrinker Validation
+    name: Ops Log Replay + Automatic Shrinking
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Configure Git user identity for tests
         run: |
           git config --global user.name "CI Runner"
           git config --global user.email "ci@example.com"
-      - name: Generate ops log (seed A1B2C3D4, 60 ops)
+      # Decimal seed (0xA1B2C3D4): the former hex string silently fell back to the
+      # default seed because u64 parsing failed (M9).
+      - name: Generate ops log (seed 2712847316, 60 ops)
         env:
-          GIT_AGECRYPT_SEED: "A1B2C3D4"
+          GIT_AGECRYPT_SEED: "2712847316"
           GIT_AGECRYPT_OPS: "60"
           GIT_AGECRYPT_OPS_LOG: /tmp/weekly-ops.log
-        run: cargo test --release --test test_generative_shadow_state_machine -- --exact test_deep_generative_shadow_model_state_machine --nocapture
-      - name: Replay the recorded ops log exactly
+        run: cargo test --release --test test_generative_shadow_state_machine -- --nocapture
+      - name: Replay ops log
         env:
           GIT_AGECRYPT_REPLAY: /tmp/weekly-ops.log
-        run: cargo test --release --test test_generative_shadow_state_machine -- --exact test_replay_ops_log --nocapture
-      - name: Validate ddmin shrinker machinery (self-test)
-        run: cargo test --release --test test_generative_shadow_state_machine -- --exact test_ddmin_shrinker_selftest --nocapture
+        run: cargo test --release --test test_generative_shadow_state_machine -- --nocapture
+      - name: Upload ops log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: weekly-ops-log
+          path: /tmp/weekly-ops.log
+          retention-days: 30

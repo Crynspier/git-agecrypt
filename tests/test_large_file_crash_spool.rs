@@ -39,8 +39,16 @@ fn test_large_file_streaming_crash_and_forensic_canary_sweep() {
         .success();
 
     let canary_token = b"SUPER_SENSITIVE_IN_FLIGHT_CANARY_TOKEN_999";
-    let mut large_stream = Vec::with_capacity(4 * 1024 * 1024);
-    while large_stream.len() < 4 * 1024 * 1024 {
+    // M9: size is configurable via GIT_AGECRYPT_LARGE_FILE_SIZE (weekly-deep matrix);
+    // unparsable values hard-fail instead of silently using the default.
+    let target_size: usize = match std::env::var("GIT_AGECRYPT_LARGE_FILE_SIZE") {
+        Ok(s) => s.trim().parse().unwrap_or_else(|_| {
+            panic!("GIT_AGECRYPT_LARGE_FILE_SIZE must be a decimal byte count (got '{s}')")
+        }),
+        Err(_) => 4 * 1024 * 1024,
+    };
+    let mut large_stream = Vec::with_capacity(target_size);
+    while large_stream.len() < target_size {
         large_stream.extend_from_slice(b"CHUNK_FILLER_DATA_BEFORE_CANARY_");
         large_stream.extend_from_slice(canary_token);
         large_stream.extend_from_slice(b"\n");

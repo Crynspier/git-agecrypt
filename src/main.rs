@@ -14,14 +14,52 @@ use std::str::FromStr;
 use age::secrecy::ExposeSecret;
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
+use zeroize::Zeroizing;
 
 use cli::{Cli, Commands};
 use git::GitRepo;
 
+/// H10: environment variable names (compared case-insensitively) that may never be
+/// loaded from a repository env file - they allow hijacking execution of the spawned
+/// command (dynamic-loader injection, PATH resolution, shell startup hooks).
+const FORBIDDEN_ENV_VARS: &[&str] = &[
+    "PATH",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_DEBUG",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "BASH_ENV",
+    "PROMPT_COMMAND",
+    "PS4",
+    "IFS",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "NODE_OPTIONS",
+    "RUBYLIB",
+    "PERL5LIB",
+    "PERL5OPT",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_EXEC_PATH",
+    "GIT_TEMPLATE_DIR",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+];
+
 fn main() {
     // Strict stderr discipline: Panics must NEVER print to stdout to avoid corrupting git streams!
+    // H12: print only the source location - panic payloads can embed secret material
+    // (identity keys, decrypted buffers) that must never reach logs or git streams.
     std::panic::set_hook(Box::new(|panic_info| {
-        eprintln!("git-agecrypt fatal panic: {panic_info}");
+        if let Some(loc) = panic_info.location() {
+            eprintln!("git-agecrypt fatal panic at {loc}");
+        } else {
+            eprintln!("git-agecrypt fatal panic");
+        }
     }));
 
     // Intercept SIGINT/Ctrl+C to terminate cleanly. Any interrupted lock transaction
@@ -435,6 +473,19 @@ fn cmd_remove_recipient(name: &str, ring_opt: Option<&str>) -> Result<()> {
     let repo = GitRepo::discover()?;
     let keys_dir = repo.keys_dir_for_ring(ring_opt);
     let label = name.trim_end_matches(".age");
+    // M1: reject path separators, traversal segments, and control characters so a
+    // crafted name cannot make this command delete files outside keys_dir.
+    if label.is_empty()
+        || label == "."
+        || label == ".."
+        || label
+            .bytes()
+            .any(|b| matches!(b, b'/' | b'\\' | 0x00..=0x1f | 0x7f))
+    {
+        return Err(anyhow!(
+            "Invalid recipient name '{name}': must be a plain file name without path separators or control characters"
+        ));
+    }
     let target_name = format!("{label}.age");
 
     let actual_key_file = if keys_dir.join(&target_name).exists() {
@@ -934,7 +985,7 @@ fn cmd_rewrap(paths: &[PathBuf], all: bool, identity_opt: Option<&str>, force: b
                         rel_path
                     );
                     let _ = git::git_cmd_with_path(&repo.root)
-                        .args(["add", rel_path])
+                        .args(["add", "--", rel_path])
                         .status();
                 }
                 continue;
@@ -1023,7 +1074,7 @@ fn cmd_rewrap(paths: &[PathBuf], all: bool, identity_opt: Option<&str>, force: b
 
             // Stage with git add: Git triggers clean_stream, which encrypts with active master key!
             let status = git::git_cmd_with_path(&repo.root)
-                .args(["add", rel_path])
+                .args(["add", "--", rel_path])
                 .status()
                 .with_context(|| format!("Failed to stage rewrapped file '{rel_path}'"))?;
 
@@ -1072,7 +1123,7 @@ fn cmd_rewrap(paths: &[PathBuf], all: bool, identity_opt: Option<&str>, force: b
 
             // Plaintext on disk: stage it so clean filter encrypts it with active master key
             let status = git::git_cmd_with_path(&repo.root)
-                .args(["add", rel_path])
+                .args(["add", "--", rel_path])
                 .status()
                 .with_context(|| format!("Failed to stage file '{rel_path}'"))?;
 
@@ -1109,8 +1160,10 @@ fn cmd_unlock(key_file: Option<&str>, force: bool, ring_opt: Option<&str>) -> Re
     if let Some(path_str) = key_file {
         if path_str == "-" {
             eprintln!("Reading private key identity from standard input...");
+            // M14: cap the identity read from stdin at 1 MiB (an identity file is ~100 bytes);
+            // an unbounded read_to_end let a malicious or broken pipe exhaust memory.
             let mut buf = Vec::new();
-            io::stdin().read_to_end(&mut buf)?;
+            io::stdin().take(1024 * 1024).read_to_end(&mut buf)?;
             let ids = crypto::load_identities_from_buffer(&buf)?;
             identities.extend(ids);
         } else {
@@ -1140,7 +1193,7 @@ fn cmd_unlock(key_file: Option<&str>, force: bool, ring_opt: Option<&str>) -> Re
 
     // 2. Iterate through all keys/*.age and attempt unwrapping
     let entries = fs::read_dir(&keys_dir)?;
-    let mut unwrapped_key: Option<String> = None;
+    let mut unwrapped_key: Option<Zeroizing<String>> = None;
 
     for entry in entries {
         let entry = entry?;
@@ -1148,7 +1201,7 @@ fn cmd_unlock(key_file: Option<&str>, force: bool, ring_opt: Option<&str>) -> Re
         if path.extension().and_then(|s| s.to_str()) == Some("age") {
             let content = fs::read_to_string(&path)?;
             if let Ok(key) = crypto::unwrap_master_key(&content, &identities) {
-                unwrapped_key = Some(key);
+                unwrapped_key = Some(Zeroizing::new(key));
                 let name_display = path
                     .file_name()
                     .map(|s| s.to_string_lossy())
@@ -1537,7 +1590,7 @@ fn cmd_textconv(file: &Path, ring_opt: Option<&str>) -> Result<()> {
 
     if !crypto::is_age_ciphertext(&prefix[..n]) {
         // Plaintext file
-        let mut full_file = File::open(file)?;
+        let mut full_file = File::open(&target_file)?;
         if let Err(err) = io::copy(&mut full_file, &mut io::stdout()) {
             if err.kind() == io::ErrorKind::BrokenPipe {
                 return Ok(());
@@ -1551,7 +1604,7 @@ fn cmd_textconv(file: &Path, ring_opt: Option<&str>) -> Result<()> {
     if let Some(key_str) = key_opt
         && let Ok(identity) = age::x25519::Identity::from_str(&key_str)
     {
-        let file_again = File::open(file)?;
+        let file_again = File::open(&target_file)?;
         let mut stream_reader = BufReader::new(file_again);
         let mut out = io::stdout();
         if let Err(err) = crypto::decrypt_stream(&mut stream_reader, &mut out, &identity) {
@@ -1602,6 +1655,9 @@ fn cmd_merge(
     let pub_key_str = fs::read_to_string(pub_file)?;
     let recipient = crypto::parse_recipient(&pub_key_str)?;
 
+    // C1: place decrypted merge intermediates in the repository's restricted spool
+    // directory instead of the shared (often world-readable) system temp dir.
+    let merge_spool_dir = repo.local_state_dir().join("merge-spool");
     let exit_code = merge::run_3way_merge(
         base,
         ours,
@@ -1610,6 +1666,7 @@ fn cmd_merge(
         file_path.unwrap_or("unknown"),
         &identity,
         recipient.as_ref(),
+        Some(&merge_spool_dir),
     )?;
 
     if exit_code != 0 {
@@ -1877,6 +1934,20 @@ fn cmd_run(
     let mut env_vars = std::collections::HashMap::new();
 
     for path in files_to_read {
+        // M13: hard cap on env file size; a secret env file is a few KiB at most,
+        // and an unbounded read of a hostile/swap file could exhaust memory.
+        const MAX_ENV_FILE_BYTES: u64 = 1024 * 1024;
+        let file_len = fs::metadata(&path)
+            .with_context(|| format!("Failed to stat secret env file: {}", path.display()))?
+            .len();
+        if file_len > MAX_ENV_FILE_BYTES {
+            return Err(anyhow!(
+                "Secret env file '{}' is too large ({} bytes; maximum is {} bytes)",
+                path.display(),
+                file_len,
+                MAX_ENV_FILE_BYTES
+            ));
+        }
         let bytes = fs::read(&path)
             .with_context(|| format!("Failed to read secret env file: {}", path.display()))?;
 
@@ -1941,12 +2012,15 @@ fn cmd_run(
             let mut reader = decryptor
                 .decrypt(std::iter::once(&id as &dyn age::Identity))
                 .map_err(|e| anyhow!("Failed to decrypt secret file '{}': {e}", path.display()))?;
-            let mut decrypted_str = String::new();
+            let mut decrypted_str = Zeroizing::new(String::new());
             reader.read_to_string(&mut decrypted_str)?;
             decrypted_str
         } else {
-            String::from_utf8(bytes)
-                .with_context(|| format!("File '{}' is not valid UTF-8 text", path.display()))?
+            Zeroizing::new(
+                String::from_utf8(bytes).with_context(|| {
+                    format!("File '{}' is not valid UTF-8 text", path.display())
+                })?,
+            )
         };
 
         for line in plaintext.lines() {
@@ -1968,9 +2042,31 @@ fn cmd_run(
                 {
                     v = v[1..v.len() - 1].to_string();
                 }
-                if !k.is_empty() {
-                    env_vars.insert(k, v);
+                // H10: hard-fail on malformed names; a NUL byte would panic
+                // Command::env, and hijack variables must never come from a
+                // repository-controlled env file.
+                if k.is_empty() || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                    return Err(anyhow!(
+                        "Invalid environment variable name '{k}' in env file"
+                    ));
                 }
+                if k.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+                    return Err(anyhow!(
+                        "Invalid environment variable name '{k}': must not start with a digit"
+                    ));
+                }
+                if v.contains('\0') {
+                    return Err(anyhow!(
+                        "Invalid environment variable '{k}': value contains a NUL byte"
+                    ));
+                }
+                if FORBIDDEN_ENV_VARS.contains(&k.to_ascii_uppercase().as_str()) {
+                    eprintln!(
+                        "git-agecrypt run [WARNING]: ignoring '{k}': this variable could hijack command execution and is blocked."
+                    );
+                    continue;
+                }
+                env_vars.insert(k, v);
             }
         }
     }

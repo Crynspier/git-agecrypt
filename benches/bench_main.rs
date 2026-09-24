@@ -57,7 +57,10 @@ fn locate_binary() -> PathBuf {
             }
         }
         if !dir.pop() {
-            panic!("could not locate git-agecrypt binary near {}", exe.display());
+            panic!(
+                "could not locate git-agecrypt binary near {}",
+                exe.display()
+            );
         }
     }
 }
@@ -177,13 +180,21 @@ fn bench_e2e(metrics: &mut Vec<Metric>, bin: &Path) {
 
     run_git(repo, &bin_dir, &["init"]);
     run_git(repo, &bin_dir, &["config", "user.name", "Bench"]);
-    run_git(repo, &bin_dir, &["config", "user.email", "bench@example.com"]);
+    run_git(
+        repo,
+        &bin_dir,
+        &["config", "user.email", "bench@example.com"],
+    );
 
     assert!(run_cmd(repo, bin, &["init"]));
     let identity = age::x25519::Identity::generate();
     let sec = identity.to_string().expose_secret().to_string();
     let pub_key = identity.to_public().to_string();
-    assert!(run_cmd(repo, bin, &["add-recipient", "-i", &pub_key, "--name", "bench"]));
+    assert!(run_cmd(
+        repo,
+        bin,
+        &["add-recipient", "-i", &pub_key, "--name", "bench"]
+    ));
 
     std::fs::write(
         repo.join(".gitattributes"),
@@ -275,9 +286,13 @@ fn parse_baseline(text: &str) -> std::collections::HashMap<String, u128> {
         if !line.starts_with('"') {
             continue;
         }
-        let Some(key_end) = line[1..].find('"') else { continue };
+        let Some(key_end) = line[1..].find('"') else {
+            continue;
+        };
         let key = &line[1..1 + key_end];
-        let Some(mpos) = line.find("\"micros\":") else { continue };
+        let Some(mpos) = line.find("\"micros\":") else {
+            continue;
+        };
         let digits: String = line[mpos + 9..]
             .chars()
             .skip_while(|c| !c.is_ascii_digit())
@@ -298,7 +313,10 @@ fn main() {
     println!("CLI binary: {}", bin.display());
     bench_e2e(&mut metrics, &bin);
 
-    println!("\n{:<26} {:>12}  {:<26} ceiling", "metric", "elapsed", "detail");
+    println!(
+        "\n{:<26} {:>12}  {:<26} ceiling",
+        "metric", "elapsed", "detail"
+    );
     let mut failures: Vec<String> = Vec::new();
     for m in &metrics {
         println!(
@@ -355,4 +373,3 @@ fn main() {
     }
     println!("\nAll {} metrics within ceilings.", metrics.len());
 }
-

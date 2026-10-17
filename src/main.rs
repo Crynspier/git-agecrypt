@@ -1742,8 +1742,8 @@ fn cmd_test_dumpable(output: &Path) -> Result<()> {
             return Err(std::io::Error::last_os_error())
                 .context("Failed to query process dumpability");
         }
-        fs::write(output, format!("{dumpable}\\n"))?;
-        return Ok(());
+        fs::write(output, format!("{dumpable}\n"))?;
+        Ok(())
     }
 
     #[cfg(not(target_os = "linux"))]

@@ -56,17 +56,20 @@ fn test_in_flight_termination_and_crash_recovery() {
     .unwrap();
 
     // 2. Invoke git-agecrypt status:
-    // This triggers `recover_interrupted_transaction`, which detects repo.key.locking without repo.key,
-    // restores repo.key, and recovers repository state cleanly.
-    agecrypt_cmd(repo).arg("status").assert().success();
+    // This triggers recovery, restores repo.key, and fails closed because the
+    // journal is malformed instead of silently discarding recovery metadata.
+    agecrypt_cmd(repo).arg("status").assert().failure();
 
-    // Verify repo.key was restored
+    // Verify repo.key was restored and the journal was retained for diagnosis.
     assert!(
         key_file.exists(),
         "Crash recovery must restore repo.key from interrupted transaction"
     );
+    assert!(journal_file.exists(), "Corrupted WAL must be retained");
 
-    // 3. Verify normal locking and unlocking work after crash recovery
+    // Operator resolution of the deliberately corrupted fixture: remove the
+    // unusable journal, then verify normal locking and unlocking work.
+    fs::remove_file(&journal_file).unwrap();
     agecrypt_cmd(repo).arg("lock").assert().success();
     let locked_bytes = fs::read(&secret_file).unwrap();
     assert!(

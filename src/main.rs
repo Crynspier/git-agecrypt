@@ -69,6 +69,15 @@ fn main() {
         process::exit(130);
     });
 
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("GIT_AGECRYPT_RUN_NON_DUMPABLE").is_some() {
+        // Some exec paths may reset dumpability; restore the protection in
+        // git-agecrypt children before they process any inherited state.
+        unsafe {
+            libc::prctl(libc::PR_SET_DUMPABLE, 0);
+        }
+    }
+
     let cli = Cli::parse();
 
     if let Err(err) = run(cli) {
@@ -1823,6 +1832,7 @@ fn pass_via_memfd(
     child.args(&command[1..]);
     child.env("GIT_AGECRYPT_ENV_FD", raw_fd_val.to_string());
     child.env("GIT_AGECRYPT_ENV_FILE", format!("/dev/fd/{raw_fd_val}"));
+    child.env("GIT_AGECRYPT_RUN_NON_DUMPABLE", "1");
 
     unsafe {
         child.pre_exec(move || {

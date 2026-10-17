@@ -37,20 +37,21 @@ jobs:
         run: |
           set -euo pipefail
           if ! echo "$RELEASE_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
-            echo "Invalid release tag '$RELEASE_TAG': must be a semantic version tag like v1.2.3"
+            echo "Invalid release tag '$RELEASE_TAG': must be a semantic version tag like v0.6.0 or v0.6.0-rc.1"
             exit 1
           fi
-          EXPECTED="${RELEASE_TAG#v}"
-          if [ "$RELEASE_TAG" != "v0.6.0" ]; then
-            echo "Only the v0.6.0 release is permitted by this release workflow"
+          BASE_TAG="${RELEASE_TAG%%-*}"
+          if [ "$BASE_TAG" != "v0.6.0" ]; then
+            echo "Only v0.6.0 and its prerelease tags are permitted by this release workflow"
             exit 1
           fi
+          EXPECTED="${BASE_TAG#v}"
           ACTUAL=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
           if [ "$EXPECTED" != "$ACTUAL" ]; then
             echo "Tag '$RELEASE_TAG' does not match Cargo.toml version '$ACTUAL'"
             exit 1
           fi
-          echo "Version check OK: $ACTUAL"
+          echo "Version check OK: $ACTUAL (tag: $RELEASE_TAG)"
       - name: Build workspace
         run: cargo build --workspace --locked --verbose
       - name: Run full test suite
@@ -68,7 +69,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" || gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --title "$RELEASE_TAG" --generate-notes
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists"
+          elif [[ "$RELEASE_TAG" == *-* ]]; then
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --title "$RELEASE_TAG" --prerelease --generate-notes
+          else
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --title "$RELEASE_TAG" --generate-notes
+          fi
 
   build-assets:
     name: Build ${{ matrix.asset_name }}

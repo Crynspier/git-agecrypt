@@ -75,7 +75,7 @@ When a team member rotates the master key via `git-agecrypt rekey`, the new reci
 - **Semantic merge conflict detection:** 3-way merge driver detects conflicting duplicate key definitions on concurrent branch edits to `.env` and configuration files and emits actionable warnings.
 - **GitHub user key enrollment:** Add team members directly by GitHub username (`git-agecrypt add-recipient --github <user>`).
 - **Safe locked clones:** Cloning without a configured key succeeds cleanly (exit code 0). Files remain encrypted on disk until unlocked.
-- **Transactional lock with WAL:** `git-agecrypt lock` re-smudges files on disk to encrypted ciphertext with write-ahead logging; interrupted recovery either completes or retains metadata and fails closed.
+- **Transactional lock with WAL:** `git-agecrypt lock` re-smudges files on disk to encrypted ciphertext with write-ahead logging; interrupted recovery either completes or retains metadata and fails closed. Recovery and key-changing operations serialize across concurrent CLI processes, and temporary key files are invocation-unique.
 - **Automated 3-way merge driver:** Decrypts conflicting branches, performs line-based 3-way merging, re-encrypts the result, and protects binary secrets from corruption.
 - **Worktree native:** A single unlock operates across all linked Git worktrees via `--git-common-dir`.
 - **Safeguard hooks:** Pre-commit and pre-push hooks inspect staged blobs in the Git index (`:0:<path>`) to block accidental cleartext leaks or commits encrypted under revoked keys. Hooks are local safeguards and can be bypassed; use server-side enforcement for mandatory policy.
@@ -444,7 +444,7 @@ Comprehensive specifications and architecture guides are available in the [`docs
   In-depth breakdown of the Git filter lifecycle (`clean`, `smudge`, `textconv`, `merge`), two-tier spooling architecture, scoped ring grammar validation, stage-0 index deduplication, cache validation, and the 3-way semantic merge driver conflict algorithms.
 
 - **[Verification & Invariant Matrix](docs/verification-matrix.md):**
-  Traceability matrix mapping the implemented verification suites (generative state machine, multi-ring combinatorial DAG, kill points, forensic canary sweeps, Linux prctl lockdown, symlink/case-collision defense) and documented invariants to automated test suites, with explicit platform and coverage limits.
+  Traceability matrix mapping the implemented verification suites (generative state machine, multi-ring combinatorial DAG, crash points, mixed-operation concurrency, forensic canary sweeps, Linux prctl lockdown, symlink/case-collision defense) and documented invariants to automated test suites, with explicit platform and coverage limits.
 
 - **[Specification & Security Guarantees](docs/spec-guarantees.md):**
   Explicit cryptographic, durability, cache, process-isolation, hardware-token, and platform-specific verification boundaries.

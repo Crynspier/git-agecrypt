@@ -584,6 +584,7 @@ fn cmd_list_recipients(ring_opt: Option<&str>) -> Result<()> {
 fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
     let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
+    let _transaction_guard = repo.acquire_recovery_lock()?;
     if !repo.is_unlocked_for_ring(ring_opt) {
         return Err(anyhow!(
             "Repository/ring is locked. You must run 'git-agecrypt unlock' before rekeying."
@@ -1162,6 +1163,7 @@ fn cmd_rewrap(paths: &[PathBuf], all: bool, identity_opt: Option<&str>, force: b
 fn cmd_unlock(key_file: Option<&str>, force: bool, ring_opt: Option<&str>) -> Result<()> {
     let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
+    let _transaction_guard = repo.acquire_recovery_lock()?;
     let keys_dir = repo.keys_dir_for_ring(ring_opt);
     if !keys_dir.exists() {
         return Err(anyhow!(

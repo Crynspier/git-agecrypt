@@ -178,7 +178,9 @@ fn test_mixed_concurrency_stress_mixed_operations() {
                 Ok(res)
                     if res.status.success()
                         || String::from_utf8_lossy(&res.stderr)
-                            .contains("existing key was preserved") => {}
+                            .contains("existing key was preserved")
+                        || String::from_utf8_lossy(&res.stderr)
+                            .contains("Repository/ring is locked") => {}
                 Ok(res) => failures_clone
                     .lock()
                     .unwrap()

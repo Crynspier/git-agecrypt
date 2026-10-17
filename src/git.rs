@@ -6,6 +6,7 @@ use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::crypto::{AGE_HEADER_MAGIC, is_age_ciphertext};
 
@@ -387,6 +388,56 @@ pub fn run_git_cmd_with_index_retry(
     }
 }
 
+pub struct RecoveryLockGuard(PathBuf);
+
+impl Drop for RecoveryLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn acquire_recovery_lock(state_dir: &Path) -> Result<RecoveryLockGuard> {
+    fs::create_dir_all(state_dir).context("Failed to create local state directory")?;
+    let lock_path = state_dir.join("recovery.lock");
+    let start = std::time::Instant::now();
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                let _ = writeln!(file, "{}", std::process::id());
+                return Ok(RecoveryLockGuard(lock_path));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let mut stale = false;
+                if let Ok(content) = fs::read_to_string(&lock_path)
+                    && let Some(pid) = content.lines().next().and_then(|line| line.parse().ok())
+                {
+                    stale = !is_pid_alive(pid);
+                }
+                if !stale
+                    && let Ok(metadata) = fs::metadata(&lock_path)
+                    && let Ok(mtime) = metadata.modified()
+                    && let Ok(age) = mtime.elapsed()
+                {
+                    stale = age > std::time::Duration::from_secs(30);
+                }
+                if stale {
+                    let _ = fs::remove_file(&lock_path);
+                    continue;
+                }
+                if start.elapsed() > std::time::Duration::from_secs(30) {
+                    return Err(anyhow!("Timed out waiting for concurrent lock recovery"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(err) => return Err(err).context("Failed to acquire lock recovery guard"),
+        }
+    }
+}
+
 pub struct GitRepo {
     pub root: PathBuf,
     pub git_dir: PathBuf,
@@ -667,7 +718,9 @@ impl GitRepo {
             ensure_not_symlink_or_reparse(&dest)?;
         }
 
-        let temp_filename = format!("repo.key.tmp.{}", std::process::id());
+        static TEMP_KEY_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nonce = TEMP_KEY_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_filename = format!("repo.key.tmp.{}.{}", std::process::id(), nonce);
         let temp_path = state_dir.join(&temp_filename);
         crash_point("after_tmp_create");
         {
@@ -790,7 +843,18 @@ impl GitRepo {
     ///   Uncommitted plaintext modifications in any linked worktree are never overwritten.
     ///
     /// Also sweeps any orphaned temporary spool files left in .git/git-agecrypt/.
+    pub fn acquire_recovery_lock(&self) -> Result<RecoveryLockGuard> {
+        acquire_recovery_lock(&self.local_state_dir())
+    }
+
     pub fn recover_interrupted_transaction(&self) -> Result<()> {
+        // Startup recovery mutates the shared lock journal, worktree files, and
+        // Git index. Multiple concurrent CLI processes may all run this method
+        // before doing their requested command, so serialize the whole recovery
+        // sweep rather than allowing one process to remove the journal while
+        // another is replaying it.
+        let _recovery_guard = acquire_recovery_lock(&self.local_state_dir())?;
+
         let locking_file = self.local_state_dir().join("repo.key.locking");
         let journal_file = self.lock_journal_file();
 
@@ -1239,6 +1303,10 @@ impl GitRepo {
         if !key_file.exists() {
             return f();
         }
+
+        // Keep startup recovery from replaying the shared journal or invoking
+        // Git while this lock transaction is changing the worktree.
+        let _transaction_guard = acquire_recovery_lock(&self.local_state_dir())?;
 
         crash_point("before_tx_begin");
 

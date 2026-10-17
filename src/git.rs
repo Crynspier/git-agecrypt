@@ -533,14 +533,16 @@ impl GitRepo {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700));
+            fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))
+                .context("Failed to restrict git-agecrypt state directory permissions")?;
         }
         let spool_dir = self.spool_dir();
         fs::create_dir_all(&spool_dir)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&spool_dir, fs::Permissions::from_mode(0o700));
+            fs::set_permissions(&spool_dir, fs::Permissions::from_mode(0o700))
+                .context("Failed to restrict git-agecrypt spool directory permissions")?;
         }
         Ok(state_dir)
     }
@@ -668,11 +670,7 @@ impl GitRepo {
         crash_point("after_tmp_create");
         {
             let mut file = open_pinned_secret_file(&state_dir, &temp_filename, true)?;
-            file.write_all(secret_key.trim().as_bytes())?;
-            file.flush()?;
-            file.sync_all()?;
-            crash_point("after_plaintext_write");
-
+            // Establish restrictive permissions before any key bytes are written.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -682,8 +680,12 @@ impl GitRepo {
 
             #[cfg(windows)]
             {
-                if let Ok(user) = std::env::var("USERNAME")
-                    && !user.is_empty()
+                let user = std::env::var("USERNAME")
+                    .ok()
+                    .filter(|user| !user.is_empty())
+                    .ok_or_else(|| {
+                        anyhow!("USERNAME is unavailable; cannot establish key-file ACL")
+                    })?;
                 {
                     let path_str = temp_path.to_string_lossy().replace('/', "\\");
                     let grant_arg = format!("{user}:(R,W)");
@@ -697,19 +699,28 @@ impl GitRepo {
                         .output()
                     {
                         Ok(out) if out.status.success() => {}
-                        Ok(out) => eprintln!(
-                            "git-agecrypt [WARNING]: failed to restrict permissions on {}: icacls exited {}: {}",
-                            temp_path.display(),
-                            out.status,
-                            String::from_utf8_lossy(&out.stderr).trim()
-                        ),
-                        Err(e) => eprintln!(
-                            "git-agecrypt [WARNING]: could not run icacls to restrict permissions on {}: {e}",
-                            temp_path.display()
-                        ),
+                        Ok(out) => {
+                            return Err(anyhow!(
+                                "Failed to restrict permissions on {}: icacls exited {}: {}",
+                                temp_path.display(),
+                                out.status,
+                                String::from_utf8_lossy(&out.stderr).trim()
+                            ));
+                        }
+                        Err(e) => {
+                            return Err(anyhow!(
+                                "Could not run icacls to restrict permissions on {}: {e}",
+                                temp_path.display()
+                            ));
+                        }
                     }
                 }
             }
+
+            file.write_all(secret_key.trim().as_bytes())?;
+            file.flush()?;
+            file.sync_all()?;
+            crash_point("after_plaintext_write");
         }
 
         let dest = self.local_master_key_file_for_ring(ring);
@@ -747,8 +758,14 @@ impl GitRepo {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             if !success {
-                let _ = fs::remove_file(&dest);
-                fs::rename(&temp_path, &dest)?;
+                // Never remove the last known-good key as a replacement fallback.
+                // If Windows cannot perform an atomic replacement, retain the
+                // existing key and return an error; the temporary key remains
+                // recoverable and is cleaned up by the caller/startup sweep.
+                return Err(anyhow!(
+                    "Failed to atomically replace master key {}; the existing key was preserved",
+                    dest.display()
+                ));
             }
         }
 
@@ -771,32 +788,49 @@ impl GitRepo {
     ///   Uncommitted plaintext modifications in any linked worktree are never overwritten.
     ///
     /// Also sweeps any orphaned temporary spool files left in .git/git-agecrypt/.
-    pub fn recover_interrupted_transaction(&self) {
+    pub fn recover_interrupted_transaction(&self) -> Result<()> {
         let locking_file = self.local_state_dir().join("repo.key.locking");
         let journal_file = self.lock_journal_file();
 
         if locking_file.exists() {
             let key_file = self.local_master_key_file();
             if key_file.exists() {
-                let _ = fs::remove_file(&locking_file);
+                fs::remove_file(&locking_file)
+                    .context("Failed to remove stale locking key after completed transaction")?;
                 if journal_file.exists() {
-                    let _ = fs::remove_file(&journal_file);
+                    fs::remove_file(&journal_file)
+                        .context("Failed to remove completed lock journal")?;
                 }
             } else {
-                let lock_mtime = fs::metadata(&locking_file).and_then(|m| m.modified()).ok();
-                if fs::rename(&locking_file, &key_file).is_ok() {
-                    eprintln!(
-                        "git-agecrypt [WARNING]: Recovered interrupted lock transaction. Master key has been restored."
-                    );
-                    // Replay recovery from WAL journal if present, or fallback to selective scan
-                    let _ = self.replay_lock_journal_or_selective(lock_mtime);
-                }
+                let lock_mtime = fs::metadata(&locking_file)
+                    .and_then(|m| m.modified())
+                    .context("Failed to inspect interrupted lock transaction")?;
+                fs::rename(&locking_file, &key_file)
+                    .context("Failed to restore master key from interrupted lock transaction")?;
+                eprintln!(
+                    "git-agecrypt [WARNING]: Recovered interrupted lock transaction. Master key has been restored."
+                );
+                // Replay recovery from WAL journal if present, or fallback to selective scan.
+                // The journal is retained automatically if replay fails.
+                self.replay_lock_journal_or_selective(Some(lock_mtime))?;
             }
         } else if journal_file.exists() {
-            let _ = fs::remove_file(&journal_file);
+            // A journal with an intact active key can only be from a crash
+            // before the destructive key transition. It is safe to discard
+            // that uncommitted journal. If the key is absent, however, the
+            // repository state is ambiguous and the journal must be retained.
+            if self.local_master_key_file().exists() {
+                fs::remove_file(&journal_file)
+                    .context("Failed to remove pre-transaction lock journal")?;
+            } else {
+                return Err(anyhow!(
+                    "Lock journal exists without a master key or transaction marker; refusing to discard recovery metadata"
+                ));
+            }
         }
 
-        // Clean up stale refresh.lock if older than 10s
+        // Clean up stale refresh.lock if older than 10s. This lock is auxiliary
+        // state, so failure to remove it is non-fatal.
         let refresh_lock = self.local_state_dir().join("refresh.lock");
         if refresh_lock.exists()
             && let Ok(meta) = fs::metadata(&refresh_lock)
@@ -808,6 +842,7 @@ impl GitRepo {
         }
 
         self.sweep_orphaned_tmp_files();
+        Ok(())
     }
 
     /// Replays recovery for an interrupted lock transaction using the WAL journal (`lock.journal`),
@@ -819,66 +854,80 @@ impl GitRepo {
     ) -> Result<()> {
         let journal_file = self.lock_journal_file();
         if journal_file.exists() {
-            if let Ok(content) = fs::read_to_string(&journal_file) {
-                for line in content.lines() {
-                    let parts: Vec<&str> = line.split('\t').collect();
-                    if parts.len() == 2 {
-                        let wt_path = PathBuf::from(parts[0]);
-                        let rel_path = parts[1];
-                        let full_path = wt_path.join(rel_path);
-                        if full_path.exists() {
-                            let repo_for_wt = GitRepo {
-                                root: wt_path.clone(),
-                                git_dir: self.git_dir.clone(),
-                                common_dir: self.common_dir.clone(),
-                            };
+            let content = fs::read_to_string(&journal_file)
+                .context("Failed to read lock recovery journal")?;
+            for line in content.lines() {
+                let parts: Vec<&str> = line.split('\t').collect();
+                if parts.len() != 2 {
+                    return Err(anyhow!("Malformed lock recovery journal entry"));
+                }
+                let wt_path = PathBuf::from(parts[0]);
+                let rel_path = parts[1];
+                let full_path = wt_path.join(rel_path);
+                if full_path.exists() {
+                    let repo_for_wt = GitRepo {
+                        root: wt_path.clone(),
+                        git_dir: self.git_dir.clone(),
+                        common_dir: self.common_dir.clone(),
+                    };
 
-                            let is_empty = fs::metadata(&full_path)
-                                .map(|m| m.len() == 0)
-                                .unwrap_or(false);
-                            let should_resmudge = if is_empty {
-                                repo_for_wt.is_staged_blob_non_empty(rel_path)
-                            } else if let Ok(mut f) = File::open(&full_path) {
-                                let mut prefix = [0u8; AGE_HEADER_MAGIC.len()];
-                                if let Ok(n) = f.read(&mut prefix) {
-                                    is_age_ciphertext(&prefix[..n])
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            };
+                    let is_empty = fs::metadata(&full_path)
+                        .map(|m| m.len() == 0)
+                        .unwrap_or(false);
+                    let should_resmudge = if is_empty {
+                        repo_for_wt.is_staged_blob_non_empty(rel_path)
+                    } else if let Ok(mut f) = File::open(&full_path) {
+                        let mut prefix = [0u8; AGE_HEADER_MAGIC.len()];
+                        if let Ok(n) = f.read(&mut prefix) {
+                            is_age_ciphertext(&prefix[..n])
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
 
-                            if should_resmudge {
-                                let orig_readonly = fs::metadata(&full_path)
-                                    .map(|m| m.permissions().readonly())
-                                    .unwrap_or(false);
+                    if should_resmudge {
+                        let orig_readonly = fs::metadata(&full_path)
+                            .map(|m| m.permissions().readonly())
+                            .unwrap_or(false);
 
-                                if orig_readonly && let Ok(meta) = fs::metadata(&full_path) {
-                                    let mut perms = meta.permissions();
-                                    set_permissions_writable(&mut perms);
-                                    let _ = fs::set_permissions(&full_path, perms);
-                                }
+                        if orig_readonly && let Ok(meta) = fs::metadata(&full_path) {
+                            let mut perms = meta.permissions();
+                            set_permissions_writable(&mut perms);
+                            fs::set_permissions(&full_path, perms).context(
+                                "Failed to make interrupted secret writable for recovery",
+                            )?;
+                        }
 
-                                let _ = fs::remove_file(&full_path);
-                                let _ = git_cmd_with_path(&wt_path)
-                                    .args(["checkout-index", "-f", "-u", "--", rel_path])
-                                    .status();
+                        fs::remove_file(&full_path)
+                            .context("Failed to remove interrupted secret before recovery")?;
+                        let status = git_cmd_with_path(&wt_path)
+                            .args(["checkout-index", "-f", "-u", "--", rel_path])
+                            .status()
+                            .context("Failed to restore interrupted secret from Git index")?;
+                        if !status.success() {
+                            return Err(anyhow!(
+                                "Git failed to restore interrupted secret '{}': {status}",
+                                full_path.display()
+                            ));
+                        }
 
-                                if orig_readonly
-                                    && full_path.exists()
-                                    && let Ok(meta) = fs::metadata(&full_path)
-                                {
-                                    let mut perms = meta.permissions();
-                                    perms.set_readonly(true);
-                                    let _ = fs::set_permissions(&full_path, perms);
-                                }
-                            }
+                        if orig_readonly
+                            && full_path.exists()
+                            && let Ok(meta) = fs::metadata(&full_path)
+                        {
+                            let mut perms = meta.permissions();
+                            perms.set_readonly(true);
+                            fs::set_permissions(&full_path, perms)
+                                .context("Failed to restore interrupted secret permissions")?;
                         }
                     }
                 }
             }
-            let _ = fs::remove_file(&journal_file);
+            // Only discard the journal after every recorded recovery action has succeeded.
+            fs::remove_file(&journal_file)
+                .context("Failed to remove completed lock recovery journal")?;
             Ok(())
         } else {
             self.recover_worktrees_selective(lock_mtime)

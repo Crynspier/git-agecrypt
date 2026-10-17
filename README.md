@@ -75,12 +75,12 @@ When a team member rotates the master key via `git-agecrypt rekey`, collaborator
 - **Semantic merge conflict detection:** 3-way merge driver detects conflicting duplicate key definitions on concurrent branch edits to `.env` and configuration files and emits actionable warnings.
 - **GitHub user key enrollment:** Add team members directly by GitHub username (`git-agecrypt add-recipient --github <user>`).
 - **Safe locked clones:** Cloning without a configured key succeeds cleanly (exit code 0). Files remain encrypted on disk until unlocked.
-- **Transactional lock with WAL:** `git-agecrypt lock` re-smudges files on disk to encrypted ciphertext with write-ahead logging, guaranteeing recovery if interrupted.
+- **Transactional lock with WAL:** `git-agecrypt lock` re-smudges files on disk to encrypted ciphertext with write-ahead logging; interrupted recovery either completes or retains metadata and fails closed.
 - **Automated 3-way merge driver:** Decrypts conflicting branches, performs line-based 3-way merging, re-encrypts the result, and protects binary secrets from corruption.
 - **Worktree native:** A single unlock operates across all linked Git worktrees via `--git-common-dir`.
-- **Safeguard hooks:** Pre-commit and pre-push hooks inspect staged blobs in the Git index (`:0:<path>`) to block accidental cleartext leaks or commits encrypted under revoked keys.
-- **Untracked secret leak scanner:** Pre-commit safeguard scans all staged files and aborts commits if untracked files matching secret heuristics (e.g. `.env`, private keys) are staged in plaintext.
-- **AI and IDE shielding:** Synchronizes ignore rules across `.cursorignore`, `.claudeignore`, `.aiderignore`, and `.aiignore` so local LLM indexers never ingest unencrypted working-tree secrets.
+- **Safeguard hooks:** Pre-commit and pre-push hooks inspect staged blobs in the Git index (`:0:<path>`) to block accidental cleartext leaks or commits encrypted under revoked keys. Hooks are local safeguards and can be bypassed; use server-side enforcement for mandatory policy.
+- **Untracked secret leak scanner:** Pre-commit safeguard scans all staged files and aborts commits if untracked files matching secret heuristics (e.g. `.env`, private keys) are staged in plaintext. Heuristics are defense in depth, not a complete secret detector.
+- **AI and IDE shielding:** Synchronizes ignore rules across `.cursorignore`, `.claudeignore`, `.aiderignore`, and `.aiignore`. These are advisory integrations: tool support varies, and ignore rules cannot remove secrets already indexed or transmitted.
 - **Headless CI/CD friendly:** Unlocks from stdin (`echo "$KEY" | git-agecrypt unlock -`) with zero daemon processes.
 - **Standalone binary:** Pure Rust with zero external dynamic library dependencies (no OpenSSL DLLs).
 

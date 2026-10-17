@@ -121,7 +121,8 @@ fn run(cli: Cli) -> Result<()> {
         | Commands::Merge { .. } => {}
         _ => {
             if let Ok(repo) = GitRepo::discover() {
-                repo.recover_interrupted_transaction();
+                repo.recover_interrupted_transaction()
+                    .context("Failed to recover interrupted lock transaction")?;
             }
         }
     }

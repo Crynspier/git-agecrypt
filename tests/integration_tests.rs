@@ -2840,7 +2840,7 @@ fn test_refresh_lock_breaks_on_dead_pid() {
 }
 
 #[test]
-fn test_orphaned_journal_without_locking_key_unlinks_cleanly() {
+fn test_orphaned_journal_without_locking_key_blocks_until_resolved() {
     let temp = tempdir().expect("Failed to create tempdir");
     let repo = temp.path();
 
@@ -2877,12 +2877,13 @@ fn test_orphaned_journal_without_locking_key_unlinks_cleanly() {
         .current_dir(repo)
         .arg("status")
         .assert()
-        .success();
+        .failure();
 
-    // Verify orphaned journal was cleaned up without attempting recovery without key
+    // An orphaned journal is ambiguous recovery metadata. It must be retained
+    // and normal operations must stop rather than silently discarding it.
     assert!(
-        !journal_file.exists(),
-        "Orphaned journal must be unlinked cleanly"
+        journal_file.exists(),
+        "Orphaned journal must be retained until recovery is resolved"
     );
 }
 
@@ -6614,12 +6615,13 @@ fn test_wal_corruption_deterministic_recovery() {
         .current_dir(repo)
         .arg("status")
         .assert()
-        .success();
+        .failure();
 
-    // Verify master key was safely restored and journal cleaned
+    // The key can be restored, but corrupted recovery metadata must remain
+    // available for diagnosis or operator-assisted recovery.
     assert!(key_file.exists());
     assert!(!locking_file.exists());
-    assert!(!journal_file.exists());
+    assert!(journal_file.exists());
 }
 
 #[test]

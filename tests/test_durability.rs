@@ -26,13 +26,14 @@ fn test_wal_corruption_deterministic_recovery() {
     let journal_file = state_dir.join("lock.journal");
     fs::write(&journal_file, b"corrupt_garbage_without_tabs\x00\xff\xfe\n").unwrap();
 
-    // Run status: triggers recover_interrupted_transaction
-    agecrypt_cmd(repo).arg("status").assert().success();
+    // Run status: recovery must fail closed on corrupted WAL data.
+    agecrypt_cmd(repo).arg("status").assert().failure();
 
-    // Verify master key was safely restored and journal cleaned
+    // The master key is restored, but corrupted recovery metadata is retained
+    // for diagnosis or operator-assisted recovery rather than discarded.
     assert!(key_file.exists());
     assert!(!locking_file.exists());
-    assert!(!journal_file.exists());
+    assert!(journal_file.exists());
 }
 
 #[test]

@@ -69,8 +69,8 @@ When a team member rotates the master key via `git-agecrypt rekey`, the new reci
 - **Runtime secret injection:** Execute child commands with in-memory decrypted environment variables (`git-agecrypt run -- <cmd>`) without writing cleartext `.env` files to disk.
 - **Anonymous in-memory secret passing (`run --fd`):** Pass secrets via Linux kernel anonymous RAM descriptors (`SYS_memfd_create`), avoiding `/proc/<pid>/environ` inspection or cleartext temporary files.
 - **In-memory clean fast-path:** Inputs below 1 MiB use the in-memory spool path and do not intentionally create a temporary spool file. The primary spool buffer uses zeroization on drop; this does not guarantee that every intermediate or library/OS copy is erased immediately.
-- **Bounded streaming for large files:** Streams larger than 1 MiB are processed in chunks and may use temporary files; memory use does not scale with the complete file size, although exact usage depends on the encryption and I/O layers.
-- **Cryptographic cache authentication:** Eliminates phantom `git diff` churn using keyed HMAC-SHA256 digests. Cached ciphertext hits are decrypted and authenticated in RAM before trust, with automatic eviction on corruption and complete cache purge on `rekey`.
+- **Bounded streaming for large files:** Streams of 1 MiB or more are processed in chunks and may use temporary files; memory use does not scale with the complete file size, although exact usage depends on the encryption and I/O layers.
+- **Cryptographic cache authentication:** Eliminates phantom `git diff` churn using keyed HMAC-SHA256 digests. Cached ciphertext hits are decrypted and authenticated in RAM before trust, with corrupted entries evicted. Rekey switches to a fresh cache namespace and attempts to purge old entries; auxiliary cache cleanup is best effort under concurrency and filesystem failures.
 - **Durability checks on critical state:** Key, journal, and merge-target writes check synchronization and replacement errors. Cache cleanup and other auxiliary cleanup paths may be best effort; filesystem and storage hardware behavior remains outside the application's control.
 - **Semantic merge conflict detection:** 3-way merge driver detects conflicting duplicate key definitions on concurrent branch edits to `.env` and configuration files and emits actionable warnings.
 - **GitHub user key enrollment:** Add team members directly by GitHub username (`git-agecrypt add-recipient --github <user>`).
@@ -239,10 +239,10 @@ To view cleartext diffs:
 git diff secrets/app.secret.env
 ```
 
-To verify the staged blob is encrypted:
+To verify the staged blob is encrypted (read from the index, not `HEAD`):
 
 ```bash
-git cat-file -p HEAD:secrets/app.secret.env
+git cat-file -p :0:secrets/app.secret.env
 ```
 
 ### 5. Locking and Unlocking
@@ -289,7 +289,7 @@ git-agecrypt run -e production.secret.env --ring prod -- node server.js
 git-agecrypt run -- npm test
 ```
 
-Secrets are decrypted for the child process and are not intentionally written to application-created cleartext files. The environment path uses process environment variables, and the Linux `--fd` path uses an anonymous memfd exposed through `GIT_AGECRYPT_ENV_FD`; memory may still be retained or paged by the operating system. On non-Linux hosts where `memfd_create` is unavailable, `--fd` fails closed unless `--allow-env-fallback` is supplied. When `-e` is omitted, `run` automatically detects encrypted `.env` or `*.secret.env` files tracked in the repository.
+Secrets are decrypted for the child process and are not intentionally written to application-created cleartext files. The environment path uses process environment variables, and the Linux `--fd` path uses an anonymous memfd exposed through `GIT_AGECRYPT_ENV_FD`; memory may still be retained or paged by the operating system. On non-Linux hosts where `memfd_create` is unavailable, `--fd` fails closed unless `--allow-env-fallback` is supplied. When `-e` is omitted, `run` discovers tracked environment-style files and matching encrypted paths, including `.env`, `*.secret.env`, ring-specific environment layouts, and related `.gitattributes` patterns; it also has a current-directory `.env` fallback.
 
 ### 7. Scoped Recipient Rings (Multi-Environment Secrets)
 
@@ -454,7 +454,7 @@ Comprehensive specifications and architecture guides are available in the [`docs
 ## Minimum Supported Versions
 
 - **Rust:** 1.88.0+ (Rust 2024 edition)
-- **Git:** 2.25.0+ (recommended for `--pathspec-from-file` and `-z` null-delimited plumbing)
+- **Git:** 2.25.0+ is the project support baseline. Some plumbing operations include compatibility fallbacks for older Git versions; `--pathspec-from-file` and `-z` null-delimited plumbing are preferred when available.
 
 ---
 

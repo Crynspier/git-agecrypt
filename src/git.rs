@@ -1280,7 +1280,8 @@ impl GitRepo {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&journal_file, fs::Permissions::from_mode(0o600));
+            fs::set_permissions(&journal_file, fs::Permissions::from_mode(0o600))
+                .context("Failed to restrict lock WAL journal permissions")?;
         }
         jf.write_all(journal_content.as_bytes())
             .context("Failed to write lock WAL journal file")?;
@@ -1295,7 +1296,8 @@ impl GitRepo {
         let state_dir = self.ensure_local_state_dir_for_ring(ring)?;
         let locking_file = state_dir.join("repo.key.locking");
         if locking_file.exists() {
-            let _ = fs::remove_file(&locking_file);
+            fs::remove_file(&locking_file)
+                .context("Failed to remove stale locking key before starting transaction")?;
         }
         fs::rename(&key_file, &locking_file).context("Failed to stage master key for locking")?;
         crash_point("after_key_rename");
@@ -1306,24 +1308,43 @@ impl GitRepo {
             Ok(()) => {
                 crash_point("before_cleanup");
                 if locking_file.exists() {
-                    let _ = fs::remove_file(&locking_file);
+                    fs::remove_file(&locking_file)
+                        .context("Failed to remove completed locking key")?;
                 }
                 if journal_file.exists() {
-                    let _ = fs::remove_file(&journal_file);
+                    fs::remove_file(&journal_file)
+                        .context("Failed to remove completed lock WAL journal")?;
                 }
-                let _ = sync_dir(&state_dir);
+                sync_dir(&state_dir).context("Failed to synchronize completed lock cleanup")?;
                 crash_point("after_cleanup");
                 Ok(())
             }
             Err(err) => {
-                // Rollback: restore master key AND replay recovery from journal
-                if locking_file.exists() {
-                    let lock_mtime = fs::metadata(&locking_file).and_then(|m| m.modified()).ok();
-                    let _ = fs::rename(&locking_file, &key_file);
-                    let _ = sync_dir(&state_dir);
-                    let _ = self.replay_lock_journal_or_selective(lock_mtime);
+                // Rollback: restore the master key and replay the journal. Any
+                // rollback failure is returned alongside the original operation
+                // error; the journal remains available for startup recovery.
+                let recovery = (|| -> Result<()> {
+                    if locking_file.exists() {
+                        let lock_mtime = fs::metadata(&locking_file)
+                            .and_then(|m| m.modified())
+                            .context("Failed to inspect locking key during rollback")?;
+                        fs::rename(&locking_file, &key_file)
+                            .context("Failed to restore master key during rollback")?;
+                        sync_dir(&state_dir)
+                            .context("Failed to synchronize master-key rollback")?;
+                        self.replay_lock_journal_or_selective(Some(lock_mtime))
+                            .context("Failed to replay lock journal during rollback")
+                    } else {
+                        Ok(())
+                    }
+                })();
+
+                match recovery {
+                    Ok(()) => Err(err),
+                    Err(recovery_err) => Err(err.context(format!(
+                        "Lock operation failed; rollback also failed: {recovery_err}"
+                    ))),
                 }
-                Err(err)
             }
         }
     }

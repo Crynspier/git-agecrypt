@@ -691,7 +691,12 @@ fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
     // 5. Update local master key in common git dir atomically and clear stale cache
     repo.save_local_master_key_for_ring(new_secret_str.expose_secret(), ring_opt)?;
     git::crash_point("after_rekey_key_saved");
-    repo.clear_cache_for_ring(ring_opt, true)?;
+    // The cache contains only auxiliary ciphertext and is intentionally
+    // best-effort. A concurrent clean filter may have a cache file open;
+    // rekey must not fail or roll back key rotation because that cache cannot
+    // be removed immediately. The new public key selects a fresh cache
+    // namespace, so stale entries are unusable with the new master key.
+    repo.clear_cache_for_ring(ring_opt, false)?;
     git::crash_point("after_rekey_cache_purge");
     git::crash_point("after_old_delete");
 

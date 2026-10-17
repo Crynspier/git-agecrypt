@@ -635,6 +635,7 @@ fn encrypt_plaintext_stream<R: Read, W: Write>(
         crate::git::crash_point("after_ciphertext_fsync");
 
         let dest = c_dir.join(format!("{hash_hex}.age"));
+        let _ = fs::create_dir_all(c_dir);
         if !dest.exists() {
             let mut current_temp = cache_temp;
             let mut persist_res = current_temp.persist(&dest);

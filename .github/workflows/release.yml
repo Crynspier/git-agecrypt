@@ -68,7 +68,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release view "$RELEASE_TAG" || gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" --generate-notes
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" || gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --title "$RELEASE_TAG" --generate-notes
 
   build-assets:
     name: Build ${{ matrix.asset_name }}

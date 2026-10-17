@@ -411,7 +411,7 @@ impl SpoolBuffer {
 /// Spools a stream into memory (or temporary file if > 1 MiB) while optionally updating an HMAC digest.
 pub fn spool_stream<R: Read>(
     mut stream: R,
-    cache_dir: Option<&Path>,
+    _cache_dir: Option<&Path>,
     mut mac_opt: Option<HmacSha256>,
 ) -> Result<(SpoolBuffer, Option<String>)> {
     let mut mem_buf = Vec::new();
@@ -432,17 +432,11 @@ pub fn spool_stream<R: Read>(
         } else if mem_buf.len() + n <= IN_MEMORY_SPOOL_LIMIT {
             mem_buf.extend_from_slice(&buf[..n]);
         } else {
-            let mut df = if let Some(c_dir) = cache_dir {
-                fs::create_dir_all(c_dir)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(c_dir, fs::Permissions::from_mode(0o700));
-                }
-                tempfile::NamedTempFile::new_in(c_dir)?
-            } else {
-                tempfile::NamedTempFile::new()?
-            };
+            // Keep the spool outside the removable cache directory. Lock/rekey
+            // may evict that directory while a clean filter is still reading
+            // its input; the spool is required data, whereas the cache is only
+            // an optimization.
+            let mut df = tempfile::NamedTempFile::new()?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -616,8 +610,11 @@ fn encrypt_plaintext_stream<R: Read, W: Write>(
         .map_err(|e| anyhow!("Failed to initialize age encryptor for clean filter: {e}"))?;
 
     if let (Some(c_dir), Some(hash_hex)) = (cache_dir, hash_hex_opt.as_ref()) {
-        fs::create_dir_all(c_dir)?;
-        let mut cache_temp = tempfile::NamedTempFile::new_in(c_dir)?;
+        // Build the cache entry in the system temp directory. The cache
+        // directory may be removed concurrently by lock/rekey; cache
+        // eviction must never make the clean filter fail after it has
+        // received valid plaintext.
+        let mut cache_temp = tempfile::NamedTempFile::new()?;
         let mut age_writer = encryptor
             .wrap_output(&mut cache_temp)
             .context("Failed to wrap cache output stream with age encryptor")?;
@@ -632,8 +629,9 @@ fn encrypt_plaintext_stream<R: Read, W: Write>(
             output.flush()?;
         }
 
-        // Guarantee physical media sync before atomic rename (fail-closed)
-        cache_temp.as_file().sync_all()?;
+        // Cache durability is best effort: the ciphertext has already been
+        // written to Git's output stream, and a cache miss is safe.
+        let _ = cache_temp.as_file().sync_all();
         crate::git::crash_point("after_ciphertext_fsync");
 
         let dest = c_dir.join(format!("{hash_hex}.age"));

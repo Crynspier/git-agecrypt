@@ -95,11 +95,18 @@ fn test_run_fd_child_reads_secret_and_proc_snooping_denied() {
                     None
                 })
         });
+        // Opening /proc/<pid>/mem can succeed before the kernel performs the
+        // ptrace access check. Force an actual read so this tests the protected
+        // operation rather than just the open syscall.
         let found_non_dumpable = child_pid.is_some_and(|pid| {
-            std::fs::OpenOptions::new()
+            let Ok(mut mem) = std::fs::OpenOptions::new()
                 .read(true)
                 .open(format!("/proc/{pid}/mem"))
-                .is_err()
+            else {
+                return true;
+            };
+            let mut byte = [0_u8; 1];
+            std::io::Read::read(&mut mem, &mut byte).is_err()
         });
 
         let _ = child.kill();

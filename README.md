@@ -82,21 +82,23 @@ When a team member rotates the master key via `git-agecrypt rekey`, the new reci
 - **Untracked secret leak scanner:** Pre-commit safeguard scans all staged files and aborts commits if untracked files matching secret heuristics (e.g. `.env`, private keys) are staged in plaintext. Heuristics are defense in depth, not a complete secret detector.
 - **AI and IDE shielding:** Synchronizes ignore rules across `.cursorignore`, `.claudeignore`, `.aiderignore`, and `.aiignore`. These are advisory integrations: tool support varies, and ignore rules cannot remove secrets already indexed or transmitted.
 - **Headless CI/CD friendly:** Unlocks from stdin (`echo "$KEY" | git-agecrypt unlock -`) with zero daemon processes.
-- **Standalone binary:** Pure Rust with zero external dynamic library dependencies (no OpenSSL DLLs).
+- **Standalone binary:** Implemented in Rust and built as a target-specific release binary; it does not require the project's application to link against OpenSSL.
 
 ---
 
 ## How It Compares
 
+This is a high-level comparison of default workflows; capabilities and defaults can vary by tool version and configuration.
+
 | Aspect | `git-agecrypt` | `git-crypt` | Mozilla `sops` |
 |---|---|---|---|
-| **Working Tree State** | Transparent cleartext or ephemeral runtime injection (`git-agecrypt run`) | Transparent cleartext on disk | Encrypted on disk (manual CLI edit) |
-| **Cryptography** | `age` (X25519, ChaCha20-Poly1305) | GPG (OpenPGP) / AES-CTR | Age, PGP, AWS KMS, GCP KMS, Vault |
-| **Identity Mechanism** | SSH keys (`id_ed25519`), Age keys, or Age plugins (YubiKey, Apple SE, TPM) | GPG keyring / Symmetric key | Cloud KMS or GPG/Age |
-| **Nonce Handling** | Keyed HMAC cache (zero phantom diffs) | Deterministic IV (from SHA-1 HMAC) | N/A (whole file encryption) |
-| **Locked Clone Behavior** | Passes ciphertext through (exit 0) | Fails checkout (exit 128) | N/A |
-| **Binary Dependencies** | Pure Rust static binary (~4.8 MB) | C++ linking OpenSSL | Go binary |
-| **3-Way Merge Driver** | Built-in (with semantic conflict warnings) | None (manual conflict resolution) | None |
+| **Working Tree State** | Git-filter cleartext on disk, or runtime injection with `git-agecrypt run` | Git-filter cleartext on disk | Encrypted files on disk, edited through the `sops` command or an editor integration |
+| **Payload Encryption** | `age` (X25519, ChaCha20-Poly1305) | OpenSSL-based encryption with GPG/OpenPGP key wrapping | Age, PGP, or supported cloud/KMS key services |
+| **Identity Mechanism** | SSH keys, native age identities, or age plugins | GPG keys or symmetric mode | PGP/age identities and configured KMS/key services |
+| **Repeat Staging** | Authenticated HMAC/index caching can reuse ciphertext for identical plaintext | Tool-specific encrypted-filter behavior | No `git-agecrypt`-style Git-filter cache; ciphertext changes depend on the SOPS workflow |
+| **Locked Clone Behavior** | Encrypted payload can pass through when the local key is unavailable | Filter checkout commonly requires an available key | Encrypted files remain encrypted until explicitly decrypted |
+| **Binary/Runtime Model** | Rust application with target-specific release builds | Native application with platform crypto dependencies | Go application |
+| **3-Way Merge Driver** | Built-in merge driver with semantic conflict warnings | No built-in semantic merge driver | No `git-agecrypt`-style transparent encrypted-file merge driver |
 
 ---
 
@@ -394,8 +396,10 @@ To migrate a repository currently using `git-crypt`:
 # 1. Ensure the repository is unlocked with git-crypt
 git-crypt unlock
 
-# 2. Run automated migration
-git-agecrypt migrate-from-git-crypt -i ~/.ssh/id_ed25519.pub
+# 2. Run automated migration (uses the local SSH key by default)
+git-agecrypt migrate-from-git-crypt
+# Or enroll a specific initial recipient:
+# git-agecrypt migrate-from-git-crypt -i ~/.ssh/id_ed25519.pub
 
 # 3. Review and commit changes
 git add .gitattributes .git-agecrypt/

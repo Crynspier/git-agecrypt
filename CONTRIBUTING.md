@@ -4,7 +4,7 @@ Thank you for your interest in improving `git-agecrypt`!
 
 ## Development Setup
 
-`git-agecrypt` requires a standard Rust toolchain (Rust 1.74+):
+`git-agecrypt` requires Rust 1.85.0 or later (Rust 2024 edition):
 
 ```bash
 # Clone the repository
@@ -17,15 +17,29 @@ cargo build
 
 ## Running Tests
 
-The test suite includes both unit tests and comprehensive end-to-end integration tests:
+The test suite includes unit tests and comprehensive end-to-end integration tests. During normal development, use the split commands below rather than the broad all-targets invocation, which is reserved as the final comprehensive gate:
 
 ```bash
-# Run all tests
-cargo test
+# Unit tests and binary test targets
+cargo test --workspace --locked --lib --bins
 
-# Run tests with verbose output
-cargo test -- --nocapture
+# Integration tests (run each integration binary concurrently on Windows)
+powershell -ExecutionPolicy Bypass -File ./scripts/run-integration-tests.ps1 -MaxParallel 4
+
+# Re-run a focused integration test with output
+cargo test --workspace --locked --test test_generative_shadow_state_machine -- --nocapture
 ```
+
+For the coverage-guided fuzz targets, install `cargo-fuzz` separately and run them on demand from the repository root:
+
+```bash
+cargo fuzz run fuzz_age_ciphertext -- -runs=10000
+cargo fuzz run fuzz_wal_journal -- -runs=10000
+cargo fuzz run fuzz_merge_parser -- -runs=10000
+cargo fuzz run fuzz_gitattributes -- -runs=10000
+```
+
+Record the target, seed/options, toolchain, commit, and result for release evidence.
 
 ## Code Quality Standards
 

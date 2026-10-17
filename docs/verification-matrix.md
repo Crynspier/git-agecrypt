@@ -1,10 +1,10 @@
-﻿# High-Assurance Verification & Invariant Mapping Matrix (v0.6.0)
+﻿# High-Assurance Verification & Invariant Mapping Matrix (v0.5.0)
 
 This document provides the exhaustive, bi-directional verification matrix mapping every architectural invariant and critique item to its concrete implementation and automated test suites in `git-agecrypt`.
 
 ---
 
-## 1. Critique Items Verification Matrix (v0.6.0)
+## 1. Critique Items Verification Matrix (v0.5.0)
 
 | # | Critique Domain | Architectural Implementation | Primary Automated Test Suite | Coverage Confidence |
 |---|---|---|---|---|
@@ -16,7 +16,7 @@ This document provides the exhaustive, bi-directional verification matrix mappin
 | **#6** | TOCTOU filesystem elimination | Descriptor-pinned `openat(..., O_NOFOLLOW)` (Unix) and `FILE_FLAG_OPEN_REPARSE_POINT` (Windows) | [`src/git.rs`](../src/git.rs), [`tests/test_toctou_racing.rs`](../tests/test_toctou_racing.rs) | Deterministic |
 | **#7** | Hostile-process `/proc` testing for `run --fd` | Real child secret consumption with `/proc/<pid>/status` Dumpable verification on Linux | [`tests/test_hostile_proc_snooping.rs`](../tests/test_hostile_proc_snooping.rs) | Deterministic |
 | **#8** | FD lifetime and process crash bounds | Child exit codes (0, 42), crash handling, early close, and descriptor cleanup | [`tests/test_fd_lifecycle_crash.rs`](../tests/test_fd_lifecycle_crash.rs) | Deterministic |
-| **#9** | Continuous coverage-guided fuzzing | Dedicated GitHub Actions nightly workflow for continuous parser fuzzing | [`.github/workflows/nightly-fuzz.yml`](../.github/workflows/nightly-fuzz.yml) | Continuous |
+| **#9** | On-demand coverage-guided fuzzing | Local/on-demand parser fuzzing using the repository fuzz targets | [`fuzz/fuzz_targets/`](../fuzz/fuzz_targets/) | On-demand |
 | **#10** | Permanent regression corpus | Byte-level regression corpus runner in standard CI | [`tests/regressions/`](../tests/regressions/), [`tests/test_regression_corpus.rs`](../tests/test_regression_corpus.rs) | Continuous |
 | **#11** | Power-loss & crash durability testing | Write → fsync → rename → crash → restart verification across 24 state boundaries, concurrency × crash injection, per-file torn-write audits (every file must be absent / complete-old / complete-new), and true block-layer power cuts via dm-flakey (Linux, root-gated) | [`tests/test_sigkill_crash_injection.rs`](../tests/test_sigkill_crash_injection.rs), [`tests/test_durability.rs`](../tests/test_durability.rs), [`tests/test_concurrency_crash_matrix.rs`](../tests/test_concurrency_crash_matrix.rs), [`tests/test_power_loss_durability.rs`](../tests/test_power_loss_durability.rs) | Generative + Hardware-level |
 | **#12** | Large-file interrupted streaming | 4 MiB stream killed in-flight with recursive forensic canary disk sweeps | [`tests/test_large_file_crash_spool.rs`](../tests/test_large_file_crash_spool.rs) | Deterministic |
@@ -32,7 +32,7 @@ This document provides the exhaustive, bi-directional verification matrix mappin
 | **#22** | Configurable random-run depth | Seedable PRNG (`GIT_AGECRYPT_SEED`) with configurable operation count (`GIT_AGECRYPT_OPS`) | [`tests/test_generative_shadow_state_machine.rs`](../tests/test_generative_shadow_state_machine.rs) | Generative |
 | **#23** | Documentation & specification tightening | Formal specification of security model, threat boundaries, and revocation guarantees | [`docs/spec-guarantees.md`](spec-guarantees.md) | Continuous |
 | **#24** | Dependency & unsafe hardening | Documented `unsafe` blocks for `openat`, `TerminateProcess`, and `prctl` | [`src/git.rs`](../src/git.rs), [`src/main.rs`](../src/main.rs) | Continuous |
-| **#25** | CI matrix & nightly automation | Multi-OS testing matrix + dedicated nightly deep fuzz workflow | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), [`.github/workflows/nightly-fuzz.yml`](../.github/workflows/nightly-fuzz.yml) | Continuous |
+| **#25** | CI matrix & deep verification | Multi-OS testing matrix plus explicitly invoked deep verification workflow; fuzzing remains on-demand | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), [`.github/workflows/weekly-deep.yml`](../.github/workflows/weekly-deep.yml) | CI + on-demand |
 | **#26** | Concurrency × crash injection | Races state-changing operations against crash points, then recovers | [`tests/test_concurrency_crash_matrix.rs`](../tests/test_concurrency_crash_matrix.rs) | Generative |
 | **#27** | FD inheritance boundaries | Verifies secret FD availability across fork/exec boundaries | [`tests/test_run_fd_inheritance.rs`](../tests/test_run_fd_inheritance.rs) | Deterministic |
 

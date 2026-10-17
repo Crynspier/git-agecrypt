@@ -240,122 +240,129 @@ fn test_power_loss_torn_write_audit() {
         "after_rekey_cache_purge",
     ];
 
-    for point in crash_points {
-        let (_temp, repo, sec_id, plaintext) = setup_unlocked_repo();
-        let id_file = repo.join("unlock_key.txt");
-        fs::write(&id_file, &sec_id).unwrap();
+    // Every crash point uses an isolated temporary repository. Run the matrix
+    // concurrently so the durability coverage does not serialize twenty full
+    // repository setup/recovery cycles.
+    std::thread::scope(|scope| {
+        for point in crash_points {
+            scope.spawn(move || {
+                let (_temp, repo, sec_id, plaintext) = setup_unlocked_repo();
+                let id_file = repo.join("unlock_key.txt");
+                fs::write(&id_file, &sec_id).unwrap();
 
-        let mut op_cmd = agecrypt_cmd(&repo);
-        op_cmd.env("GIT_AGECRYPT_CRASH_POINT", point);
+                let mut op_cmd = agecrypt_cmd(&repo);
+                op_cmd.env("GIT_AGECRYPT_CRASH_POINT", point);
 
-        let clean_point = matches!(
-            point,
-            "after_ciphertext_write" | "after_ciphertext_fsync" | "spool_chunk"
-        );
-        let unlock_point = matches!(
-            point,
-            "after_unwrap_key" | "after_unlock_key_saved" | "after_unlock_refresh"
-        );
-        let rekey_point = matches!(
-            point,
-            "after_tmp_create"
-                | "after_plaintext_write"
-                | "after_rekey_pub_write"
-                | "after_rekey_key_saved"
-                | "after_rekey_cache_purge"
-        );
+                let clean_point = matches!(
+                    point,
+                    "after_ciphertext_write" | "after_ciphertext_fsync" | "spool_chunk"
+                );
+                let unlock_point = matches!(
+                    point,
+                    "after_unwrap_key" | "after_unlock_key_saved" | "after_unlock_refresh"
+                );
+                let rekey_point = matches!(
+                    point,
+                    "after_tmp_create"
+                        | "after_plaintext_write"
+                        | "after_rekey_pub_write"
+                        | "after_rekey_key_saved"
+                        | "after_rekey_cache_purge"
+                );
 
-        // Trigger the crash.
-        if clean_point {
-            op_cmd.args(["clean", "vault.secret.env"]);
-            op_cmd.stdin(Stdio::piped());
-            op_cmd.stdout(Stdio::null());
-            op_cmd.stderr(Stdio::null());
-            let mut child = op_cmd.spawn().expect("spawn clean");
-            if let Some(mut sin) = child.stdin.take() {
-                let payload = vec![b'A'; 2 * 1024 * 1024];
-                let _ = sin.write_all(&payload);
-            }
-            let status = child.wait().expect("wait clean");
-            assert!(!status.success(), "{point}: crashed clean must not succeed");
-        } else {
-            match point {
-                _ if unlock_point => {
-                    op_cmd.args(["unlock", id_file.to_str().unwrap()]);
+                // Trigger the crash.
+                if clean_point {
+                    op_cmd.args(["clean", "vault.secret.env"]);
+                    op_cmd.stdin(Stdio::piped());
+                    op_cmd.stdout(Stdio::null());
+                    op_cmd.stderr(Stdio::null());
+                    let mut child = op_cmd.spawn().expect("spawn clean");
+                    if let Some(mut sin) = child.stdin.take() {
+                        let payload = vec![b'A'; 2 * 1024 * 1024];
+                        let _ = sin.write_all(&payload);
+                    }
+                    let status = child.wait().expect("wait clean");
+                    assert!(!status.success(), "{point}: crashed clean must not succeed");
+                } else {
+                    match point {
+                        _ if unlock_point => {
+                            op_cmd.args(["unlock", id_file.to_str().unwrap()]);
+                        }
+                        _ if rekey_point => {
+                            op_cmd.args(["rekey", "-f"]);
+                        }
+                        "after_old_delete" => {
+                            op_cmd.args(["remove-recipient", "ci_user"]);
+                        }
+                        _ => {
+                            op_cmd.args(["lock", "-f"]);
+                        }
+                    }
+                    let out = op_cmd.output().expect("run crashed op");
+                    assert!(
+                        !out.status.success(),
+                        "{point}: crashed op must exit non-zero"
+                    );
                 }
-                _ if rekey_point => {
-                    op_cmd.args(["rekey", "-f"]);
+
+                // LAYER 1: no torn writes anywhere (pre-recovery audit).
+                audit_no_torn_files(&repo, &plaintext);
+
+                // LAYER 2: recovery sweep succeeds and leaves no transient artifacts.
+                run_recovery_status(&repo, point);
+                assert_no_transient_artifacts(&repo, point);
+                assert_inv_b_durability_consistent(&repo);
+                // LAYER 3: idempotent retry of the crashed operation must succeed (or be
+                // harmlessly complete already), and secrets must decrypt to exact plaintext.
+                if clean_point {
+                    let out = agecrypt_cmd(&repo)
+                        .args(["clean", "vault.secret.env"])
+                        .output()
+                        .expect("retry clean");
+                    assert!(out.status.success(), "{point}: retried clean must succeed");
+                    assert!(
+                        !out.stdout.is_empty(),
+                        "{point}: retried clean must emit complete ciphertext"
+                    );
+                } else if unlock_point {
+                    agecrypt_cmd(&repo)
+                        .args(["unlock", id_file.to_str().unwrap()])
+                        .assert()
+                        .success();
+                    let disk = fs::read_to_string(repo.join("vault.secret.env")).unwrap();
+                    assert_eq!(
+                        disk, plaintext,
+                        "{point}: unlock retry must restore exact plaintext"
+                    );
+                } else if rekey_point {
+                    agecrypt_cmd(&repo).args(["rekey", "-f"]).assert().success();
+                } else if point == "after_old_delete" {
+                    // Delete already happened pre-crash; re-adding the recipient must succeed.
+                    let (_, pub2) = generate_test_identity();
+                    agecrypt_cmd(&repo)
+                        .args(["add-recipient", "-i", &pub2, "--name", "ci_user"])
+                        .assert()
+                        .success();
+                } else {
+                    // lock-transaction points: retry lock, then full decryptability proof.
+                    agecrypt_cmd(&repo).args(["lock", "-f"]).assert().success();
+                    agecrypt_cmd(&repo)
+                        .args(["unlock", id_file.to_str().unwrap()])
+                        .assert()
+                        .success();
+                    let disk = fs::read_to_string(repo.join("vault.secret.env")).unwrap();
+                    assert_eq!(
+                        disk, plaintext,
+                        "{point}: post-crash unlock must restore exact plaintext"
+                    );
                 }
-                "after_old_delete" => {
-                    op_cmd.args(["remove-recipient", "ci_user"]);
-                }
-                _ => {
-                    op_cmd.args(["lock", "-f"]);
-                }
-            }
-            let out = op_cmd.output().expect("run crashed op");
-            assert!(
-                !out.status.success(),
-                "{point}: crashed op must exit non-zero"
-            );
+
+                // Final structural audit after recovery.
+                audit_no_torn_files(&repo, &plaintext);
+                assert_no_transient_artifacts(&repo, point);
+            });
         }
-
-        // LAYER 1: no torn writes anywhere (pre-recovery audit).
-        audit_no_torn_files(&repo, &plaintext);
-
-        // LAYER 2: recovery sweep succeeds and leaves no transient artifacts.
-        run_recovery_status(&repo, point);
-        assert_no_transient_artifacts(&repo, point);
-        assert_inv_b_durability_consistent(&repo);
-        // LAYER 3: idempotent retry of the crashed operation must succeed (or be
-        // harmlessly complete already), and secrets must decrypt to exact plaintext.
-        if clean_point {
-            let out = agecrypt_cmd(&repo)
-                .args(["clean", "vault.secret.env"])
-                .output()
-                .expect("retry clean");
-            assert!(out.status.success(), "{point}: retried clean must succeed");
-            assert!(
-                !out.stdout.is_empty(),
-                "{point}: retried clean must emit complete ciphertext"
-            );
-        } else if unlock_point {
-            agecrypt_cmd(&repo)
-                .args(["unlock", id_file.to_str().unwrap()])
-                .assert()
-                .success();
-            let disk = fs::read_to_string(repo.join("vault.secret.env")).unwrap();
-            assert_eq!(
-                disk, plaintext,
-                "{point}: unlock retry must restore exact plaintext"
-            );
-        } else if rekey_point {
-            agecrypt_cmd(&repo).args(["rekey", "-f"]).assert().success();
-        } else if point == "after_old_delete" {
-            // Delete already happened pre-crash; re-adding the recipient must succeed.
-            let (_, pub2) = generate_test_identity();
-            agecrypt_cmd(&repo)
-                .args(["add-recipient", "-i", &pub2, "--name", "ci_user"])
-                .assert()
-                .success();
-        } else {
-            // lock-transaction points: retry lock, then full decryptability proof.
-            agecrypt_cmd(&repo).args(["lock", "-f"]).assert().success();
-            agecrypt_cmd(&repo)
-                .args(["unlock", id_file.to_str().unwrap()])
-                .assert()
-                .success();
-            let disk = fs::read_to_string(repo.join("vault.secret.env")).unwrap();
-            assert_eq!(
-                disk, plaintext,
-                "{point}: post-crash unlock must restore exact plaintext"
-            );
-        }
-
-        // Final structural audit after recovery.
-        audit_no_torn_files(&repo, &plaintext);
-        assert_no_transient_artifacts(&repo, point);
-    }
+    });
 }
 // ---------------------------------------------------------------------------
 // True power-loss emulation via device-mapper flakey target (Linux + root only).
@@ -382,7 +389,7 @@ mod dm_flakey {
             .unwrap_or(false)
     }
 
-    fn run(argv: &[&str]) -> Result<String, String> {
+    fn run_cmd(argv: &[&str]) -> Result<String, String> {
         let out = Command::new(argv[0])
             .args(&argv[1..])
             .output()
@@ -408,9 +415,9 @@ mod dm_flakey {
 
     impl Drop for PowerCutGuard {
         fn drop(&mut self) {
-            let _ = run(&["umount", "-f", "-l", &self.mnt.to_string_lossy()]);
-            let _ = run(&["dmsetup", "remove", "-f", &self.dm_name]);
-            let _ = run(&["losetup", "-d", &self.loop_dev]);
+            let _ = run_cmd(&["umount", "-f", "-l", &self.mnt.to_string_lossy()]);
+            let _ = run_cmd(&["dmsetup", "remove", "-f", &self.dm_name]);
+            let _ = run_cmd(&["losetup", "-d", &self.loop_dev]);
         }
     }
 
@@ -433,7 +440,7 @@ mod dm_flakey {
         f.set_len(64 * 1024 * 1024).unwrap();
         drop(f);
 
-        let loop_dev = match run(&["losetup", "-f", "--show", &img.to_string_lossy()]) {
+        let loop_dev = match run_cmd(&["losetup", "-f", "--show", &img.to_string_lossy()]) {
             Ok(dev) => dev,
             Err(e) => {
                 eprintln!("losetup unavailable ({e}); skipping dm-flakey test");
@@ -448,7 +455,7 @@ mod dm_flakey {
             mnt: mnt.clone(),
         };
 
-        run(&[
+        run_cmd(&[
             "dmsetup",
             "create",
             &dm_name,
@@ -456,8 +463,8 @@ mod dm_flakey {
             &format!("0 {sectors} flakey {loop_dev} 0 0 0"),
         ])
         .expect("dmsetup create flakey");
-        run(&["mkfs.ext4", "-q", &format!("/dev/mapper/{dm_name}")]).expect("mkfs.ext4");
-        run(&[
+        run_cmd(&["mkfs.ext4", "-q", &format!("/dev/mapper/{dm_name}")]).expect("mkfs.ext4");
+        run_cmd(&[
             "mount",
             &format!("/dev/mapper/{dm_name}"),
             &mnt.to_string_lossy(),
@@ -503,8 +510,8 @@ mod dm_flakey {
         );
 
         // TRUE POWER CUT: drop all in-flight writes at the block layer, kill the fs.
-        run(&["dmsetup", "suspend", &dm_name]).expect("dm suspend");
-        run(&[
+        run_cmd(&["dmsetup", "suspend", &dm_name]).expect("dm suspend");
+        run_cmd(&[
             "dmsetup",
             "load",
             &dm_name,
@@ -512,12 +519,12 @@ mod dm_flakey {
             &format!("0 {sectors} error"),
         ])
         .expect("dm load error target");
-        run(&["dmsetup", "resume", &dm_name]).expect("dm resume error");
-        run(&["umount", "-f", &mnt.to_string_lossy()]).expect("force unmount (no sync)");
-        run(&["dmsetup", "remove", "-f", &dm_name]).expect("dm remove");
+        run_cmd(&["dmsetup", "resume", &dm_name]).expect("dm resume error");
+        run_cmd(&["umount", "-f", &mnt.to_string_lossy()]).expect("force unmount (no sync)");
+        run_cmd(&["dmsetup", "remove", "-f", &dm_name]).expect("dm remove");
 
         // Reattach the surviving disk image and remount (ext4 replays its journal).
-        run(&[
+        run_cmd(&[
             "dmsetup",
             "create",
             &dm_name,
@@ -525,7 +532,7 @@ mod dm_flakey {
             &format!("0 {sectors} flakey {loop_dev} 0 0 0"),
         ])
         .expect("dm recreate");
-        run(&[
+        run_cmd(&[
             "mount",
             &format!("/dev/mapper/{dm_name}"),
             &mnt.to_string_lossy(),

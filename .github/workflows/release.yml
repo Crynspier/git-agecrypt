@@ -41,6 +41,10 @@ jobs:
             exit 1
           fi
           EXPECTED="${RELEASE_TAG#v}"
+          if [ "$RELEASE_TAG" != "v0.5.0" ]; then
+            echo "Only the v0.5.0 release is permitted by this release workflow"
+            exit 1
+          fi
           ACTUAL=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
           if [ "$EXPECTED" != "$ACTUAL" ]; then
             echo "Tag '$RELEASE_TAG' does not match Cargo.toml version '$ACTUAL'"
@@ -81,6 +85,14 @@ jobs:
             target: x86_64-unknown-linux-gnu
             asset_name: git-agecrypt-linux-x86_64.tar.gz
             binary_name: git-agecrypt
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset_name: git-agecrypt-macos-x86_64.tar.gz
+            binary_name: git-agecrypt
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset_name: git-agecrypt-macos-aarch64.tar.gz
+            binary_name: git-agecrypt
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             asset_name: git-agecrypt-windows-x86_64.zip
@@ -98,15 +110,32 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           tar -czvf "${{ matrix.asset_name }}" -C target/${{ matrix.target }}/release "${{ matrix.binary_name }}"
+      - name: Package asset (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          tar -czvf "${{ matrix.asset_name }}" -C target/${{ matrix.target }}/release "${{ matrix.binary_name }}"
       - name: Package asset (Windows)
         if: runner.os == 'Windows'
         run: |
           Compress-Archive -Path target/${{ matrix.target }}/release/${{ matrix.binary_name }} -DestinationPath "${{ matrix.asset_name }}"
-      # H7: emit a SHA256 checksum so users can verify integrity.
-      - name: Generate checksum (Linux)
-        if: runner.os == 'Linux'
+      - name: Smoke-test packaged binary (Unix)
+        if: runner.os != 'Windows'
         run: |
-          sha256sum "${{ matrix.asset_name }}" > "${{ matrix.asset_name }}.sha256"
+          VERSION=$(target/${{ matrix.target }}/release/${{ matrix.binary_name }} --version)
+          test "$VERSION" = "git-agecrypt 0.5.0"
+          tar -tzf "${{ matrix.asset_name }}" | grep -Fx "${{ matrix.binary_name }}"
+      - name: Smoke-test packaged binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = & "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" --version
+          if ($version -ne 'git-agecrypt 0.5.0') { throw "Unexpected version: $version" }
+          if (-not (tar -tf "${{ matrix.asset_name }}" | Select-String -SimpleMatch "${{ matrix.binary_name }}")) { throw 'Packaged executable is missing' }
+      # H7: emit a SHA256 checksum so users can verify integrity.
+      - name: Generate checksum (Unix)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        run: |
+          shasum -a 256 "${{ matrix.asset_name }}" | awk '{print $1"  "$2}' > "${{ matrix.asset_name }}.sha256"
           cat "${{ matrix.asset_name }}.sha256"
       - name: Generate checksum (Windows)
         if: runner.os == 'Windows'

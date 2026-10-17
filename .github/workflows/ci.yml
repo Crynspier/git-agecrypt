@@ -30,7 +30,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Run clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   # H5: enforce the declared MSRV (rust-version = "1.85.0" in Cargo.toml).
   msrv:
@@ -57,10 +57,10 @@ jobs:
           git config --global user.name "CI Runner"
           git config --global user.email "ci@example.com"
       - name: Run tests
-        run: cargo test --workspace --verbose
+        run: cargo test --workspace --locked --verbose
       # Benchmarks are compiled here but executed only in weekly-deep (M8).
       - name: Compile benchmarks
-        run: cargo bench --no-run
+        run: cargo bench --no-run --locked
 
   build:
     name: Build Project
@@ -71,6 +71,41 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Build workspace
         run: cargo build --workspace --locked --verbose
+
+  platform-matrix:
+    name: Platform Build and Smoke Test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: macOS Intel
+            os: macos-13
+            target: x86_64-apple-darwin
+          - name: macOS Apple Silicon
+            os: macos-14
+            target: aarch64-apple-darwin
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Configure Git user identity for tests
+        shell: bash
+        run: |
+          git config --global user.name "CI Runner"
+          git config --global user.email "ci@example.com"
+      - name: Build release binary
+        run: cargo build --workspace --locked --release --target ${{ matrix.target }}
+      - name: Run platform smoke tests
+        run: cargo test --workspace --locked --target ${{ matrix.target }} --lib --bins
 
   supply-chain:
     name: Supply Chain Audit (cargo-deny)

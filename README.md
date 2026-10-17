@@ -133,6 +133,17 @@ Verify installation:
 
 ```bash
 git-agecrypt --version
+# git-agecrypt 0.5.0
+```
+
+The v0.5.0 release provides all four mandatory targets: Linux x86_64, macOS x86_64 (Intel), macOS arm64 (Apple Silicon), and Windows x86_64. Each archive has a matching `.sha256` checksum file; verify it before placing the binary in `PATH`:
+
+```bash
+# Linux/macOS
+sha256sum -c git-agecrypt-linux-x86_64.tar.gz.sha256  # use shasum -a 256 on macOS if needed
+
+# Windows PowerShell
+(Get-FileHash .\\git-agecrypt-windows-x86_64.zip -Algorithm SHA256).Hash
 ```
 
 ---
@@ -427,6 +438,9 @@ Comprehensive specifications and architecture guides are available in the [`docs
 
 - **[High-Assurance Verification & Invariant Matrix](docs/verification-matrix.md):**
   Exhaustive traceability matrix mapping all 27 critique requirements (generative state machine, multi-ring combinatorial DAG, kill points, forensic canary sweeps, Linux prctl lockdown, symlink/case-collision defense) and formal Invariants A–F to automated test suites.
+
+- **[Specification & Security Guarantees](docs/spec-guarantees.md):**
+  Explicit cryptographic, durability, cache, process-isolation, hardware-token, and v0.5.0 verification boundaries.
 
 ---
 

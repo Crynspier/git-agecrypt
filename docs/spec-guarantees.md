@@ -61,3 +61,19 @@ When executing commands via `git-agecrypt run -- <cmd>`:
 
 - Missing, corrupted, unresponsive, or disconnected hardware tokens result in immediate **fail-closed termination**.
 - `git-agecrypt` will **never** fallback to plaintext, fallback to an untrusted secondary credential, or emit unencrypted secrets into Git streams.
+
+---
+
+## 6. v0.5.0 Verification Boundary
+
+The guarantees above are implementation claims, not a promise that every operating-system primitive is available everywhere. The v0.5.0 release evidence maps them as follows:
+
+| Guarantee | Implementation evidence | Verification boundary |
+|---|---|---|
+| Historical revocation | Epoch-specific recipient wrapping and cache purge | New epochs exclude revoked recipients; old Git objects remain decryptable to recipients who held the old epoch key |
+| Crash consistency | WAL, staged writes, fsync/sync-all, atomic rename, recovery sweep | SIGKILL/TerminateProcess and torn-write suites; dm-flakey is Linux/root-gated |
+| Cache integrity | HMAC-addressed entries with validation and generation purge | Corruption, race, and rekey tests; a cache hit is never trusted without authentication |
+| `run --fd` isolation | Linux `memfd_create`, dumpability lockdown, descriptor lifecycle cleanup | Linux gets anonymous descriptors; Windows/macOS fail closed unless `--allow-env-fallback` is explicitly requested |
+| Hardware-token failure handling | Age plugin protocol errors are propagated without plaintext fallback | Missing, malformed, slow, and disconnected plugins are failure cases, not supported recovery paths |
+
+The project does not claim protection against plaintext already copied by an authorized process, historical Git objects retained by a formerly authorized recipient, compromised hosts, or operating systems that cannot provide the requested kernel isolation primitive. Those are explicit limitations rather than silent best-effort behavior.

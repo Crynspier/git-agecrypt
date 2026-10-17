@@ -15,10 +15,10 @@ fn recursively_scan_for_canary(dir: &Path, canary: &[u8]) -> Vec<String> {
             let p = entry.path();
             if p.is_dir() {
                 leaks.extend(recursively_scan_for_canary(&p, canary));
-            } else if let Ok(data) = fs::read(&p) {
-                if data.windows(canary.len()).any(|window| window == canary) {
-                    leaks.push(p.display().to_string());
-                }
+            } else if let Ok(data) = fs::read(&p)
+                && data.windows(canary.len()).any(|window| window == canary)
+            {
+                leaks.push(p.display().to_string());
             }
         }
     }

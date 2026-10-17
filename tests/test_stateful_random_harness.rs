@@ -151,12 +151,11 @@ fn test_stateful_random_git_state_machine() {
                     }
                     for name in &secret_filenames {
                         let disk_path = repo.join(name);
-                        if disk_path.exists() {
-                            if let Ok(c) = fs::read_to_string(&disk_path) {
-                                if !c.starts_with("age-encryption.org/v1\n") {
-                                    shadow_files.insert(name.to_string(), c);
-                                }
-                            }
+                        if disk_path.exists()
+                            && let Ok(c) = fs::read_to_string(&disk_path)
+                            && !c.starts_with("age-encryption.org/v1\n")
+                        {
+                            shadow_files.insert(name.to_string(), c);
                         }
                     }
                 }
@@ -182,12 +181,11 @@ fn test_stateful_random_git_state_machine() {
                     }
                     for name in &secret_filenames {
                         let disk_path = repo.join(name);
-                        if disk_path.exists() {
-                            if let Ok(c) = fs::read_to_string(&disk_path) {
-                                if !c.starts_with("age-encryption.org/v1\n") {
-                                    shadow_files.insert(name.to_string(), c);
-                                }
-                            }
+                        if disk_path.exists()
+                            && let Ok(c) = fs::read_to_string(&disk_path)
+                            && !c.starts_with("age-encryption.org/v1\n")
+                        {
+                            shadow_files.insert(name.to_string(), c);
                         }
                     }
                 }
@@ -209,12 +207,11 @@ fn test_stateful_random_git_state_machine() {
                     is_locked = false;
                     for name in &secret_filenames {
                         let disk_path = repo.join(name);
-                        if disk_path.exists() {
-                            if let Ok(c) = fs::read_to_string(&disk_path) {
-                                if !c.starts_with("age-encryption.org/v1\n") {
-                                    shadow_files.insert(name.to_string(), c);
-                                }
-                            }
+                        if disk_path.exists()
+                            && let Ok(c) = fs::read_to_string(&disk_path)
+                            && !c.starts_with("age-encryption.org/v1\n")
+                        {
+                            shadow_files.insert(name.to_string(), c);
                         }
                     }
                 }
@@ -283,7 +280,7 @@ fn assert_invariants_at_step(
     }
 
     // Git object store must NEVER hold plaintext (check every 10 steps and at the end)
-    if step_idx % 10 == 0 || step_idx == 99 {
+    if step_idx.is_multiple_of(10) || step_idx == 99 {
         let mut canaries = Vec::new();
         for content in shadow_files.values() {
             for line in content.lines() {

@@ -183,7 +183,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -939,7 +939,7 @@ fn draw_op(step: usize, action_type: u32, rng: &mut ChaCha8Rng, h: &Harness) -> 
 fn check_invariants(repo: &Path, h: &Harness, step: usize, canary: &[u8]) {
     assert_inv_b_durability_consistent(repo);
     assert_inv_g_zero_canary_leaks(repo, canary);
-    if step % 10 == 0 {
+    if step.is_multiple_of(10) {
         h.shadow.verify_state(repo);
         h.shadow.verify_index_state(repo);
         h.shadow.verify_object_db(repo);

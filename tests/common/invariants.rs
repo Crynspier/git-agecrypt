@@ -132,10 +132,10 @@ pub fn assert_inv_e_zero_plaintext_memory(repo: &Path, canary: &str, stdout: &[u
                         if scan_dir(&p, canary) {
                             return true;
                         }
-                    } else if let Ok(data) = fs::read(&p) {
-                        if data.windows(canary.len()).any(|w| w == canary) {
-                            return true;
-                        }
+                    } else if let Ok(data) = fs::read(&p)
+                        && data.windows(canary.len()).any(|w| w == canary)
+                    {
+                        return true;
                     }
                 }
             }
@@ -186,10 +186,10 @@ pub fn assert_inv_g_zero_canary_leaks(repo: &Path, canary: &[u8]) {
                     if scan_dir(&p, canary) {
                         return true;
                     }
-                } else if let Ok(data) = fs::read(&p) {
-                    if data.windows(canary.len()).any(|w| w == canary) {
-                        return true;
-                    }
+                } else if let Ok(data) = fs::read(&p)
+                    && data.windows(canary.len()).any(|w| w == canary)
+                {
+                    return true;
                 }
             }
         }

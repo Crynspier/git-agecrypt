@@ -162,36 +162,31 @@ impl ShadowModel {
         let mut new_files = HashMap::new();
         for path in self.files.keys() {
             let full_path = repo.join(path);
-            if full_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&full_path) {
-                    if !content.starts_with(
-                        "age-encryption.org/v1
+            if full_path.exists()
+                && let Ok(content) = std::fs::read_to_string(&full_path)
+                && !content.starts_with(
+                    "age-encryption.org/v1
 ",
-                    ) {
-                        new_files.insert(path.clone(), content);
-                    }
-                }
+                )
+            {
+                new_files.insert(path.clone(), content);
             }
         }
         // Also scan for new secret files that might have been created
         if let Ok(entries) = std::fs::read_dir(repo) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_file() {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.ends_with(".secret.env") {
-                            if let Ok(content) = std::fs::read_to_string(&path) {
-                                if !content.starts_with(
-                                    "age-encryption.org/v1
+                if path.is_file()
+                    && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && name.ends_with(".secret.env")
+                    && let Ok(content) = std::fs::read_to_string(&path)
+                    && !content.starts_with(
+                        "age-encryption.org/v1
 ",
-                                ) {
-                                    let rel =
-                                        path.strip_prefix(repo).unwrap_or(&path).to_path_buf();
-                                    new_files.entry(rel).or_insert(content);
-                                }
-                            }
-                        }
-                    }
+                    )
+                {
+                    let rel = path.strip_prefix(repo).unwrap_or(&path).to_path_buf();
+                    new_files.entry(rel).or_insert(content);
                 }
             }
         }
@@ -202,18 +197,17 @@ impl ShadowModel {
             .args(["ls-tree", "-r", "--name-only", "HEAD", "-z"])
             .current_dir(repo)
             .output()
+            && output.status.success()
         {
-            if output.status.success() {
-                for path_slice in output.stdout.split(|&b| b == 0) {
-                    if path_slice.is_empty() {
-                        continue;
-                    }
-                    let name = String::from_utf8_lossy(path_slice).to_string();
-                    if name.ends_with(".secret.env") {
-                        let rel = PathBuf::from(&name);
-                        if let Some(content) = self.files.get(&rel) {
-                            committed.insert(rel, content.clone());
-                        }
+            for path_slice in output.stdout.split(|&b| b == 0) {
+                if path_slice.is_empty() {
+                    continue;
+                }
+                let name = String::from_utf8_lossy(path_slice).to_string();
+                if name.ends_with(".secret.env") {
+                    let rel = PathBuf::from(&name);
+                    if let Some(content) = self.files.get(&rel) {
+                        committed.insert(rel, content.clone());
                     }
                 }
             }
@@ -259,29 +253,28 @@ impl ShadowModel {
             .args(["ls-files", "-z"])
             .current_dir(repo)
             .output()
+            && output.status.success()
         {
-            if output.status.success() {
-                for path_slice in output.stdout.split(|&b| b == 0) {
-                    if path_slice.is_empty() {
-                        continue;
-                    }
-                    let name = String::from_utf8_lossy(path_slice).to_string();
-                    if name.ends_with(".secret.env") {
-                        let blob_ref = format!(":0:{}", name);
-                        let blob = std::process::Command::new("git")
-                            .args(["cat-file", "-p", &blob_ref])
-                            .current_dir(repo)
-                            .output();
-                        if let Ok(out) = blob {
-                            if out.status.success() {
-                                assert!(
-                                    out.stdout.starts_with(b"age-encryption.org/v1\n"),
-                                    "Git index blob {:?} must be age ciphertext, got: {:?}",
-                                    blob_ref,
-                                    String::from_utf8_lossy(&out.stdout)
-                                );
-                            }
-                        }
+            for path_slice in output.stdout.split(|&b| b == 0) {
+                if path_slice.is_empty() {
+                    continue;
+                }
+                let name = String::from_utf8_lossy(path_slice).to_string();
+                if name.ends_with(".secret.env") {
+                    let blob_ref = format!(":0:{}", name);
+                    let blob = std::process::Command::new("git")
+                        .args(["cat-file", "-p", &blob_ref])
+                        .current_dir(repo)
+                        .output();
+                    if let Ok(out) = blob
+                        && out.status.success()
+                    {
+                        assert!(
+                            out.stdout.starts_with(b"age-encryption.org/v1\n"),
+                            "Git index blob {:?} must be age ciphertext, got: {:?}",
+                            blob_ref,
+                            String::from_utf8_lossy(&out.stdout)
+                        );
                     }
                 }
             }
@@ -295,28 +288,27 @@ impl ShadowModel {
             .args(["ls-tree", "-r", "--name-only", "HEAD", "-z"])
             .current_dir(repo)
             .output()
+            && output.status.success()
         {
-            if output.status.success() {
-                for path_slice in output.stdout.split(|&b| b == 0) {
-                    if path_slice.is_empty() {
-                        continue;
-                    }
-                    let name = String::from_utf8_lossy(path_slice).to_string();
-                    if name.ends_with(".secret.env") {
-                        let cat_ref = format!("HEAD:{}", name);
-                        let blob = std::process::Command::new("git")
-                            .args(["cat-file", "-p", &cat_ref])
-                            .current_dir(repo)
-                            .output();
-                        if let Ok(out) = blob {
-                            if out.status.success() {
-                                assert!(
-                                    out.stdout.starts_with(b"age-encryption.org/v1\n"),
-                                    "Git HEAD blob {:?} must be age ciphertext",
-                                    cat_ref
-                                );
-                            }
-                        }
+            for path_slice in output.stdout.split(|&b| b == 0) {
+                if path_slice.is_empty() {
+                    continue;
+                }
+                let name = String::from_utf8_lossy(path_slice).to_string();
+                if name.ends_with(".secret.env") {
+                    let cat_ref = format!("HEAD:{}", name);
+                    let blob = std::process::Command::new("git")
+                        .args(["cat-file", "-p", &cat_ref])
+                        .current_dir(repo)
+                        .output();
+                    if let Ok(out) = blob
+                        && out.status.success()
+                    {
+                        assert!(
+                            out.stdout.starts_with(b"age-encryption.org/v1\n"),
+                            "Git HEAD blob {:?} must be age ciphertext",
+                            cat_ref
+                        );
                     }
                 }
             }

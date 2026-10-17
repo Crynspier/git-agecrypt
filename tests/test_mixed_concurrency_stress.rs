@@ -1,4 +1,4 @@
-﻿mod common;
+mod common;
 
 use common::*;
 use std::fs;
@@ -109,17 +109,17 @@ fn test_mixed_concurrency_stress_mixed_operations() {
         let mut op = 0;
         while !stop.load(Ordering::Relaxed) && op < 5 {
             let lock_out = agecrypt_cmd(r).args(["lock", "-f"]).output();
-            if let Ok(res) = lock_out {
-                if res.status.success() {
-                    let unlock_out = agecrypt_assert_cmd(r)
-                        .args(["unlock", "-"])
-                        .write_stdin(id_file.to_str().unwrap().as_bytes())
-                        .output();
-                    if let Ok(unlock_res) = unlock_out {
-                        if !unlock_res.status.success() {
-                            eprintln!("Unlock failed after lock: {:?}", unlock_res);
-                        }
-                    }
+            if let Ok(res) = lock_out
+                && res.status.success()
+            {
+                let unlock_out = agecrypt_assert_cmd(r)
+                    .args(["unlock", "-"])
+                    .write_stdin(id_file.to_str().unwrap().as_bytes())
+                    .output();
+                if let Ok(unlock_res) = unlock_out
+                    && !unlock_res.status.success()
+                {
+                    eprintln!("Unlock failed after lock: {:?}", unlock_res);
                 }
             }
             op += 1;
@@ -136,10 +136,10 @@ fn test_mixed_concurrency_stress_mixed_operations() {
         let mut op = 0;
         while !stop.load(Ordering::Relaxed) && op < 30 {
             let status_out = agecrypt_cmd(r).arg("status").output();
-            if let Ok(res) = status_out {
-                if !res.status.success() {
-                    eprintln!("Status failed: {:?}", res);
-                }
+            if let Ok(res) = status_out
+                && !res.status.success()
+            {
+                eprintln!("Status failed: {:?}", res);
             }
             op += 1;
             thread::sleep(Duration::from_millis(5));
@@ -155,10 +155,10 @@ fn test_mixed_concurrency_stress_mixed_operations() {
         let mut op = 0;
         while !stop.load(Ordering::Relaxed) && op < 2 {
             let rekey_out = agecrypt_cmd(r).args(["rekey", "-f"]).output();
-            if let Ok(res) = rekey_out {
-                if !res.status.success() {
-                    eprintln!("Rekey failed: {:?}", res);
-                }
+            if let Ok(res) = rekey_out
+                && !res.status.success()
+            {
+                eprintln!("Rekey failed: {:?}", res);
             }
             op += 1;
             thread::sleep(Duration::from_millis(50));

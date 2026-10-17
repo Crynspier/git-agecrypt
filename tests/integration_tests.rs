@@ -5755,15 +5755,15 @@ fn scan_dir_for_needle(dir: &Path, needle: &str) {
             let path = entry.path();
             if path.is_dir() {
                 scan_dir_for_needle(&path, needle);
-            } else if path.is_file() {
-                if let Ok(bytes) = fs::read(&path) {
-                    let text = String::from_utf8_lossy(&bytes);
-                    assert!(
-                        !text.contains(needle),
-                        "Plaintext canary found inside file {}",
-                        path.display()
-                    );
-                }
+            } else if path.is_file()
+                && let Ok(bytes) = fs::read(&path)
+            {
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(
+                    !text.contains(needle),
+                    "Plaintext canary found inside file {}",
+                    path.display()
+                );
             }
         }
     }

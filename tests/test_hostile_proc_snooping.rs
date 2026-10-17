@@ -70,9 +70,9 @@ fn test_run_fd_child_reads_secret_and_proc_snooping_denied() {
     // On Linux, verify that the child process is actually non-dumpable (PR_SET_DUMPABLE=0 applied)
     #[cfg(target_os = "linux")]
     {
-        // Spawn a child via run --fd and verify that the child's /proc fd directory
-        // is inaccessible. Modern Linux kernels no longer expose a Dumpable field
-        // in /proc/<pid>/status; the fd-directory permission is the observable
+        // Spawn a child via run --fd and verify that the child's process memory
+        // cannot be opened. Modern Linux kernels no longer expose a Dumpable field
+        // in /proc/<pid>/status; denying /proc/<pid>/mem is the direct observable
         // effect of PR_SET_DUMPABLE=0 that this test is intended to protect.
         let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("git-agecrypt"))
             .args(["run", "--fd", "--", "sh", "-c", "sleep 5"])
@@ -101,7 +101,13 @@ fn test_run_fd_child_reads_secret_and_proc_snooping_denied() {
                 let Some(ppid) = parts.get(3).and_then(|value| value.parse::<u32>().ok()) else {
                     continue;
                 };
-                if ppid == parent_pid && std::fs::read_dir(format!("/proc/{pid}/fd")).is_err() {
+                let mem_path = format!("/proc/{pid}/mem");
+                if ppid == parent_pid
+                    && std::fs::OpenOptions::new()
+                        .read(true)
+                        .open(mem_path)
+                        .is_err()
+                {
                     found_non_dumpable = true;
                     break;
                 }

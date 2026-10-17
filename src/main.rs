@@ -1878,27 +1878,24 @@ fn cmd_run(
         if let Ok(out) = git::git_cmd_with_path(&repo.root)
             .args(["ls-files"])
             .output()
+            && out.status.success()
         {
-            if out.status.success() {
-                let text = String::from_utf8_lossy(&out.stdout);
-                for line in text.lines() {
-                    let rel = line.trim();
-                    if rel.is_empty() {
-                        continue;
-                    }
-                    let lower = rel.to_lowercase();
-                    if (lower.ends_with(".env")
-                        || lower.contains(".env.")
-                        || lower.ends_with(".secret.env"))
-                        && repo.is_file_tracked_for_ring(rel, ring_opt)
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                let rel = line.trim();
+                if rel.is_empty() {
+                    continue;
+                }
+                let lower = rel.to_lowercase();
+                if (lower.ends_with(".env")
+                    || lower.contains(".env.")
+                    || lower.ends_with(".secret.env"))
+                    && repo.is_file_tracked_for_ring(rel, ring_opt)
+                {
+                    let candidate = repo.root.join(rel);
+                    if candidate.exists() && candidate.is_file() && !env_files.contains(&candidate)
                     {
-                        let candidate = repo.root.join(rel);
-                        if candidate.exists()
-                            && candidate.is_file()
-                            && !env_files.contains(&candidate)
-                        {
-                            env_files.push(candidate);
-                        }
+                        env_files.push(candidate);
                     }
                 }
             }
@@ -1972,21 +1969,18 @@ fn cmd_run(
                                 identities.extend(ids);
                             }
                         }
-                        if !identities.is_empty() {
-                            if let Ok(entries) = fs::read_dir(&keys_dir) {
-                                for entry in entries.flatten() {
-                                    let key_path = entry.path();
-                                    if key_path.extension().and_then(|s| s.to_str()) == Some("age")
-                                    {
-                                        if let Ok(content) = fs::read_to_string(&key_path) {
-                                            if let Ok(key) =
-                                                crypto::unwrap_master_key(&content, &identities)
-                                            {
-                                                master_key_opt = Some(key);
-                                                break;
-                                            }
-                                        }
-                                    }
+                        if !identities.is_empty()
+                            && let Ok(entries) = fs::read_dir(&keys_dir)
+                        {
+                            for entry in entries.flatten() {
+                                let key_path = entry.path();
+                                if key_path.extension().and_then(|s| s.to_str()) == Some("age")
+                                    && let Ok(content) = fs::read_to_string(&key_path)
+                                    && let Ok(key) =
+                                        crypto::unwrap_master_key(&content, &identities)
+                                {
+                                    master_key_opt = Some(key);
+                                    break;
                                 }
                             }
                         }

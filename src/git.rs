@@ -79,21 +79,21 @@ pub fn crash_point(point_name: &'static str) {
     {
         return;
     }
-    if let Ok(target) = std::env::var("GIT_AGECRYPT_CRASH_POINT") {
-        if target == point_name {
-            #[cfg(unix)]
-            unsafe {
-                libc::raise(libc::SIGKILL);
+    if let Ok(target) = std::env::var("GIT_AGECRYPT_CRASH_POINT")
+        && target == point_name
+    {
+        #[cfg(unix)]
+        unsafe {
+            libc::raise(libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        unsafe {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetCurrentProcess() -> isize;
+                fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
             }
-            #[cfg(windows)]
-            unsafe {
-                #[link(name = "kernel32")]
-                unsafe extern "system" {
-                    fn GetCurrentProcess() -> isize;
-                    fn TerminateProcess(hProcess: isize, uExitCode: u32) -> i32;
-                }
-                TerminateProcess(GetCurrentProcess(), 137);
-            }
+            TerminateProcess(GetCurrentProcess(), 137);
         }
     }
 }
@@ -266,13 +266,13 @@ pub fn sync_dir(path: &Path) -> Result<()> {
 /// Ensures that a sensitive path is not a symlink, directory junction, or reparse point.
 /// This prevents symlink redirection attacks where an adversary swaps metadata or key paths.
 pub fn ensure_not_symlink_or_reparse(path: &Path) -> Result<()> {
-    if let Ok(meta) = path.symlink_metadata() {
-        if meta.file_type().is_symlink() {
-            return Err(anyhow!(
-                "Security violation: path '{}' is a symlink or reparse point, which is strictly prohibited for security-critical repository metadata",
-                path.display()
-            ));
-        }
+    if let Ok(meta) = path.symlink_metadata()
+        && meta.file_type().is_symlink()
+    {
+        return Err(anyhow!(
+            "Security violation: path '{}' is a symlink or reparse point, which is strictly prohibited for security-critical repository metadata",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -578,18 +578,18 @@ impl GitRepo {
     /// Purges cached ciphertexts for a specific ring, failing closed if transactional wipe is requested.
     pub fn clear_cache_for_ring(&self, ring: Option<&str>, transactional: bool) -> Result<()> {
         let base_cache = self.local_state_dir_for_ring(ring).join("cache");
-        if base_cache.exists() {
-            if let Err(e) = fs::remove_dir_all(&base_cache) {
-                if transactional {
-                    return Err(e).with_context(|| {
-                        format!(
-                            "Failed to transactionally wipe cache directory {}",
-                            base_cache.display()
-                        )
-                    });
-                } else {
-                    eprintln!("git-agecrypt [WARN]: Non-fatal cache eviction error: {e}");
-                }
+        if base_cache.exists()
+            && let Err(e) = fs::remove_dir_all(&base_cache)
+        {
+            if transactional {
+                return Err(e).with_context(|| {
+                    format!(
+                        "Failed to transactionally wipe cache directory {}",
+                        base_cache.display()
+                    )
+                });
+            } else {
+                eprintln!("git-agecrypt [WARN]: Non-fatal cache eviction error: {e}");
             }
         }
         Ok(())
@@ -627,16 +627,16 @@ impl GitRepo {
             rings.push("default".to_string());
         }
         let rings_dir = self.agecrypt_metadata_dir().join("rings");
-        if rings_dir.exists() {
-            if let Ok(entries) = fs::read_dir(rings_dir) {
-                for entry in entries.flatten() {
-                    if let Ok(file_type) = entry.file_type() {
-                        if file_type.is_dir() {
-                            let name = entry.file_name().to_string_lossy().to_string();
-                            if !name.starts_with('.') && !rings.contains(&name) {
-                                rings.push(name);
-                            }
-                        }
+        if rings_dir.exists()
+            && let Ok(entries) = fs::read_dir(rings_dir)
+        {
+            for entry in entries.flatten() {
+                if let Ok(file_type) = entry.file_type()
+                    && file_type.is_dir()
+                {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if !name.starts_with('.') && !rings.contains(&name) {
+                        rings.push(name);
                     }
                 }
             }
@@ -1816,10 +1816,11 @@ impl GitRepo {
             if actual == "agecrypt" {
                 return true;
             }
-            if let Some(ring_suffix) = actual.strip_prefix("agecrypt-") {
-                if !ring_suffix.is_empty() && validate_ring_name(ring_suffix).is_ok() {
-                    return true;
-                }
+            if let Some(ring_suffix) = actual.strip_prefix("agecrypt-")
+                && !ring_suffix.is_empty()
+                && validate_ring_name(ring_suffix).is_ok()
+            {
+                return true;
             }
         }
         // Fallback: check default ring patterns
@@ -2142,12 +2143,11 @@ impl GitRepo {
 
                         match age::Decryptor::new(&header[..]) {
                             Ok(decryptor) => {
-                                if let Some(ref id) = file_master_id {
-                                    if let Err(age::DecryptError::NoMatchingKeys) =
+                                if let Some(ref id) = file_master_id
+                                    && let Err(age::DecryptError::NoMatchingKeys) =
                                         decryptor.decrypt(std::iter::once(id as &dyn age::Identity))
-                                    {
-                                        foreign_key_files.push(path_str);
-                                    }
+                                {
+                                    foreign_key_files.push(path_str);
                                 }
                             }
                             Err(err) => {

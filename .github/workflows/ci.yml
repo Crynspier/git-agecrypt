@@ -106,6 +106,9 @@ jobs:
         run: cargo build --workspace --locked --release --target ${{ matrix.target }}
       - name: Run platform smoke tests
         run: cargo test --workspace --locked --target ${{ matrix.target }} --lib --bins
+      - name: Run native macOS integration tests
+        if: startsWith(matrix.os, 'macos-')
+        run: cargo test --workspace --locked --target ${{ matrix.target }} --tests
 
   supply-chain:
     name: Supply Chain Audit (cargo-deny)

@@ -3,6 +3,7 @@ mod common;
 use common::*;
 use std::fs;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -21,9 +22,6 @@ fn test_mixed_concurrency_stress_mixed_operations() {
     init_repo(repo);
 
     let (user_sec, user_pub) = generate_test_identity();
-    let key_dir = tempdir().expect("Failed to create keydir");
-    let id_file = key_dir.path().join("master.key");
-    fs::write(&id_file, &user_sec).unwrap();
 
     agecrypt_cmd(repo).arg("init").assert().success();
     agecrypt_cmd(repo)
@@ -51,6 +49,7 @@ fn test_mixed_concurrency_stress_mixed_operations() {
     run_git(repo, &["commit", "-m", "Commit initial concurrent secrets"]);
 
     let stop_flag = Arc::new(AtomicBool::new(false));
+    let failures: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let mut handles = Vec::new();
 
     // Thread 1-2: clean filter (encryption)
@@ -85,14 +84,20 @@ fn test_mixed_concurrency_stress_mixed_operations() {
     for thread_idx in 2..4 {
         let repo_clone = Arc::clone(&repo_arc);
         let stop = Arc::clone(&stop_flag);
+        let failures_clone = Arc::clone(&failures);
         let handle = thread::spawn(move || {
             let r = repo_clone.as_path();
             let mut op = 0;
             while !stop.load(Ordering::Relaxed) && op < 10 {
                 let file_name = format!("file_{}.secret.env", op % 5);
                 let out = git_out_res(r, &["checkout", "HEAD", "--", &file_name]);
-                if let Err(e) = out {
-                    eprintln!("Thread {thread_idx} checkout failed: {e}");
+                if let Err(e) = out
+                    && !e.contains("index.lock")
+                {
+                    failures_clone
+                        .lock()
+                        .unwrap()
+                        .push(format!("checkout thread {thread_idx} op {op}: {e}"));
                 }
                 op += 1;
                 thread::sleep(Duration::from_millis(10));
@@ -104,6 +109,8 @@ fn test_mixed_concurrency_stress_mixed_operations() {
     // Thread 5: lock/unlock cycles
     let repo_clone = Arc::clone(&repo_arc);
     let stop = Arc::clone(&stop_flag);
+    let failures_clone = Arc::clone(&failures);
+    let unlock_identity = user_sec.clone();
     let handle = thread::spawn(move || {
         let r = repo_clone.as_path();
         let mut op = 0;
@@ -114,12 +121,18 @@ fn test_mixed_concurrency_stress_mixed_operations() {
             {
                 let unlock_out = agecrypt_assert_cmd(r)
                     .args(["unlock", "-"])
-                    .write_stdin(id_file.to_str().unwrap().as_bytes())
+                    .write_stdin(unlock_identity.as_bytes())
                     .output();
-                if let Ok(unlock_res) = unlock_out
-                    && !unlock_res.status.success()
-                {
-                    eprintln!("Unlock failed after lock: {:?}", unlock_res);
+                match unlock_out {
+                    Ok(unlock_res) if unlock_res.status.success() => {}
+                    Ok(unlock_res) => failures_clone
+                        .lock()
+                        .unwrap()
+                        .push(format!("unlock after lock op {op}: {:?}", unlock_res)),
+                    Err(e) => failures_clone
+                        .lock()
+                        .unwrap()
+                        .push(format!("unlock after lock op {op}: {e}")),
                 }
             }
             op += 1;
@@ -131,15 +144,21 @@ fn test_mixed_concurrency_stress_mixed_operations() {
     // Thread 6: status checks (read-only)
     let repo_clone = Arc::clone(&repo_arc);
     let stop = Arc::clone(&stop_flag);
+    let failures_clone = Arc::clone(&failures);
     let handle = thread::spawn(move || {
         let r = repo_clone.as_path();
         let mut op = 0;
         while !stop.load(Ordering::Relaxed) && op < 30 {
-            let status_out = agecrypt_cmd(r).arg("status").output();
-            if let Ok(res) = status_out
-                && !res.status.success()
-            {
-                eprintln!("Status failed: {:?}", res);
+            match agecrypt_cmd(r).arg("status").output() {
+                Ok(res) if res.status.success() => {}
+                Ok(res) => failures_clone
+                    .lock()
+                    .unwrap()
+                    .push(format!("status op {op}: {:?}", res)),
+                Err(e) => failures_clone
+                    .lock()
+                    .unwrap()
+                    .push(format!("status op {op}: {e}")),
             }
             op += 1;
             thread::sleep(Duration::from_millis(5));
@@ -150,15 +169,24 @@ fn test_mixed_concurrency_stress_mixed_operations() {
     // Thread 7: rekey (state-changing, should be rare)
     let repo_clone = Arc::clone(&repo_arc);
     let stop = Arc::clone(&stop_flag);
+    let failures_clone = Arc::clone(&failures);
     let handle = thread::spawn(move || {
         let r = repo_clone.as_path();
         let mut op = 0;
         while !stop.load(Ordering::Relaxed) && op < 2 {
-            let rekey_out = agecrypt_cmd(r).args(["rekey", "-f"]).output();
-            if let Ok(res) = rekey_out
-                && !res.status.success()
-            {
-                eprintln!("Rekey failed: {:?}", res);
+            match agecrypt_cmd(r).args(["rekey", "-f"]).output() {
+                Ok(res)
+                    if res.status.success()
+                        || String::from_utf8_lossy(&res.stderr)
+                            .contains("existing key was preserved") => {}
+                Ok(res) => failures_clone
+                    .lock()
+                    .unwrap()
+                    .push(format!("rekey op {op}: {:?}", res)),
+                Err(e) => failures_clone
+                    .lock()
+                    .unwrap()
+                    .push(format!("rekey op {op}: {e}")),
             }
             op += 1;
             thread::sleep(Duration::from_millis(50));
@@ -174,26 +202,38 @@ fn test_mixed_concurrency_stress_mixed_operations() {
         h.join().expect("Thread panicked during concurrent stress");
     }
 
-    // Final verification: repository must be healthy
-    let status_out = agecrypt_cmd(repo).arg("status").output().unwrap();
+    let failures = failures.lock().unwrap();
     assert!(
-        status_out.status.success(),
-        "Repository must be healthy after concurrent stress: {:?}",
-        status_out
+        failures.is_empty(),
+        "Concurrent workers reported failures: {failures:?}"
     );
 
-    // Verify all files are in a consistent state (either plaintext or ciphertext, not corrupted)
+    // Final verification: recover the exact expected plaintext after all workers join.
+    let recovery_dir = tempdir().expect("Failed to create recovery key directory");
+    let recovery_key = recovery_dir.path().join("recovery.key");
+    fs::write(&recovery_key, &user_sec).unwrap();
+    agecrypt_cmd(repo)
+        .args(["unlock", recovery_key.to_str().unwrap()])
+        .assert()
+        .success();
+    agecrypt_cmd(repo).arg("status").assert().success();
+    agecrypt_cmd(repo).args(["lock", "-f"]).assert().success();
+    agecrypt_cmd(repo)
+        .args(["unlock", recovery_key.to_str().unwrap()])
+        .assert()
+        .success();
+
+    // Every file must be exact plaintext or a complete age ciphertext. A
+    // historical generation may intentionally remain ciphertext until rewrap;
+    // arbitrary UTF-8/binary partial output is never accepted.
     for i in 0..5 {
         let file_path = repo.join(format!("file_{i}.secret.env"));
-        if file_path.exists() {
-            let content = fs::read(&file_path).unwrap();
-            let is_ciphertext = content.starts_with(b"age-encryption.org/v1\n");
-            let is_plaintext = std::str::from_utf8(&content).is_ok();
-            assert!(
-                is_ciphertext || is_plaintext,
-                "File {} must be either ciphertext or plaintext, not corrupted",
-                file_path.display()
-            );
-        }
+        let expected = format!("FILE_{i}_SECRET=concurrent_val_{i}\n");
+        let content = fs::read(&file_path).unwrap();
+        assert!(
+            content == expected.as_bytes() || content.starts_with(b"age-encryption.org/v1\n"),
+            "Concurrent stress produced partial or invalid state for {}",
+            file_path.display()
+        );
     }
 }

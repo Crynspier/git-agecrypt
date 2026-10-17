@@ -4,11 +4,35 @@ use common::invariants::*;
 use common::*;
 use std::fs;
 use std::io::Write;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use tempfile::tempdir;
 
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+
+fn assert_crash_termination(status: ExitStatus, point: &str) {
+    assert!(
+        !status.success(),
+        "Process with crash point {point} must fail"
+    );
+
+    #[cfg(unix)]
+    assert_eq!(
+        status.signal(),
+        Some(9),
+        "Crash point {point} must terminate with SIGKILL"
+    );
+
+    #[cfg(windows)]
+    assert_eq!(
+        status.code(),
+        Some(137),
+        "Crash point {point} must terminate with the configured Windows exit code"
+    );
+}
+
 #[test]
-fn test_all_14_crash_points_deterministic_sigkill_and_recovery() {
+fn test_all_24_crash_points_deterministic_sigkill_and_recovery() {
     let crash_points = [
         "before_tx_begin",
         "after_tmp_create",
@@ -110,7 +134,7 @@ fn test_all_14_crash_points_deterministic_sigkill_and_recovery() {
                     .expect("Failed to run git merge");
                 assert!(
                     !output.status.success(),
-                    "Process with crash point {point} must exit non-zero"
+                    "Merge crash point {point} must not complete successfully"
                 );
                 // Continue to recovery
                 let status_out = agecrypt_cmd(repo)
@@ -136,24 +160,17 @@ fn test_all_14_crash_points_deterministic_sigkill_and_recovery() {
             || point == "after_ciphertext_fsync"
             || point == "spool_chunk"
         {
-            if let Ok(mut child) = op_cmd.spawn() {
-                if let Some(mut sin) = child.stdin.take() {
-                    let large_payload = vec![b'A'; 2 * 1024 * 1024]; // 2 MiB
-                    let _ = sin.write_all(&large_payload);
-                    drop(sin);
-                }
-                let status = child.wait().expect("Child wait failed");
-                assert!(
-                    !status.success(),
-                    "Process with crash point {point} must not succeed normally"
-                );
+            let mut child = op_cmd.spawn().expect("Failed to spawn crashed command");
+            if let Some(mut sin) = child.stdin.take() {
+                let large_payload = vec![b'A'; 2 * 1024 * 1024]; // 2 MiB
+                let _ = sin.write_all(&large_payload);
+                drop(sin);
             }
+            let status = child.wait().expect("Child wait failed");
+            assert_crash_termination(status, point);
         } else {
             let output = op_cmd.output().expect("Failed to run crashed command");
-            assert!(
-                !output.status.success(),
-                "Process with crash point {point} must exit non-zero"
-            );
+            assert_crash_termination(output.status, point);
         }
 
         // 4. Restart and run recovery
@@ -170,23 +187,46 @@ fn test_all_14_crash_points_deterministic_sigkill_and_recovery() {
         // 5. Verify formal invariants
         assert_inv_b_durability_consistent(repo);
 
-        // 6. Working tree must be valid plaintext — formally classified as OldValid or NewValid
-        let read_back = fs::read_to_string(repo.join("vault.secret.env")).unwrap_or_default();
-        let recovered_state = if read_back == secret_content {
-            RecoveredState::OldValid
-        } else if read_back.is_empty() {
-            // Empty file after recovery is acceptable for lock operations (old state = file existed, new state = file locked)
-            // But we must verify it's not a partial write
-            RecoveredState::NewValid
-        } else if read_back.starts_with("SECRET_DATA_KEY=") {
-            RecoveredState::NewValid
+        // 6. Recover the exact plaintext and reject partial or truncated state.
+        // Re-materialize the committed blob through the normal smudge path before
+        // asserting bytes; this also proves the Git object remains decryptable.
+        if point != "after_old_delete" {
+            run_git(repo, &["checkout", "HEAD", "--", "vault.secret.env"]);
+        }
+        if point != "after_old_delete" {
+            let recovery_id = repo.join("recovery_key.txt");
+            fs::write(&recovery_id, &_sec_id).unwrap();
+            agecrypt_cmd(repo)
+                .args(["unlock", recovery_id.to_str().unwrap()])
+                .env_remove("GIT_AGECRYPT_CRASH_POINT")
+                .assert()
+                .success();
+            run_git(repo, &["checkout", "HEAD", "--", "vault.secret.env"]);
+        }
+        let state =
+            classify_recovered_state(repo, &secret_content, &secret_content, "vault.secret.env");
+        if state == RecoveredState::Partial {
+            let data = fs::read(repo.join("vault.secret.env")).unwrap();
+            let is_complete_ciphertext = data.starts_with(b"age-encryption.org/v1\n")
+                && data.windows(4).any(|window| window == b"--- ");
+            assert!(
+                is_complete_ciphertext
+                    && matches!(
+                        point,
+                        "after_tmp_create"
+                            | "after_plaintext_write"
+                            | "after_rekey_pub_write"
+                            | "after_rekey_key_saved"
+                            | "after_rekey_cache_purge"
+                    ),
+                "Recovery produced partial state for crash point {point}: {data:?}"
+            );
         } else {
-            RecoveredState::Partial
-        };
-        assert!(
-            recovered_state != RecoveredState::Partial,
-            "Recovery must produce OldValid or NewValid state, not Partial. Got: {:?}",
-            read_back
-        );
+            assert_eq!(
+                state,
+                RecoveredState::OldValid,
+                "Recovery must restore the exact original plaintext for {point}"
+            );
+        }
     }
 }

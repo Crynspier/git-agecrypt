@@ -70,8 +70,10 @@ fn test_run_fd_child_reads_secret_and_proc_snooping_denied() {
     // On Linux, verify that the child process is actually non-dumpable (PR_SET_DUMPABLE=0 applied)
     #[cfg(target_os = "linux")]
     {
-        use std::io::Read as _;
-        // Spawn a child via run --fd and check /proc/<pid>/status for Dumpable flag
+        // Spawn a child via run --fd and verify that the child's /proc fd directory
+        // is inaccessible. Modern Linux kernels no longer expose a Dumpable field
+        // in /proc/<pid>/status; the fd-directory permission is the observable
+        // effect of PR_SET_DUMPABLE=0 that this test is intended to protect.
         let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("git-agecrypt"))
             .args(["run", "--fd", "--", "sh", "-c", "sleep 5"])
             .current_dir(repo)
@@ -81,41 +83,27 @@ fn test_run_fd_child_reads_secret_and_proc_snooping_denied() {
             .spawn()
             .expect("Failed to spawn run --fd child");
 
-        // Give the child a moment to start
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        // Find the grandchild shell process (the actual child of git-agecrypt)
-        // Check the git-agecrypt child's children via /proc
         let parent_pid = child.id();
         let mut found_non_dumpable = false;
         if let Ok(entries) = std::fs::read_dir("/proc") {
             for entry in entries.flatten() {
                 let pid_str = entry.file_name().to_string_lossy().to_string();
-                if let Ok(pid) = pid_str.parse::<u32>() {
-                    let stat_path = format!("/proc/{}/stat", pid);
-                    if let Ok(stat) = std::fs::read_to_string(&stat_path) {
-                        // ppid is field 4 in /proc/<pid>/stat
-                        let parts: Vec<&str> = stat.split_whitespace().collect();
-                        if parts.len() > 3 {
-                            if let Ok(ppid) = parts[3].parse::<u32>() {
-                                if ppid == parent_pid {
-                                    // Found the child process; check its dumpable flag
-                                    let status_path = format!("/proc/{}/status", pid);
-                                    if let Ok(status) = std::fs::read_to_string(&status_path) {
-                                        for line in status.lines() {
-                                            if line.starts_with("Dumpable:") {
-                                                let val =
-                                                    line.trim_start_matches("Dumpable:").trim();
-                                                if val == "0" {
-                                                    found_non_dumpable = true;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                let Ok(pid) = pid_str.parse::<u32>() else {
+                    continue;
+                };
+                let stat_path = format!("/proc/{pid}/stat");
+                let Ok(stat) = std::fs::read_to_string(stat_path) else {
+                    continue;
+                };
+                let parts: Vec<&str> = stat.split_whitespace().collect();
+                let Some(ppid) = parts.get(3).and_then(|value| value.parse::<u32>().ok()) else {
+                    continue;
+                };
+                if ppid == parent_pid && std::fs::read_dir(format!("/proc/{pid}/fd")).is_err() {
+                    found_non_dumpable = true;
+                    break;
                 }
             }
         }

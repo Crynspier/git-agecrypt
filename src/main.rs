@@ -1797,8 +1797,10 @@ fn pass_via_memfd(
             if flags >= 0 {
                 let _ = libc::fcntl(raw_fd_val, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
             }
-            // Block unprivileged same-UID /proc/<pid>/fd inspection and ptrace attachment
-            let _ = libc::prctl(libc::PR_SET_DUMPABLE, 0);
+            // Block unprivileged same-UID /proc/<pid>/fd inspection and ptrace attachment.
+            if libc::prctl(libc::PR_SET_DUMPABLE, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }

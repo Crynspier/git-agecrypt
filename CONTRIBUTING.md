@@ -4,7 +4,7 @@ Thank you for your interest in improving `git-agecrypt`!
 
 ## Development Setup
 
-`git-agecrypt` requires Rust 1.85.0 or later (Rust 2024 edition):
+`git-agecrypt` requires Rust 1.88.0 or later (Rust 2024 edition):
 
 ```bash
 # Clone the repository

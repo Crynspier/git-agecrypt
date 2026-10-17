@@ -4,7 +4,7 @@ Transparent client-side Git encryption using [age](https://age-encryption.org/v1
 
 [![CI](https://github.com/Crynspier/git-agecrypt/actions/workflows/ci.yml/badge.svg)](https://github.com/Crynspier/git-agecrypt/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
-[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
 ---
 
@@ -114,7 +114,7 @@ Extract the binary and place it in your system `PATH` (e.g. `/usr/local/bin` on 
 
 ### Building From Source
 
-Requires Rust 1.85 or later (Rust 2024 edition):
+Requires Rust 1.88 or later (Rust 2024 edition):
 
 ```bash
 git clone https://github.com/Crynspier/git-agecrypt.git
@@ -449,7 +449,7 @@ Comprehensive specifications and architecture guides are available in the [`docs
 
 ## Minimum Supported Versions
 
-- **Rust:** 1.85.0+ (Rust 2024 edition)
+- **Rust:** 1.88.0+ (Rust 2024 edition)
 - **Git:** 2.25.0+ (recommended for `--pathspec-from-file` and `-z` null-delimited plumbing)
 
 ---

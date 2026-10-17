@@ -201,6 +201,13 @@ pub enum Commands {
         identity: Option<String>,
     },
 
+    /// Internal Linux process-dumpability probe used by security tests
+    #[command(name = "__test-dumpable", hide = true)]
+    TestDumpable {
+        /// File to receive the PR_GET_DUMPABLE result
+        output: PathBuf,
+    },
+
     /// Execute a command with decrypted secrets injected into the process environment
     Run {
         /// Specific secret env file to load (defaults to all tracked .env / *.secret.env files)

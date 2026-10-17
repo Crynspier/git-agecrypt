@@ -175,6 +175,7 @@ fn run(cli: Cli) -> Result<()> {
             ring.as_deref(),
         ),
         Commands::MigrateFromGitCrypt { identity } => cmd_migrate(identity.as_deref()),
+        Commands::TestDumpable { output } => cmd_test_dumpable(&output),
         Commands::Run {
             env_file,
             ring,
@@ -1731,6 +1732,25 @@ fn cmd_migrate(identity: Option<&str>) -> Result<()> {
     eprintln!("  git commit -m 'Migrate secrets encryption from git-crypt to git-agecrypt'");
 
     Ok(())
+}
+
+fn cmd_test_dumpable(output: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let dumpable = unsafe { libc::prctl(libc::PR_GET_DUMPABLE) };
+        if dumpable < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("Failed to query process dumpability");
+        }
+        fs::write(output, format!("{dumpable}\\n"))?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = output;
+        Err(anyhow!("dumpability probe is only supported on Linux"))
+    }
 }
 
 fn hex_digest(bytes: &[u8]) -> String {

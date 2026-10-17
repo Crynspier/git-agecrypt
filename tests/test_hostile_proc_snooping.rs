@@ -70,47 +70,28 @@ fn test_run_fd_child_reads_secret_and_proc_snooping_denied() {
     // On Linux, verify that the child process is actually non-dumpable (PR_SET_DUMPABLE=0 applied)
     #[cfg(target_os = "linux")]
     {
-        // Spawn a child via run --fd and verify that the child's process memory
-        // cannot be opened. Modern Linux kernels no longer expose a Dumpable field
-        // in /proc/<pid>/status; denying /proc/<pid>/mem is the direct observable
-        // effect of PR_SET_DUMPABLE=0 that this test is intended to protect.
-        let pid_file = repo.join("run-fd-child.pid");
-        let child_script = "echo $$ > \"$GIT_AGECRYPT_TEST_PID_FILE\"; sleep 5";
-        let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("git-agecrypt"))
-            .args(["run", "--fd", "--", "sh", "-c", child_script])
+        // Execute the same binary after run --fd sets dumpability in pre_exec.
+        // The child directly queries PR_GET_DUMPABLE, avoiding /proc behavior
+        // that differs with kernel versions and runner privileges.
+        let probe_file = repo.join("run-fd-dumpable.txt");
+        let binary = assert_cmd::cargo::cargo_bin("git-agecrypt");
+        let mut child = std::process::Command::new(&binary)
+            .args(["run", "--fd", "--"])
+            .arg(&binary)
+            .arg("__test-dumpable")
+            .arg(&probe_file)
             .current_dir(repo)
             .env("PATH", prepend_to_path(&bin_dir()))
-            .env("GIT_AGECRYPT_TEST_PID_FILE", &pid_file)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("Failed to spawn run --fd child");
 
-        let child_pid = (0..20).find_map(|_| {
-            std::fs::read_to_string(&pid_file)
-                .ok()
-                .and_then(|pid| pid.trim().parse::<u32>().ok())
-                .or_else(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    None
-                })
-        });
-        // Opening /proc/<pid>/mem can succeed before the kernel performs the
-        // ptrace access check. Force an actual read so this tests the protected
-        // operation rather than just the open syscall.
-        let found_non_dumpable = child_pid.is_some_and(|pid| {
-            let Ok(mut mem) = std::fs::OpenOptions::new()
-                .read(true)
-                .open(format!("/proc/{pid}/mem"))
-            else {
-                return true;
-            };
-            let mut byte = [0_u8; 1];
-            std::io::Read::read(&mut mem, &mut byte).is_err()
-        });
-
-        let _ = child.kill();
-        let _ = child.wait();
+        let status = child.wait().expect("Failed to wait for run --fd child");
+        let found_non_dumpable = status.success()
+            && std::fs::read_to_string(&probe_file)
+                .map(|value| value.trim() == "0")
+                .unwrap_or(false);
 
         assert!(
             found_non_dumpable,

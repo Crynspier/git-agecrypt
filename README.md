@@ -133,10 +133,10 @@ Verify installation:
 
 ```bash
 git-agecrypt --version
-# git-agecrypt 0.5.0
+# git-agecrypt 0.6.0
 ```
 
-The v0.5.0 release provides all four mandatory targets: Linux x86_64, macOS x86_64 (Intel), macOS arm64 (Apple Silicon), and Windows x86_64. Each archive has a matching `.sha256` checksum file; verify it before placing the binary in `PATH`:
+The release package set is limited to four targets: Linux x86_64, macOS x86_64 (Intel), macOS arm64 (Apple Silicon), and Windows x86_64. Published archives include a matching `.sha256` checksum file; verify a downloaded archive before placing the binary in `PATH`:
 
 ```bash
 # Linux/macOS
@@ -439,11 +439,11 @@ Comprehensive specifications and architecture guides are available in the [`docs
 - **[Internal Architecture & Driver Mechanics](docs/internals.md):**
   In-depth breakdown of the Git filter lifecycle (`clean`, `smudge`, `textconv`, `merge`), two-tier spooling architecture (RAM < 1 MiB with `zeroize`, disk >= 1 MiB inside `.git/git-agecrypt/spool/`), scoped ring grammar validation, stage-0 index deduplication, cache validation, and the 3-way semantic merge driver conflict algorithms.
 
-- **[High-Assurance Verification & Invariant Matrix](docs/verification-matrix.md):**
-  Exhaustive traceability matrix mapping all 27 critique requirements (generative state machine, multi-ring combinatorial DAG, kill points, forensic canary sweeps, Linux prctl lockdown, symlink/case-collision defense) and formal Invariants A–F to automated test suites.
+- **[Verification & Invariant Matrix](docs/verification-matrix.md):**
+  Traceability matrix mapping the implemented verification suites (generative state machine, multi-ring combinatorial DAG, kill points, forensic canary sweeps, Linux prctl lockdown, symlink/case-collision defense) and documented invariants to automated test suites, with explicit platform and coverage limits.
 
 - **[Specification & Security Guarantees](docs/spec-guarantees.md):**
-  Explicit cryptographic, durability, cache, process-isolation, hardware-token, and v0.5.0 verification boundaries.
+  Explicit cryptographic, durability, cache, process-isolation, hardware-token, and v0.6.0 verification boundaries.
 
 ---
 

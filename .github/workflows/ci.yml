@@ -58,7 +58,7 @@ jobs:
           git config --global user.email "ci@example.com"
       - name: Run tests
         run: cargo test --workspace --locked --verbose
-      # Benchmarks are compiled here but executed only in weekly-deep (M8).
+      # Benchmarks are compiled here; performance runs are opt-in locally.
       - name: Compile benchmarks
         run: cargo bench --no-run --locked
 

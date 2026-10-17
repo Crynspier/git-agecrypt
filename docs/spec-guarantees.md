@@ -27,12 +27,12 @@ When a collaborator is removed from an encryption ring via `git-agecrypt remove-
 
 ## 2. In-Flight Durability & Crash Consistency (WAL)
 
-`git-agecrypt` guarantees **crash consistency** under arbitrary process termination (`SIGKILL`, power failure, hardware faults):
+`git-agecrypt` is designed to provide crash consistency when a process terminates unexpectedly. The automated suites cover process termination and selected fault-injection cases; physical power-loss behavior remains filesystem- and host-specific:
 
 - **Atomic Key Staging:** Master keys are staged via `repo.key.tmp.<pid>` with `fsync()`, directory sync, and atomic rename.
 - **Write-Ahead Log (WAL):** The locking transaction records all staged secret targets in `lock.journal` with `sync_all()` before modifying the key store.
 - **Self-Healing Recovery:** Any subsequent invocation (`status`, `lock`, `unlock`, etc.) triggers `recover_interrupted_transaction()`. The repository deterministically recovers either the **Old Valid State** or the **New Valid State**.
-- **No Corrupted Half-States:** Secret files are never left in a partially decrypted or corrupted state.
+- **No Silent Half-States:** Recovery rejects incomplete or inconsistent metadata instead of treating it as successful state. The guarantees depend on the filesystem primitives available on the host.
 
 ---
 
@@ -48,9 +48,9 @@ When a collaborator is removed from an encryption ring via `git-agecrypt remove-
 
 ## 4. `run --fd` Process Isolation Boundary
 
-When executing commands via `git-agecrypt run -- <cmd>`:
+When executing commands via `git-agecrypt run --fd -- <cmd>`:
 
-- **Zero Disk Exposure:** Decrypted secrets are never written to disk, swap, or temporary files.
+- **No Application Temporary-File Exposure:** The `--fd` path does not intentionally write decrypted secrets to application temporary files. The operating system may still page or capture process memory; that is outside this tool's guarantee.
 - **Zero Environment Leakage:** Secrets are not passed in `argv` or inherited environment variables where other local users might inspect them via `ps` or `/proc/<pid>/cmdline`.
 - **Memory Dumpable Lockdown:** On Linux, child processes have `libc::prctl(PR_SET_DUMPABLE, 0)` set in `pre_exec`, preventing sibling processes under the same UID from reading memory via `/proc/<pid>/mem` or attaching debuggers via `ptrace`.
 - **Descriptor Reclaim:** Secrets are delivered over anonymous file descriptors (or `memfd_create`) which are automatically reclaimed by the kernel upon child process termination.
@@ -64,9 +64,9 @@ When executing commands via `git-agecrypt run -- <cmd>`:
 
 ---
 
-## 6. v0.5.0 Verification Boundary
+## 6. v0.6.0 Verification Boundary
 
-The guarantees above are implementation claims, not a promise that every operating-system primitive is available everywhere. The v0.5.0 release evidence maps them as follows:
+The guarantees above are implementation claims, not a promise that every operating-system primitive is available everywhere. The v0.6.0 verification evidence maps them as follows:
 
 | Guarantee | Implementation evidence | Verification boundary |
 |---|---|---|

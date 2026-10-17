@@ -1,10 +1,10 @@
-﻿# High-Assurance Verification & Invariant Mapping Matrix (v0.5.0)
+﻿# Verification and Invariant Mapping Matrix (v0.6.0)
 
-This document provides the exhaustive, bi-directional verification matrix mapping every architectural invariant and critique item to its concrete implementation and automated test suites in `git-agecrypt`.
+This document maps the implemented verification suites and documented invariants to their source files. Entries describe test coverage; they do not claim exhaustive coverage of every operating-system or filesystem behavior.
 
 ---
 
-## 1. Critique Items Verification Matrix (v0.5.0)
+## 1. Critique Items Verification Matrix (v0.6.0)
 
 | # | Critique Domain | Architectural Implementation | Primary Automated Test Suite | Coverage Confidence |
 |---|---|---|---|---|
@@ -18,7 +18,7 @@ This document provides the exhaustive, bi-directional verification matrix mappin
 | **#8** | FD lifetime and process crash bounds | Child exit codes (0, 42), crash handling, early close, and descriptor cleanup | [`tests/test_fd_lifecycle_crash.rs`](../tests/test_fd_lifecycle_crash.rs) | Deterministic |
 | **#9** | On-demand coverage-guided fuzzing | Local/on-demand parser fuzzing using the repository fuzz targets | [`fuzz/fuzz_targets/`](../fuzz/fuzz_targets/) | On-demand |
 | **#10** | Permanent regression corpus | Byte-level regression corpus runner in standard CI | [`tests/regressions/`](../tests/regressions/), [`tests/test_regression_corpus.rs`](../tests/test_regression_corpus.rs) | Continuous |
-| **#11** | Power-loss & crash durability testing | Write → fsync → rename → crash → restart verification across 24 state boundaries, concurrency × crash injection, per-file torn-write audits (every file must be absent / complete-old / complete-new), and true block-layer power cuts via dm-flakey (Linux, root-gated) | [`tests/test_sigkill_crash_injection.rs`](../tests/test_sigkill_crash_injection.rs), [`tests/test_durability.rs`](../tests/test_durability.rs), [`tests/test_concurrency_crash_matrix.rs`](../tests/test_concurrency_crash_matrix.rs), [`tests/test_power_loss_durability.rs`](../tests/test_power_loss_durability.rs) | Generative + Hardware-level |
+| **#11** | Power-loss & crash durability testing | Write → fsync → rename → crash → restart verification across the implemented crash points, concurrency × crash injection, per-file torn-write audits (every audited file must be absent / complete-old / complete-new), and an optional dm-flakey block-layer experiment on Linux with root and device-mapper support | [`tests/test_sigkill_crash_injection.rs`](../tests/test_sigkill_crash_injection.rs), [`tests/test_durability.rs`](../tests/test_durability.rs), [`tests/test_concurrency_crash_matrix.rs`](../tests/test_concurrency_crash_matrix.rs), [`tests/test_power_loss_durability.rs`](../tests/test_power_loss_durability.rs) | Deterministic + environment-gated |
 | **#12** | Large-file interrupted streaming | 4 MiB stream killed in-flight with recursive forensic canary disk sweeps | [`tests/test_large_file_crash_spool.rs`](../tests/test_large_file_crash_spool.rs) | Deterministic |
 | **#13** | Strict 3-tier submodule hierarchy | Strict parent → child → grandchild hierarchy testing with assertion rigor | [`tests/test_strict_submodules_matrix.rs`](../tests/test_strict_submodules_matrix.rs) | Deterministic |
 | **#14** | Expanded 3-way merge matrix | 18-case merge matrix: non-overlapping, comments, quotes, JSON, conflict markers | [`tests/test_deep_merge_matrix_expanded.rs`](../tests/test_deep_merge_matrix_expanded.rs) | Deterministic |
@@ -32,7 +32,7 @@ This document provides the exhaustive, bi-directional verification matrix mappin
 | **#22** | Configurable random-run depth | Seedable PRNG (`GIT_AGECRYPT_SEED`) with configurable operation count (`GIT_AGECRYPT_OPS`) | [`tests/test_generative_shadow_state_machine.rs`](../tests/test_generative_shadow_state_machine.rs) | Generative |
 | **#23** | Documentation & specification tightening | Formal specification of security model, threat boundaries, and revocation guarantees | [`docs/spec-guarantees.md`](spec-guarantees.md) | Continuous |
 | **#24** | Dependency & unsafe hardening | Documented `unsafe` blocks for `openat`, `TerminateProcess`, and `prctl` | [`src/git.rs`](../src/git.rs), [`src/main.rs`](../src/main.rs) | Continuous |
-| **#25** | CI matrix & deep verification | Multi-OS testing matrix plus explicitly invoked deep verification workflow; fuzzing remains on-demand | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), [`.github/workflows/weekly-deep.yml`](../.github/workflows/weekly-deep.yml) | CI + on-demand |
+| **#25** | CI matrix and deep verification | Multi-OS build/test matrix; deeper generative, concurrency, durability, benchmark, and fuzz suites are explicitly invoked locally or by a release operator | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), [`tests/`](../tests/), [`fuzz/`](../fuzz/) | CI + on-demand |
 | **#26** | Concurrency × crash injection | Races state-changing operations against crash points, then recovers | [`tests/test_concurrency_crash_matrix.rs`](../tests/test_concurrency_crash_matrix.rs) | Generative |
 | **#27** | FD inheritance boundaries | Verifies secret FD availability across fork/exec boundaries | [`tests/test_run_fd_inheritance.rs`](../tests/test_run_fd_inheritance.rs) | Deterministic |
 
@@ -50,9 +50,9 @@ This document provides the exhaustive, bi-directional verification matrix mappin
 
 ---
 
-## 3. Post-Critique Hardening Additions
+## 3. Additional Verification Infrastructure
 
-The following infrastructure was added after the 27-item critique closure, extending the generative, adversarial, and durability suites:
+The repository includes the following generative, adversarial, and durability verification infrastructure:
 
 ### 3.1 Exact Replay + ddmin Failure-Shrinking (Generative State Machine)
 
@@ -60,7 +60,7 @@ The following infrastructure was added after the 27-item critique closure, exten
 - `test_replay_ops_log` re-executes a recorded log bit-for-bit when `GIT_AGECRYPT_REPLAY=<path>` is set — no RNG involved, fully deterministic.
 - `test_ddmin_shrink_real_failure` implements a classic ddmin algorithm: candidate subsequences of the failing ops log are executed in a fresh subprocess (`replay_subprocess_fails` oracle), shrinking the failure to a minimal reproducer written to `<log>.min`. Gated on `GIT_AGECRYPT_SHRINK`.
 - `test_ddmin_shrinker_selftest` validates the shrinker machinery itself using a synthetic ordered-subsequence failure trigger (`GIT_AGECRYPT_FAIL_IF_EXEC_SEQ`), proving ddmin eliminates unrelated noise ops.
-- CI: `replay-shrink-validation` job in `weekly-deep.yml` (generate → replay → shrinker self-test).
+- Replay and shrinking are available through the generative state-machine test's environment-controlled modes; they are run on demand.
 
 ### 3.2 age-plugin / Hardware-Token Failure Injection
 
@@ -73,11 +73,11 @@ The following infrastructure was added after the 27-item critique closure, exten
 - [`tests/test_power_loss_durability.rs`](../tests/test_power_loss_durability.rs):
   - `test_power_loss_torn_write_audit`: kills the CLI at 20 write-side crash points, then recursively audits every state file (public keys, armored `.age` identities, `repo.key`, tracked secrets) classifying each as absent / complete-old / complete-new — any torn (partial) file is a violation. Followed by a recovery status sweep and idempotent retry with exact-plaintext proof.
   - `test_dm_flakey_true_power_loss` (Linux + root + device-mapper only): builds a loop-backed dm-flakey device with ext4, crashes the CLI at `after_unwrap_key`, cuts power at the block layer (flakey error target), remounts, and verifies recovery. Skips cleanly on non-Linux / non-root.
-- CI: `power-loss-block-layer` job (ubuntu, sudo) + `cross-platform-crash-matrix` job (Windows/macOS torn-write audit + SIGKILL suite) in `weekly-deep.yml`.
+- The torn-write audit is cross-platform. The dm-flakey test is Linux/root-gated and must be run on a host that provides device-mapper support; the standard CI workflow does not claim to run it.
 
 ### 3.4 Benchmark Suite v2
 
 - [`benches/bench_main.rs`](../benches/bench_main.rs): crypto micro-benches (spool / clean / smudge at 1 KiB, 100 KiB, 1 MiB, 4 MiB) plus end-to-end CLI benches (clean, bulk clean ×20 files, lock, unlock, rekey, status) with per-benchmark sanity ceilings.
 - Machine-readable output via `GIT_AGECRYPT_BENCH_JSON=1` (optional `GIT_AGECRYPT_BENCH_OUT=<path>`); opt-in regression gate via `GIT_AGECRYPT_BENCH_CHECK=1` comparing against committed [`benches/baseline.json`](../benches/baseline.json) with 3× tolerance.
-- CI: `performance-benchmark` job in `weekly-deep.yml` runs the full matrix and uploads the JSON artifact.
+- Performance benchmarks are opt-in and produce local Criterion output; no benchmark result is treated as a release claim without a recorded run.
 

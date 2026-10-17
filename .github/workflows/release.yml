@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v0.5.0)'
+        description: 'Release tag (e.g. v0.6.0)'
         required: true
-        default: 'v0.5.0'
+        default: 'v0.6.0'
 
 # Least privilege by default; individual jobs elevate only where required.
 permissions:
@@ -41,8 +41,8 @@ jobs:
             exit 1
           fi
           EXPECTED="${RELEASE_TAG#v}"
-          if [ "$RELEASE_TAG" != "v0.5.0" ]; then
-            echo "Only the v0.5.0 release is permitted by this release workflow"
+          if [ "$RELEASE_TAG" != "v0.6.0" ]; then
+            echo "Only the v0.6.0 release is permitted by this release workflow"
             exit 1
           fi
           ACTUAL=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
@@ -122,14 +122,14 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           VERSION=$(target/${{ matrix.target }}/release/${{ matrix.binary_name }} --version)
-          test "$VERSION" = "git-agecrypt 0.5.0"
+          test "$VERSION" = "git-agecrypt 0.6.0"
           tar -tzf "${{ matrix.asset_name }}" | grep -Fx "${{ matrix.binary_name }}"
       - name: Smoke-test packaged binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $version = & "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" --version
-          if ($version -ne 'git-agecrypt 0.5.0') { throw "Unexpected version: $version" }
+          if ($version -ne 'git-agecrypt 0.6.0') { throw "Unexpected version: $version" }
           $extractPath = Join-Path $env:RUNNER_TEMP 'git-agecrypt-archive-check'
           Remove-Item -LiteralPath $extractPath -Recurse -Force -ErrorAction SilentlyContinue
           Expand-Archive -LiteralPath "${{ matrix.asset_name }}" -DestinationPath $extractPath

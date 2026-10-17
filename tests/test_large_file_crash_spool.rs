@@ -39,7 +39,7 @@ fn test_large_file_streaming_crash_and_forensic_canary_sweep() {
         .success();
 
     let canary_token = b"SUPER_SENSITIVE_IN_FLIGHT_CANARY_TOKEN_999";
-    // M9: size is configurable via GIT_AGECRYPT_LARGE_FILE_SIZE (weekly-deep matrix);
+    // The size is configurable via GIT_AGECRYPT_LARGE_FILE_SIZE for local matrix runs;
     // unparsable values hard-fail instead of silently using the default.
     let target_size: usize = match std::env::var("GIT_AGECRYPT_LARGE_FILE_SIZE") {
         Ok(s) => s.trim().parse().unwrap_or_else(|_| {

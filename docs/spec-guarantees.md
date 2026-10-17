@@ -64,9 +64,9 @@ When executing commands via `git-agecrypt run --fd -- <cmd>`:
 
 ---
 
-## 6. Current Development Verification Boundary
+## 6. Verification Boundary
 
-The guarantees above are implementation claims, not a promise that every operating-system primitive is available everywhere. The current development verification evidence maps them as follows; this is not a claim that a v0.6.0 release has been published:
+The guarantees above are implementation claims, not a promise that every operating-system primitive is available everywhere. The evidence currently maintained in this repository maps them as follows; test results do not by themselves establish a published release or universal platform coverage:
 
 | Guarantee | Implementation evidence | Verification boundary |
 |---|---|---|

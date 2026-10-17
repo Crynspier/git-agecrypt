@@ -1,10 +1,10 @@
-﻿# Verification and Invariant Mapping Matrix (v0.6.0 development)
+﻿# Verification and Invariant Mapping Matrix
 
 This document maps the implemented verification suites and documented invariants to their source files. Entries describe test coverage; they do not claim exhaustive coverage of every operating-system or filesystem behavior.
 
 ---
 
-## 1. Verification Matrix (v0.6.0 development)
+## 1. Verification Matrix
 
 | # | Critique Domain | Architectural Implementation | Primary Automated Test Suite | Coverage Confidence |
 |---|---|---|---|---|

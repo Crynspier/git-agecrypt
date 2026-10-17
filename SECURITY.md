@@ -1,11 +1,8 @@
 ﻿# Security Policy
 
-## Version Status
+## Supported Release Policy
 
-| Version | Status |
-| ------- | ------ |
-| 0.5.x   | Latest published release: [repository releases](https://github.com/Crynspier/git-agecrypt/releases) |
-| 0.6.x   | Development; not a published release and not a supported release channel |
+Security support follows the versions identified as supported in the project's published release information. Development checkouts and unreleased versions are not supported release channels. Refer to the [GitHub Releases](https://github.com/Crynspier/git-agecrypt/releases) page for published versions and release-specific guidance.
 
 ## Reporting a Vulnerability
 
@@ -17,6 +14,6 @@ Include the affected commit or release, impact, reproduction steps, and a minima
 
 ### What to Expect
 
-Reports will be reviewed through the private reporting channel. Response time, assessment, remediation, and disclosure timing depend on maintainer availability and the severity of the issue.
+Reports submitted through GitHub Private Vulnerability Reporting will be reviewed by the maintainers. Response time, assessment, remediation, and disclosure timing depend on maintainer availability and the severity of the issue.
 
 Thank you for helping keep `git-agecrypt` and its users safe.

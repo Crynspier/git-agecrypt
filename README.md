@@ -104,7 +104,7 @@ When a team member rotates the master key via `git-agecrypt rekey`, the new reci
 
 ### Pre-Compiled Binaries
 
-The latest published release is `v0.5.0`; download its pre-compiled standalone binaries from the [GitHub Releases](https://github.com/Crynspier/git-agecrypt/releases) page. The `v0.6.0` metadata in this checkout is development work and is not a published release:
+Download pre-compiled standalone binaries for a published release from the [GitHub Releases](https://github.com/Crynspier/git-agecrypt/releases) page. Select the release and asset matching the version you intend to install:
 
 - **Linux:** `git-agecrypt-linux-x86_64.tar.gz` (x86_64)
 - **macOS:** `git-agecrypt-macos-aarch64.tar.gz` (Apple Silicon M-series), `git-agecrypt-macos-x86_64.tar.gz` (Intel)
@@ -133,7 +133,7 @@ Verify installation:
 
 ```bash
 git-agecrypt --version
-# A source build from this checkout reports git-agecrypt 0.6.0
+# Confirm that the reported version matches the release or source checkout you intended to install.
 ```
 
 When release archives are published, the package set is limited to four targets: Linux x86_64, macOS x86_64 (Intel), macOS arm64 (Apple Silicon), and Windows x86_64. Published archives include a matching `.sha256` checksum file; verify a downloaded archive before placing the binary in `PATH`:

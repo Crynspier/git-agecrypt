@@ -595,6 +595,7 @@ impl GitRepo {
     }
 
     /// Purges all cached ciphertexts (e.g. during rekey or lock) and sweeps temp files.
+    #[allow(dead_code)]
     pub fn clear_cache(&self) -> Result<()> {
         self.clear_cache_for_ring(None, false)?;
         let rings_cache = self.local_state_dir().join("rings");
@@ -2686,6 +2687,7 @@ impl GitRepo {
     }
 
     /// Returns a list of tracked secret files that currently have unstaged/uncommitted changes across all rings.
+    #[allow(dead_code)]
     pub fn get_dirty_tracked_files(&self) -> Result<Vec<String>> {
         self.get_dirty_tracked_files_for_ring(None)
     }
@@ -2874,6 +2876,7 @@ impl GitRepo {
     }
 
     /// Refreshes the working tree non-destructively by default across all rings.
+    #[allow(dead_code)]
     pub fn refresh_working_tree(&self, force: bool) -> Result<()> {
         let _ = self.get_dirty_tracked_files()?;
         self.refresh_working_tree_for_ring(force, None)
@@ -2987,6 +2990,7 @@ impl GitRepo {
     }
 
     /// Refreshes the working tree across all linked worktrees across all rings.
+    #[allow(dead_code)]
     pub fn refresh_all_worktrees(&self, force: bool) -> Result<()> {
         let worktrees = self.list_worktrees()?;
         for wt in worktrees {

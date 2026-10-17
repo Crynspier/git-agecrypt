@@ -1228,7 +1228,7 @@ fn cmd_unlock(key_file: Option<&str>, force: bool, ring_opt: Option<&str>) -> Re
 
     // 4. Safe checkout / refresh working trees across all linked worktrees
     if ring_opt.is_none() {
-        repo.refresh_all_worktrees(force)?;
+        repo.refresh_all_worktrees_for_ring(force, Some("default"))?;
     } else {
         repo.refresh_all_worktrees_for_ring(force, ring_opt)?;
     }
@@ -1269,7 +1269,10 @@ fn cmd_lock(force: bool, ring_opt: Option<&str>) -> Result<()> {
         ));
     }
 
-    let dirty_across = repo.get_dirty_files_across_worktrees_for_ring(ring_opt)?;
+    // An omitted ring selects the default ring, not every registered ring.
+    // Keep scoped operations from inspecting or refreshing unrelated ring files.
+    let scoped_ring = ring_opt.or(Some("default"));
+    let dirty_across = repo.get_dirty_files_across_worktrees_for_ring(scoped_ring)?;
     if !dirty_across.is_empty() && !force {
         eprintln!(
             "git-agecrypt [WARNING]: Uncommitted (staged or unstaged) changes detected in tracked secret file(s):"
@@ -1312,8 +1315,10 @@ fn cmd_lock(force: bool, ring_opt: Option<&str>) -> Result<()> {
         repo.clear_cache_for_ring(Some(r), false)?;
         eprintln!("Ring '{r}' locked across all linked worktrees. Local credentials removed.");
     } else {
-        repo.transactional_lock_for_ring(None, || repo.refresh_all_worktrees_for_ring(true, None))?;
-        let _ = repo.clear_cache();
+        repo.transactional_lock_for_ring(None, || {
+            repo.refresh_all_worktrees_for_ring(true, Some("default"))
+        })?;
+        repo.clear_cache_for_ring(None, false)?;
         eprintln!(
             "Repository (default ring) locked across all linked worktrees. Local credentials removed."
         );

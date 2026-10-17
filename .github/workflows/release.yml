@@ -130,25 +130,32 @@ jobs:
         run: |
           $version = & "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" --version
           if ($version -ne 'git-agecrypt 0.5.0') { throw "Unexpected version: $version" }
-          if (-not (tar -tf "${{ matrix.asset_name }}" | Select-String -SimpleMatch "${{ matrix.binary_name }}")) { throw 'Packaged executable is missing' }
+          $extractPath = Join-Path $env:RUNNER_TEMP 'git-agecrypt-archive-check'
+          Remove-Item -LiteralPath $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath "${{ matrix.asset_name }}" -DestinationPath $extractPath
+          if (-not (Test-Path (Join-Path $extractPath "${{ matrix.binary_name }}"))) { throw 'Packaged executable is missing' }
       # H7: emit a SHA256 checksum so users can verify integrity.
       - name: Generate checksum (Unix)
         if: runner.os == 'Linux' || runner.os == 'macOS'
         run: |
           shasum -a 256 "${{ matrix.asset_name }}" | awk '{print $1"  "$2}' > "${{ matrix.asset_name }}.sha256"
           cat "${{ matrix.asset_name }}.sha256"
+          test "$(shasum -a 256 "${{ matrix.asset_name }}" | awk '{print $1}')" = "$(awk '{print $1}' "${{ matrix.asset_name }}.sha256")"
       - name: Generate checksum (Windows)
         if: runner.os == 'Windows'
         run: |
           $h = (Get-FileHash -Algorithm SHA256 "${{ matrix.asset_name }}").Hash.ToLower()
           "$h  ${{ matrix.asset_name }}" | Out-File -FilePath "${{ matrix.asset_name }}.sha256" -Encoding ascii
           Get-Content "${{ matrix.asset_name }}.sha256"
+          $expected = (Get-Content "${{ matrix.asset_name }}.sha256").Trim().Split()[0]
+          if ($h -ne $expected) { throw 'Checksum file does not match asset' }
       # H7: Sigstore build-provenance attestation for the release asset.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: ${{ matrix.asset_name }}
       - name: Upload asset to GitHub Release
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

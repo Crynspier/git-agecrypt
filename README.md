@@ -143,7 +143,10 @@ The v0.5.0 release provides all four mandatory targets: Linux x86_64, macOS x86_
 sha256sum -c git-agecrypt-linux-x86_64.tar.gz.sha256  # use shasum -a 256 on macOS if needed
 
 # Windows PowerShell
-(Get-FileHash .\\git-agecrypt-windows-x86_64.zip -Algorithm SHA256).Hash
+$asset = '.\\git-agecrypt-windows-x86_64.zip'
+$expected = (Get-Content "$asset.sha256").Trim().Split()[0].ToLowerInvariant()
+$actual = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "Checksum mismatch" }
 ```
 
 ---

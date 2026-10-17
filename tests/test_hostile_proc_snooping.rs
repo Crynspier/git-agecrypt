@@ -11,7 +11,7 @@ fn test_run_fd_child_reads_secret_and_proc_snooping_denied() {
     init_repo(repo);
 
     agecrypt_cmd(repo).arg("init").assert().success();
-    let (_sec_id, pub_key) = generate_test_identity();
+    let (sec_id, pub_key) = generate_test_identity();
     agecrypt_cmd(repo)
         .args(["add-recipient", "-i", &pub_key, "--name", "fd_user"])
         .assert()
@@ -66,6 +66,26 @@ fn test_run_fd_child_reads_secret_and_proc_snooping_denied() {
     locked_run.args(["run", "--", child_cmd]);
     locked_run.args(child_args);
     locked_run.assert().failure();
+
+    // Restore the unlocked state before probing the child process. The --fd
+    // command must load the tracked secret environment first, so probing while
+    // the repository is locked would only test the expected missing-key error.
+    let mut unlock = agecrypt_cmd(repo);
+    unlock
+        .args(["unlock", "-"])
+        .stdin(std::process::Stdio::piped());
+    let mut unlock_child = unlock.spawn().expect("Failed to spawn unlock");
+    if let Some(mut stdin) = unlock_child.stdin.take() {
+        std::io::Write::write_all(&mut stdin, sec_id.as_bytes())
+            .expect("Failed to provide unlock identity");
+    }
+    assert!(
+        unlock_child
+            .wait()
+            .expect("Failed to wait for unlock")
+            .success(),
+        "Failed to unlock repository for dumpability probe"
+    );
 
     // On Linux, verify that the child process is actually non-dumpable (PR_SET_DUMPABLE=0 applied)
     #[cfg(target_os = "linux")]

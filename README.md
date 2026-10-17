@@ -10,7 +10,7 @@ Transparent client-side Git encryption using [age](https://age-encryption.org/v1
 
 `git-agecrypt` provides transparent file encryption and decryption for Git repositories using Git's native filter drivers (`clean`, `smudge`, `diff`, and `merge`).
 
-Files remain unencrypted cleartext in your local working directory so your editor, linters, and compiler can access them normally. When files are committed or pushed to a remote repository, they are automatically encrypted into authenticated `age` ciphertexts. Collaborators without an enrolled private key see only encrypted data.
+Files matching the configured Git filters remain cleartext in your local working directory so your editor, linters, and compiler can access them normally. When those files are staged through the configured filters, Git stores authenticated `age` ciphertexts in the index and object database. Files outside the filter configuration, already-committed plaintext, and other Git metadata are not retroactively protected.
 
 It is designed as a modern replacement for `git-crypt`, substituting GPG and OpenSSL dependencies with the `age` format (X25519, ChaCha20-Poly1305), standard SSH Ed25519 or RSA keys, and native Age hardware plugins (YubiKey, Apple Secure Enclave, TPM).
 
@@ -54,10 +54,10 @@ Working Tree                 Git Index & Staging              Remote (GitHub, et
 
 `git-agecrypt` uses a two-tier key envelope:
 
-1. **Repository Master Key:** A 256-bit symmetric key that encrypts all secret files in the repository.
+1. **Repository Master Key:** A 256-bit symmetric key that encrypts files routed to the repository's configured secret filters.
 2. **Recipient Envelopes (`.git-agecrypt/keys/<name>.age`):** The master key is encrypted individually for each authorized team member using their SSH public key (`~/.ssh/id_ed25519.pub`, `~/.ssh/id_rsa.pub`), native `age` identity, or hardware token recipient.
 
-When a team member rotates the master key via `git-agecrypt rekey`, collaborators re-synchronize transparently on `git pull` using their local SSH identity.
+When a team member rotates the master key via `git-agecrypt rekey`, the new recipient envelopes and ciphertexts must be committed and distributed. Collaborators then unlock or refresh their local checkout using an authorized identity.
 
 ---
 
@@ -68,10 +68,10 @@ When a team member rotates the master key via `git-agecrypt rekey`, collaborator
 - **Scoped recipient rings (multi-environment secrets):** Segment secrets across independent access domains (e.g. `--ring prod`, `--ring dev`) with dedicated master keys, recipient sets, and `.gitattributes` filter bindings (`filter=agecrypt-prod`).
 - **Runtime secret injection:** Execute child commands with in-memory decrypted environment variables (`git-agecrypt run -- <cmd>`) without writing cleartext `.env` files to disk.
 - **Anonymous in-memory secret passing (`run --fd`):** Pass secrets via Linux kernel anonymous RAM descriptors (`SYS_memfd_create`), avoiding `/proc/<pid>/environ` inspection or cleartext temporary files.
-- **In-memory clean fast-path:** Small secrets and config files (< 1 MiB) are spooled and encrypted entirely in RAM with zero temporary disk file I/O. Memory buffers are cryptographically zeroized on drop.
-- **Zero memory bloat on large files ($O(1)$ RAM):** Streams larger than 1 MiB automatically spill to disk, processing files in 64 KiB chunks; multi-gigabyte archives or database dumps never exhaust system memory.
+- **In-memory clean fast-path:** Inputs below 1 MiB use the in-memory spool path and do not intentionally create a temporary spool file. The primary spool buffer uses zeroization on drop; this does not guarantee that every intermediate or library/OS copy is erased immediately.
+- **Bounded streaming for large files:** Streams larger than 1 MiB are processed in chunks and may use temporary files; memory use does not scale with the complete file size, although exact usage depends on the encryption and I/O layers.
 - **Cryptographic cache authentication:** Eliminates phantom `git diff` churn using keyed HMAC-SHA256 digests. Cached ciphertext hits are decrypted and authenticated in RAM before trust, with automatic eviction on corruption and complete cache purge on `rekey`.
-- **Fail-closed durability:** All filesystem operations (`fsync` / `sync_all`) strictly propagate I/O errors across cache persistence, lock journals, and merge targets; partial or un-flushed writes never succeed silently.
+- **Durability checks on critical state:** Key, journal, and merge-target writes check synchronization and replacement errors. Cache cleanup and other auxiliary cleanup paths may be best effort; filesystem and storage hardware behavior remains outside the application's control.
 - **Semantic merge conflict detection:** 3-way merge driver detects conflicting duplicate key definitions on concurrent branch edits to `.env` and configuration files and emits actionable warnings.
 - **GitHub user key enrollment:** Add team members directly by GitHub username (`git-agecrypt add-recipient --github <user>`).
 - **Safe locked clones:** Cloning without a configured key succeeds cleanly (exit code 0). Files remain encrypted on disk until unlocked.
@@ -104,7 +104,7 @@ When a team member rotates the master key via `git-agecrypt rekey`, collaborator
 
 ### Pre-Compiled Binaries
 
-Download pre-compiled standalone binaries from the [GitHub Releases](https://github.com/Crynspier/git-agecrypt/releases) page:
+The latest published release is `v0.5.0`; download its pre-compiled standalone binaries from the [GitHub Releases](https://github.com/Crynspier/git-agecrypt/releases) page. The `v0.6.0` metadata in this checkout is development work and is not a published release:
 
 - **Linux:** `git-agecrypt-linux-x86_64.tar.gz` (x86_64)
 - **macOS:** `git-agecrypt-macos-aarch64.tar.gz` (Apple Silicon M-series), `git-agecrypt-macos-x86_64.tar.gz` (Intel)
@@ -133,10 +133,10 @@ Verify installation:
 
 ```bash
 git-agecrypt --version
-# git-agecrypt 0.6.0
+# A source build from this checkout reports git-agecrypt 0.6.0
 ```
 
-The release package set is limited to four targets: Linux x86_64, macOS x86_64 (Intel), macOS arm64 (Apple Silicon), and Windows x86_64. Published archives include a matching `.sha256` checksum file; verify a downloaded archive before placing the binary in `PATH`:
+When release archives are published, the package set is limited to four targets: Linux x86_64, macOS x86_64 (Intel), macOS arm64 (Apple Silicon), and Windows x86_64. Published archives include a matching `.sha256` checksum file; verify a downloaded archive before placing the binary in `PATH`:
 
 ```bash
 # Linux/macOS
@@ -287,7 +287,7 @@ git-agecrypt run -e production.secret.env --ring prod -- node server.js
 git-agecrypt run -- npm test
 ```
 
-Secrets are decrypted entirely in RAM, injected into the child process environment (or anonymous file descriptor via `GIT_AGECRYPT_ENV_FD`), and immediately zeroized upon exit without creating temporary cleartext files on disk. On non-Linux hosts where `memfd_create` is unavailable, `--fd` strictly fails closed unless `--allow-env-fallback` is supplied. When `-e` is omitted, `run` automatically detects encrypted `.env` or `*.secret.env` files tracked in the repository.
+Secrets are decrypted for the child process and are not intentionally written to application-created cleartext files. The environment path uses process environment variables, and the Linux `--fd` path uses an anonymous memfd exposed through `GIT_AGECRYPT_ENV_FD`; memory may still be retained or paged by the operating system. On non-Linux hosts where `memfd_create` is unavailable, `--fd` fails closed unless `--allow-env-fallback` is supplied. When `-e` is omitted, `run` automatically detects encrypted `.env` or `*.secret.env` files tracked in the repository.
 
 ### 7. Scoped Recipient Rings (Multi-Environment Secrets)
 
@@ -331,7 +331,7 @@ git commit -m "Rotate master key and remove bob"
 git push
 ```
 
-The offboarded developer cannot decrypt any subsequent commits.
+After the new key and re-encrypted files are distributed, the offboarded developer cannot decrypt ciphertext produced under that new key unless they obtain another authorized recipient key. Historical commits encrypted under keys they already possessed remain readable to them.
 
 ### 9. Resolving Historical Branches (`rewrap`)
 
@@ -434,16 +434,16 @@ git commit -m "Migrate from git-crypt to git-agecrypt"
 Comprehensive specifications and architecture guides are available in the [`docs/`](docs/) directory:
 
 - **[Security Model & Threat Analysis](docs/security-model.md):**
-  Detailed threat model, cryptographic primitives (ChaCha20-Poly1305, X25519, HMAC caching), formal Invariants A through F, POSIX permissions (`0o700`/`0o600`), crash durability (`sync_all` + `sync_dir`), Merkle DAG forward-secrecy vs historical revocation, runtime secret injection boundaries, and enterprise server-side `pre-receive` hook enforcement.
+  Detailed threat model, cryptographic primitives (ChaCha20-Poly1305, X25519, HMAC caching), documented invariants, POSIX permissions (`0o700`/`0o600`), crash-recovery boundaries, Merkle DAG historical-access behavior, runtime secret injection boundaries, and enterprise server-side `pre-receive` hook enforcement.
 
 - **[Internal Architecture & Driver Mechanics](docs/internals.md):**
-  In-depth breakdown of the Git filter lifecycle (`clean`, `smudge`, `textconv`, `merge`), two-tier spooling architecture (RAM < 1 MiB with `zeroize`, disk >= 1 MiB inside `.git/git-agecrypt/spool/`), scoped ring grammar validation, stage-0 index deduplication, cache validation, and the 3-way semantic merge driver conflict algorithms.
+  In-depth breakdown of the Git filter lifecycle (`clean`, `smudge`, `textconv`, `merge`), two-tier spooling architecture, scoped ring grammar validation, stage-0 index deduplication, cache validation, and the 3-way semantic merge driver conflict algorithms.
 
 - **[Verification & Invariant Matrix](docs/verification-matrix.md):**
   Traceability matrix mapping the implemented verification suites (generative state machine, multi-ring combinatorial DAG, kill points, forensic canary sweeps, Linux prctl lockdown, symlink/case-collision defense) and documented invariants to automated test suites, with explicit platform and coverage limits.
 
 - **[Specification & Security Guarantees](docs/spec-guarantees.md):**
-  Explicit cryptographic, durability, cache, process-isolation, hardware-token, and v0.6.0 verification boundaries.
+  Explicit cryptographic, durability, cache, process-isolation, hardware-token, and platform-specific verification boundaries.
 
 ---
 

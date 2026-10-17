@@ -41,8 +41,8 @@ Git integrates with `git-agecrypt` using custom filter and diff drivers configur
 The `clean` filter converts cleartext from standard input into authenticated `age` ciphertext on standard output when files are staged (`git add`).
 
 **Execution Pipeline:**
-1. **Repository & Key Verification:** Reads the master key from `.git/git-agecrypt/master.key`. If the key is missing or locked, `clean` aborts with an error to prevent committing unencrypted data.
-2. **Two-Tier Ingest:** The incoming stream from `stdin` is read into memory up to 1 MiB. If the stream exceeds 1 MiB, it spills into `.git/git-agecrypt/spool/`.
+1. **Repository & Key Verification:** Reads the unlocked repository key from `.git/git-agecrypt/repo.key`. If the key is missing or locked, `clean` aborts with an error to prevent committing unencrypted data.
+2. **Two-Tier Ingest:** The incoming stream from `stdin` is read into memory up to 1 MiB. If the stream exceeds 1 MiB, the stream spool uses the host temporary-file facility.
 3. **Stage-0 Index Deduplication:** If the target path is provided, `git-agecrypt` inspects the existing blob at `:0:<path>` in the Git index. If the existing index blob decrypts to identical plaintext, the existing ciphertext is reused directly, producing bitwise-identical commits without re-encryption overhead.
 4. **Keyed HMAC Cache Check:** Computes an HMAC-SHA256 digest of the plaintext using the master key. If a matching ciphertext exists in `.git/git-agecrypt/cache/<hmac>`, the cached header is validated (`is_age_ciphertext`). If valid, the cached ciphertext is emitted.
 5. **Streaming Encryption:** On a cache miss, the plaintext is encrypted into an `age-encryption.org/v1` container using ChaCha20-Poly1305 in 64 KiB chunks. The result is written to `stdout`, and atomically cached with `sync_all()`.
@@ -52,7 +52,7 @@ The `clean` filter converts cleartext from standard input into authenticated `ag
 The `smudge` filter converts ciphertext from standard input into cleartext on standard output during checkout or switch operations (`git checkout`, `git switch`, `git reset`).
 
 **Execution Pipeline:**
-1. **Pass-Through on Locked Repositories:** If the repository is locked or no enrolled key is present, `smudge` streams standard input directly to standard output with exit code `0`. This ensures that cloning a repository or switching branches never causes Git to fail with fatal errors.
+1. **Pass-Through on Locked Repositories:** If the repository is locked or no enrolled key is present, `smudge` is designed to stream standard input directly to standard output with exit code `0`. This allows the encrypted payload to remain checked out, subject to other Git and filesystem errors.
 2. **Decryption:** If unlocked, the `age` container is decrypted using the master key. Small files are decrypted in RAM; files larger than 1 MiB are streamed through disk spools in 64 KiB chunks.
 
 ### 1.3 The `textconv` Driver
@@ -66,25 +66,25 @@ Configured for `git diff` and `git log -p`:
 
 ## 2. Two-Tier Spooling & Memory Management
 
-`git-agecrypt` enforces strict resource boundaries to support both tiny environment configs and multi-gigabyte files efficiently:
+`git-agecrypt` uses separate in-memory and temporary-file paths for small and large inputs. Exact resource usage depends on the age and I/O layers:
 
 | Tier | Payload Size | Storage Medium | Zeroization | Memory Footprint |
 |---|---|---|---|---|
 | **Tier 1 (RAM)** | $< 1\text{ MiB}$ | Heap buffer (`Zeroizing<Vec<u8>>`) | Automatic on `drop` | $O(N)$ up to 1 MiB |
-| **Tier 2 (Disk Spool)** | $\ge 1\text{ MiB}$ | `.git/git-agecrypt/spool/` | Unlinked on close | $O(1)$ RAM (64 KiB chunk buffer) |
+| **Tier 2 (Temporary Spool)** | $\ge 1\text{ MiB}$ | Host temporary-file facility | Removed on close when cleanup succeeds | Bounded, implementation-dependent memory |
 
 ### 2.1 Tier 1: In-Memory Fast Path
 
-Secrets and configuration files are almost universally under 1 MiB. For these files:
-- Zero temporary disk files are created.
-- Buffers use Rust's `zeroize` crate to guarantee memory is wiped with zeroes when deallocated, preventing secret remanence in process memory.
+For inputs below the 1 MiB threshold on the in-memory path:
+- The implementation does not intentionally create a temporary spool file.
+- The primary spool buffer uses Rust's `zeroize` crate on deallocation; this does not guarantee that every intermediate or operating-system copy is wiped.
 
 ### 2.2 Tier 2: Bounded Streaming for Large Files
 
 For datasets, database dumps, archives, or binary blobs $\ge 1\text{ MiB}$:
-- Data spills directly into an anonymous temporary file inside `.git/git-agecrypt/spool/`.
-- Encryption and decryption operate in 64 KiB streaming chunks (`STREAM_CHUNK_SIZE`).
-- Peak memory usage remains bounded to approximately 128 KiB regardless of whether the file is 10 MiB or 50 GiB.
+- The stream spool is created through the host temporary-file facility; it is not currently forced into `.git/git-agecrypt/spool/`.
+- Encryption and decryption use the implementation's streaming buffers; exact memory usage depends on the age and I/O layers.
+- The design avoids loading the complete file into one application buffer, but this document does not promise a fixed peak-memory figure.
 
 ---
 
@@ -131,7 +131,7 @@ $$\text{merge driver invocation: } \texttt{git-agecrypt merge <\%O> <\%A> <\%B> 
 
 ### 4.1 Execution Sequence
 
-1. **Decryption:** `%O`, `%A`, and `%B` are decrypted into temporary cleartext files inside `.git/git-agecrypt/spool/`.
+1. **Decryption:** `%O`, `%A`, and `%B` are decrypted into temporary cleartext files managed by the host temporary-file facility.
 2. **Binary Detection:** If any decrypted version contains null bytes (`0x00`), the file is treated as binary. Clean 3-way line merging is aborted; a conflict is declared immediately to protect binary data from corruption.
 3. **Git 3-Way Merge:** Executes `git merge-file -L <our> -L <base> -L <their> <tmp_A> <tmp_O> <tmp_B>`.
 4. **Semantic Key Analysis:** If merging `.env` or key-value configuration files, `git-agecrypt` scans the merged output for conflicting assignments or duplicate keys and emits diagnostic warnings.
@@ -189,7 +189,7 @@ Repository Root
     └── git-agecrypt/
         ├── repo.key                  # Ephemeral unlocked default master key
         ├── cache/                    # HMAC ciphertext cache
-        ├── spool/                    # RAM-to-disk large file spools
+        ├── spool/                    # Auxiliary local state and cleanup area
         └── rings/
             ├── prod/
             │   └── repo.key          # Ephemeral unlocked prod master key
@@ -223,7 +223,7 @@ To prevent directory traversal attacks, arbitrary file overwrites, and platform-
 
 ## 7. Anonymous In-Memory Secret Passing (`memfd_create`)
 
-To eliminate exposure of decrypted environment variables via `/proc/<pid>/environ` on Linux hosts:
+To avoid intentionally placing decrypted environment variables in `/proc/<pid>/environ` on Linux hosts:
 
 ### 7.1 Linux Kernel In-Memory File Descriptors
 
@@ -234,30 +234,30 @@ When `git-agecrypt run --fd -- <cmd>` is executed on Linux:
 4. **File Offset Rewind:** The file position is rewound to 0 (`lseek(fd, 0, SEEK_SET)`).
 5. **Child Process Descriptor Transfer:** In `Command::pre_exec` before executing the child command via `execve`, the `FD_CLOEXEC` flag is cleared (`fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC)`) exclusively for the target child process.
 6. **FD Exposure:** The descriptor number is injected into the child's environment as `GIT_AGECRYPT_ENV_FD=<fd>`. Child processes can read secrets via `/dev/fd/<fd>` or `open("/proc/self/fd/<fd>", O_RDONLY)`.
-7. **Zero Disk Footprint:** When the parent or child process terminates, the kernel frees the memory automatically. Cleartext secrets never touch disk or swap partitions.
+7. **Descriptor Lifetime:** When the parent and child close the descriptor, the kernel releases the anonymous file. This avoids an application-created pathname, but does not establish that plaintext can never be paged, captured, or written by the operating system.
 8. **Fail-Closed on Non-Linux Hosts:** On operating systems lacking anonymous RAM descriptors (Windows, macOS), `run --fd` strictly fails closed by default. Users must explicitly supply `--allow-env-fallback` to permit falling back to standard in-memory environment variable injection.
 
 ---
 
 ## 8. Crash Durability & Directory Synchronization
 
-To prevent filesystem metadata inconsistency or zero-length files in the event of unexpected system power loss:
+To reduce filesystem metadata inconsistency after interruption or a crash:
 
-1. **Atomic Temporary Replacement:** All critical file writes (master keys, lock journals, merge results, cache entries) write first to an anonymous or uniquely named temporary file located within the same directory (`NamedTempFile::new_in(dir)`).
-2. **File Content Sync:** Prior to renaming, `sync_all()` (`fsync`) is invoked on the file handle, ensuring all data bytes and inode metadata are committed to physical media.
-3. **Directory Entry Sync (`sync_dir`):** On POSIX operating systems, `git-agecrypt` opens the parent directory in read-only mode and issues `fsync` on the directory descriptor. This guarantees that directory link updates and file name renames are flushed to physical journal storage. On Windows, this operation safely succeeds as a no-op.
-4. **Fail-Closed I/O:** All filesystem synchronization operations strictly propagate errors (`?`). Neither cache operations nor merge resolutions swallow write or sync failures silently.
+1. **Atomic Temporary Replacement:** Key, journal, and merge-target writes generally use uniquely named temporary files and replacement within the target filesystem. Stream spools and some fallback paths use the host temporary-file facility instead.
+2. **File Content Sync:** Critical replacement paths call `sync_all()` (`fsync`) before replacement. This asks the operating system to flush file data and metadata; it is not a universal proof of physical-media persistence.
+3. **Directory Entry Sync (`sync_dir`):** POSIX replacement paths also attempt to synchronize the containing directory. Windows behavior and filesystem guarantees differ by platform.
+4. **Error Handling:** Security-critical write, replacement, and recovery errors are propagated. Auxiliary cache cleanup and some cleanup synchronization are intentionally best effort.
 
 ---
 
 ## 9. Generative State Machine & Combinatorial DAG Verification
 
-Starting with v0.4.0, `git-agecrypt` incorporates a generative randomized state-machine test harness ([`tests/test_stateful_random_harness.rs`](../tests/test_stateful_random_harness.rs)) powered by seeded PRNG (`rand_chacha::ChaCha8Rng`):
+The repository includes generative randomized state-machine harnesses, including [`tests/test_generative_shadow_state_machine.rs`](../tests/test_generative_shadow_state_machine.rs), powered by seeded PRNGs (`rand_chacha::ChaCha8Rng`):
 
-1. **State Space Exploration:** The harness executes 100+ pseudorandom sequential operations including `EditSecret`, `GitAdd`, `GitCommit`, `GitCreateBranch`, `GitSwitchBranch`, `GitStashPush`, `GitStashPop`, `GitRepack`, `AgecryptLock`, `AgecryptUnlock`, and `AgecryptRekey`.
-2. **Shadow State Model:** Tracks expected plaintext and encrypted status in memory, asserting formal Invariants A–F at each transition.
-3. **Forensic Canary Validation:** Injects unique canary tokens into secrets and verifies through packfile/loose-object forensic sweeps that plaintext never escapes into the Git object store.
-4. **Combinatorial DAG Testing:** Tests multi-ring (`default`, `prod`, `dev`) $\times$ multi-generation ($G_0, G_1, \dots$) branch divergence, merges, and cross-generation credential synchronization ([`tests/test_combinatorial_rings_generations.rs`](../tests/test_combinatorial_rings_generations.rs)).
+1. **State Space Exploration:** The harness executes a default 100-step pseudorandom sequential run, with configurable depth, including `EditSecret`, `GitAdd`, `GitCommit`, `GitCreateBranch`, `GitSwitchBranch`, `GitStashPush`, `GitStashPop`, `GitRepack`, `AgecryptLock`, `AgecryptUnlock`, and `AgecryptRekey`.
+2. **Shadow State Model:** Tracks expected plaintext and encrypted status in memory and checks the invariants implemented by the harness at each transition.
+3. **Forensic Canary Validation:** Injects unique canary tokens into secrets and checks selected packfile/loose-object scenarios for plaintext canary presence; this does not cover every Git operation or misconfiguration.
+4. **Combinatorial DAG Testing:** Separate tests exercise multi-ring and multi-generation branch divergence, merges, and credential synchronization ([`tests/test_combinatorial_rings_generations.rs`](../tests/test_combinatorial_rings_generations.rs)).
 
 ---
 

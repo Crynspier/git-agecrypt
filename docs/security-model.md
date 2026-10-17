@@ -8,11 +8,11 @@
 
 ### 1.1 What `git-agecrypt` Defends Against
 
-- **Untrusted Remote Hosting:** Remote Git hosts (GitHub, GitLab, Bitbucket, cloud infrastructure, or bare Git servers) only receive authenticated `age` ciphertexts. Compromise or subpoena of the remote Git host exposes zero plaintext secrets.
-- **Passive and Active Network Interception:** Repository pushes, pulls, and clones transfer ciphertext payloads. Man-in-the-middle (MITM) adversaries cannot decrypt or inject forged secrets due to ChaCha20-Poly1305 AEAD authentication.
-- **Unauthorized Clones and Forking:** Public or unintended access to repository clones leaves secret files in their encrypted state. Without an enrolled private key, files cannot be decrypted.
-- **Local AI Agent and IDE Indexer Leakage:** Local coding assistants and IDE indexing processes scan the working directory. Through `git-agecrypt shield`, ignore patterns are synchronized into `.cursorignore`, `.claudeignore`, `.aiderignore`, and `.aiignore`, preventing local language models from ingesting transparently decrypted secrets into context windows.
-- **Accidental Cleartext Staging:** The built-in safeguard hook suite (`pre-commit`, `pre-merge-commit`, `pre-push`) and `git-agecrypt check` inspect index blobs (`:0:<path>`) prior to commit or push, preventing unencrypted secrets or untracked sensitive files (e.g. unmatched `.env`, private keys) from escaping into the Git object database.
+- **Untrusted Remote Hosting:** For files correctly covered by the configured Git filters and committed through the normal filter path, remote Git hosts receive authenticated `age` ciphertexts rather than plaintext. This does not protect plaintext committed before configuration, files outside the filter rules, or secrets exposed through other Git metadata.
+- **Passive and Active Network Interception:** Encrypted payloads are authenticated by age's AEAD format, so tampering with a payload should be detected during decryption. Git transport authentication, ref integrity, replay protection, and commit provenance remain responsibilities of Git and the transport configuration.
+- **Unauthorized Clones and Forking:** For correctly filtered and encrypted paths, public or unintended access to repository clones leaves secret payloads encrypted. A clone without an authorized identity cannot decrypt those payloads; plaintext outside the filters and Git metadata remain separate concerns.
+- **Local AI Agent and IDE Indexer Leakage:** `git-agecrypt shield` can synchronize patterns into `.cursorignore`, `.claudeignore`, `.aiderignore`, and `.aiignore` as advisory defense in depth. Tool support varies, and ignore files do not prevent access by tools that disregard them or remove data already indexed or transmitted.
+- **Accidental Cleartext Staging:** When installed, invoked, and not bypassed, the safeguard hook suite (`pre-commit`, `pre-merge-commit`, `pre-push`) and `git-agecrypt check` inspect index blobs (`:0:<path>`) before commit or push. They provide defense in depth against unencrypted secrets and heuristic matches; they are not a complete secret detector or a replacement for server-side enforcement.
 - **Ciphertext Header Tampering & Interactive Staging Corruption:** Running interactive patch staging (`git add -p`) on encrypted files or tampering with ciphertext chunks is detected by `git-agecrypt check`, blocking commits that contain corrupted `age` payloads.
 
 ### 1.2 What `git-agecrypt` Does NOT Defend Against
@@ -64,7 +64,7 @@ To solve this securely:
 [ Recipient Envelope ] (.git-agecrypt/keys/<user>.age or rings/<name>/keys/<user>.age)
            |
            v (Extracts 256-bit symmetric repository secret)
-[ Symmetric Master Key ] (repo.key, 256-bit X25519 identity)
+[ Symmetric Master Key ] (repo.key, repository-generated symmetric key)
            |
            v (ChaCha20-Poly1305 streaming AEAD, 64 KiB chunks)
 [ Data Payload ] (Working tree file contents)
@@ -120,22 +120,20 @@ This prevents unauthorized access from other local users sharing the same machin
 
 ### 4.2 Colocated Spool Directory
 
-When processing streams larger than 1 MiB, temporary spill files are stored within `.git/git-agecrypt/spool/` rather than the system-wide `/tmp` directory. This ensures:
-- Spill data remains on the same filesystem and partition as the Git repository, enabling atomic rename operations.
-- Spill files inherit repository directory access permissions and avoid shared multi-tenant temporary locations.
+When processing streams larger than 1 MiB, the current stream implementation uses the host temporary-file facility. The location, permissions, cleanup behavior, and filesystem are therefore host-dependent; this path should not be treated as repository-local or as an atomic-rename boundary.
 
 ### 4.3 Crash Durability, Physical Disk Synchronization & Fail-Closed Semantics
 
-To prevent data loss or corrupted key files from sudden system reboots or power loss:
-- Key files, journals, merge targets, and cache files are written to atomic temporary files (`NamedTempFile`).
-- Before atomically persisting the file into its destination, `git-agecrypt` executes `sync_all()` (`fsync`), ensuring data and metadata are physically written to durable storage before the directory entry is updated.
-- **Strict Fail-Closed Durability:** All filesystem sync operations strictly propagate I/O and synchronization errors (`?`). Neither cache persistence nor merge target updates silently swallow disk flush errors. If durable persistence cannot be guaranteed by the underlying storage subsystem, the operation immediately fails closed.
+To reduce inconsistent state after interruption:
+- Security-critical key, journal, and merge-target writes use temporary-file replacement and synchronization on the relevant paths.
+- `sync_all()` (`fsync`) asks the operating system to flush file data and metadata before replacement; it is not a universal proof of physical-media persistence under power loss.
+- Errors from security-critical writes, replacement, and recovery are propagated. Auxiliary cache cleanup and some cleanup synchronization remain best effort.
 
 ### 4.4 Transactional Locking with Write-Ahead Logging (WAL)
 
 The `git-agecrypt lock` command re-smudges cleartext files on disk back into ciphertext. To prevent partial state if interrupted:
 - A write-ahead journal (`.git/git-agecrypt/lock.journal`) is written and flushed prior to modifying disk files.
-- If an operation is interrupted, the journal guarantees deterministic recovery on the next command execution.
+- If an operation is interrupted, the journal is used by the recovery path to restore a valid state on the next command execution; coverage is bounded by the tested failure modes and host filesystem behavior.
 
 ---
 
@@ -171,23 +169,23 @@ When executing commands using `run`, consider the operating system process bound
 - **Process Memory & `/proc` Inspection:** On Linux systems, any process running under the same user ID (UID) or possessing `PTRACE_MODE_READ` capability can inspect `/proc/<pid>/environ`. Run untrusted or multi-tenant processes under isolated service accounts.
 - **Child Process Inheritance:** Environment variables are inherited by child processes spawned by the target command. Ensure build tools, test runners, or scripts do not echo environment variables to CI logs.
 - **Core Dumps:** Prevent memory-mapped secrets from being written to disk on unexpected crashes by setting `ulimit -c 0` or disabling kernel core dumps (`fs.suid_dumpable = 0`).
-- **Cryptographic Memory Zeroization:** All in-memory buffers holding decrypted plaintext are zeroized using the `zeroize` crate immediately when dropped.
+- **Cryptographic Memory Zeroization:** Some sensitive buffers use the `zeroize` crate when dropped. This does not guarantee immediate erasure of every intermediate `String`, environment value, library buffer, or operating-system copy.
 
 ### 6.2 Anonymous In-Memory Secret Passing (`run --fd`)
 
 For high-security Linux runtime environments where `/proc/<pid>/environ` inspection by other co-tenant processes is an attack vector:
 - `git-agecrypt run --fd -- <cmd>` creates an anonymous in-memory file descriptor via the Linux `SYS_memfd_create` syscall with `MFD_CLOEXEC`.
-- Secrets are written entirely into kernel RAM without touching the physical filesystem.
+- The memfd has no application-created filesystem pathname; the operating system may still page, capture, or otherwise handle process memory according to host policy.
 - **Child Descriptor Lifecycle:** In the parent process, `MFD_CLOEXEC` ensures file descriptors do not leak across unrelated child forks. Prior to executing the child command, a `pre_exec` hook unsets the `FD_CLOEXEC` flag (`fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC)`) exclusively for the target child process, allowing it to inherit the descriptor while keeping all other file handles sealed.
 - The descriptor number is passed to the child process via the `GIT_AGECRYPT_ENV_FD` environment variable (accessible via `/dev/fd/<fd>` or `open("/proc/self/fd/<fd>", O_RDONLY)`).
-- Plaintext secrets are never exposed in `/proc/<pid>/environ` argument arrays or command-line strings.
+- The `--fd` path does not intentionally place the secret payload in `/proc/<pid>/environ` or command-line arguments; the descriptor number is passed through the environment. Authorized child processes can still read the secret.
 - **Fail-Closed Security on Non-Linux Hosts:** On platforms where `memfd_create` is unsupported (Windows, macOS), `run --fd` strictly fails closed by default with an explicit security error. If a user or CI pipeline explicitly wishes to tolerate falling back to standard in-memory environment injection on non-Linux platforms, they must pass `--allow-env-fallback`.
 
 ---
 
 ## 7. Server-Side Enforcement (Enterprise Gateway)
 
-To eliminate reliance on client-side hooks across distributed teams, deploy a server-side `pre-receive` hook on your central Git server (GitHub Enterprise, GitLab, Gitea, or bare Git). The hook verifies that every file with `filter=agecrypt` is committed as valid `age` ciphertext:
+Where organizational policy requires enforcement beyond local hooks, deploy a server-side `pre-receive` hook on a Git server that supports custom hooks (for example, GitLab, Gitea, or a bare Git server). The example below checks files identified by a matching `filter=agecrypt` attribute; adapt it to the server's attribute and revision model:
 
 ```bash
 #!/usr/bin/env bash
@@ -221,19 +219,19 @@ done
 
 ---
 
-## 8. Formal Security Invariants (A through F)
+## 8. Documented Security Invariants (A through G)
 
-`git-agecrypt` v0.4.0 establishes and formally verifies six architectural invariants through an automated, generative state-machine testing harness ([`tests/test_stateful_random_harness.rs`](../tests/test_stateful_random_harness.rs)) and the comprehensive [Verification Matrix](verification-matrix.md):
+The repository documents architectural invariants and exercises them through multiple automated state-machine, filesystem, concurrency, and durability suites. The [Verification Matrix](verification-matrix.md) maps the current suites and their boundaries; test coverage is not a universal proof of every platform or filesystem behavior:
 
 ### Invariant A: Working-Tree vs Object Database Invariant
 $$\text{Working tree} = \text{Plaintext} \iff \text{Git index / Object database} = \text{Ciphertext}$$
-- Under no circumstances does plaintext enter Git loose objects (`.git/objects/??/`), packfiles (`.git/objects/pack/*.pack`), or unmerged index stages (stages 1, 2, 3).
-- Verified continuously across 100+ randomized state-machine transitions and forensic canary scans inspecting uncompressed packfile bytes and loose object stores following `commit`, `rebase`, `stash`, and `cherry-pick`.
+- For correctly configured encrypted paths and the tested Git workflows, the clean filter and forensic checks require ciphertext in Git objects and unmerged index stages.
+- The suites exercise randomized transitions and canary scans over selected loose-object and packfile scenarios; this does not cover misconfigured attributes, bypassed filters, or every Git command.
 
 ### Invariant B: Crash & Durability Invariant
-- All state mutations (key generation, rekeying, lock journals, merge resolution, cache entries) are staged into atomic temporary files on the same filesystem.
-- File payloads and parent directories are physically synchronized to disk (`fsync` / `sync_all()` + POSIX `sync_dir`).
-- In-flight crash kill points and corrupted WAL journals automatically heal and recover state (`recover_interrupted_transaction`) on subsequent command invocations.
+- Security-critical key, journal, and merge-target mutations use temporary replacement paths on the relevant filesystem; cache and stream-spool paths have separate cleanup and durability boundaries.
+- Critical file payloads and containing directories are asked to synchronize through (`fsync` / `sync_all()` plus POSIX directory synchronization where supported).
+- In-flight crash kill points and corrupted WAL journals are exercised for recovery by subsequent command invocations; this does not prove behavior for every filesystem or power-loss mode.
 
 ### Invariant C: Cross-Ring Isolation Invariant
 - Every recipient ring (`default`, `prod`, `dev`, etc.) operates with cryptographic and operational independence:
@@ -248,10 +246,10 @@ $$\text{Working tree} = \text{Plaintext} \iff \text{Git index / Object database}
 - Symlinks and NTFS reparse points targeting files outside the repository root or pointing into `.git-agecrypt` metadata directories are rejected (`ensure_not_symlink_or_reparse`).
 
 ### Invariant E: Zero-Plaintext Memory Invariant
-- Plaintext secrets held in memory by filter drivers, merge drivers, or secret runner routines are wrapped in `Zeroizing<T>` allocations and wiped with zeroes upon drop.
-- In-memory descriptor injection (`run --fd`) isolates runtime secrets from `/proc/<pid>/environ` argument inspections and sets `libc::prctl(PR_SET_DUMPABLE, 0)` in child processes on Linux to prevent ptrace/coredump leakage.
+- Some sensitive buffers use zeroizing allocations, but this is not a guarantee that every intermediate `String`, environment value, library buffer, or operating-system copy is wiped immediately.
+- Linux `run --fd` uses an anonymous descriptor and applies the implemented dumpability restriction to the child; this reduces specific inspection paths but does not eliminate operating-system memory capture, paging, or authorized child-process access.
 
 ### Invariant F: Idempotent Git Plumbing Invariant
-- Standard Git porcelain and plumbing commands (`stash push/pop`, `cherry-pick`, `rebase`, `merge`, `reset --hard`, `sparse-checkout`) preserve working tree plaintext and object database ciphertext idempotently.
-- Refreshing index stats (`git update-index -q --refresh`) ensures clean filter state without phantom modifications.
+- The listed Git porcelain and plumbing commands are exercised by the repository's tests for correctly configured encrypted paths; the result is not a guarantee for every Git command or filter configuration.
+- Refreshing index stats (`git update-index -q --refresh`) is used by the implementation and tests to check clean filter state without phantom modifications.
 

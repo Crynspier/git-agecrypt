@@ -241,7 +241,7 @@ pub fn run_3way_merge(
             None
         };
 
-        // Ensure disk flush before atomic rename (fail-closed durability)
+        // Request file synchronization before atomic rename; propagate failures on this critical path.
         temp_target.as_file().sync_all()?;
         crate::git::crash_point("after_merge_fsync");
 

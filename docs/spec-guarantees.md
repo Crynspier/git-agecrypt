@@ -1,6 +1,6 @@
 # Specification: Cryptographic Security Guarantees & Threat Model
 
-This document formally specifies the cryptographic and architectural guarantees of `git-agecrypt`.
+This document records the cryptographic and architectural properties that `git-agecrypt` implements, together with their operational limits and verification boundaries.
 
 ---
 
@@ -52,8 +52,8 @@ When executing commands via `git-agecrypt run --fd -- <cmd>`:
 
 - **No Application Temporary-File Exposure:** The `--fd` path does not intentionally write decrypted secrets to application temporary files. The operating system may still page or capture process memory; that is outside this tool's guarantee.
 - **Zero Environment Leakage:** Secrets are not passed in `argv` or inherited environment variables where other local users might inspect them via `ps` or `/proc/<pid>/cmdline`.
-- **Memory Dumpable Lockdown:** On Linux, child processes have `libc::prctl(PR_SET_DUMPABLE, 0)` set in `pre_exec`, preventing sibling processes under the same UID from reading memory via `/proc/<pid>/mem` or attaching debuggers via `ptrace`.
-- **Descriptor Reclaim:** Secrets are delivered over anonymous file descriptors (or `memfd_create`) which are automatically reclaimed by the kernel upon child process termination.
+- **Memory Dumpability Reduction:** On Linux, the child setup applies `libc::prctl(PR_SET_DUMPABLE, 0)` in `pre_exec`, reducing some same-user `/proc` and `ptrace` inspection paths. This does not prevent all memory capture, paging, or access by an authorized child.
+- **Descriptor Reclaim:** Linux secrets are delivered through an anonymous descriptor that is closed and reclaimed according to normal process/file-descriptor lifetime rules.
 
 ---
 
@@ -64,9 +64,9 @@ When executing commands via `git-agecrypt run --fd -- <cmd>`:
 
 ---
 
-## 6. v0.6.0 Verification Boundary
+## 6. Current Development Verification Boundary
 
-The guarantees above are implementation claims, not a promise that every operating-system primitive is available everywhere. The v0.6.0 verification evidence maps them as follows:
+The guarantees above are implementation claims, not a promise that every operating-system primitive is available everywhere. The current development verification evidence maps them as follows; this is not a claim that a v0.6.0 release has been published:
 
 | Guarantee | Implementation evidence | Verification boundary |
 |---|---|---|

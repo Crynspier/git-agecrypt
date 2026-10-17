@@ -236,8 +236,9 @@ pub fn is_shell_safe_repo_path(path: &str) -> bool {
         .any(|b| matches!(b, b'"' | b'`' | b'$' | b'\\' | 0x00..=0x1f | 0x7f))
 }
 
-/// Flushes the parent directory entry to durable storage on POSIX filesystems (directory fsync).
-/// Safe no-op on platforms or pseudo-filesystems that do not support directory fsync.
+/// Requests synchronization of the parent directory entry on POSIX filesystems (directory fsync).
+/// Safe no-op on platforms or pseudo-filesystems that do not support directory fsync;
+/// this is not a universal proof of physical-media persistence.
 pub fn sync_dir(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -547,7 +548,8 @@ impl GitRepo {
         Ok(state_dir)
     }
 
-    /// Path to local untracked temporary disk spool buffer directory (`.git/git-agecrypt/spool`).
+    /// Path to the local auxiliary spool/cleanup directory (`.git/git-agecrypt/spool`).
+    /// Large stream spools may instead use the host temporary-file facility.
     pub fn spool_dir(&self) -> PathBuf {
         let dir = self.local_state_dir().join("spool");
         ensure_extended_path(&dir)

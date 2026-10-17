@@ -1786,6 +1786,14 @@ fn pass_via_memfd(
 
     let raw_fd_val = std::mem::ManuallyDrop::new(file).as_raw_fd();
 
+    // Mark this process non-dumpable before creating the command process. The
+    // setting is inherited across fork and is also applied again in pre_exec
+    // immediately before exec, preventing same-UID proc/ptrace access to the
+    // inherited secret file descriptor.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("Failed to disable process dumping");
+    }
+
     let mut child = process::Command::new(&command[0]);
     child.args(&command[1..]);
     child.env("GIT_AGECRYPT_ENV_FD", raw_fd_val.to_string());

@@ -77,7 +77,7 @@ fn test_run_fd_child_reads_secret_and_proc_snooping_denied() {
         let pid_file = repo.join("run-fd-child.pid");
         let child_script = "echo $$ > \"$GIT_AGECRYPT_TEST_PID_FILE\"; sleep 5";
         let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("git-agecrypt"))
-            .args(["run", "--fd", "--", "sh", "-c", &child_script])
+            .args(["run", "--fd", "--", "sh", "-c", child_script])
             .current_dir(repo)
             .env("PATH", prepend_to_path(&bin_dir()))
             .env("GIT_AGECRYPT_TEST_PID_FILE", &pid_file)

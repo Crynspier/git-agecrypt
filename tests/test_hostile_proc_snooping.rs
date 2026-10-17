@@ -74,45 +74,33 @@ fn test_run_fd_child_reads_secret_and_proc_snooping_denied() {
         // cannot be opened. Modern Linux kernels no longer expose a Dumpable field
         // in /proc/<pid>/status; denying /proc/<pid>/mem is the direct observable
         // effect of PR_SET_DUMPABLE=0 that this test is intended to protect.
+        let pid_file = repo.join("run-fd-child.pid");
+        let child_script = "echo $$ > \"$GIT_AGECRYPT_TEST_PID_FILE\"; sleep 5";
         let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("git-agecrypt"))
-            .args(["run", "--fd", "--", "sh", "-c", "sleep 5"])
+            .args(["run", "--fd", "--", "sh", "-c", &child_script])
             .current_dir(repo)
             .env("PATH", prepend_to_path(&bin_dir()))
+            .env("GIT_AGECRYPT_TEST_PID_FILE", &pid_file)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("Failed to spawn run --fd child");
 
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        let parent_pid = child.id();
-        let mut found_non_dumpable = false;
-        if let Ok(entries) = std::fs::read_dir("/proc") {
-            for entry in entries.flatten() {
-                let pid_str = entry.file_name().to_string_lossy().to_string();
-                let Ok(pid) = pid_str.parse::<u32>() else {
-                    continue;
-                };
-                let stat_path = format!("/proc/{pid}/stat");
-                let Ok(stat) = std::fs::read_to_string(stat_path) else {
-                    continue;
-                };
-                let parts: Vec<&str> = stat.split_whitespace().collect();
-                let Some(ppid) = parts.get(3).and_then(|value| value.parse::<u32>().ok()) else {
-                    continue;
-                };
-                let mem_path = format!("/proc/{pid}/mem");
-                if ppid == parent_pid
-                    && std::fs::OpenOptions::new()
-                        .read(true)
-                        .open(mem_path)
-                        .is_err()
-                {
-                    found_non_dumpable = true;
-                    break;
-                }
-            }
-        }
+        let child_pid = (0..20).find_map(|_| {
+            std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+                .or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    None
+                })
+        });
+        let found_non_dumpable = child_pid.is_some_and(|pid| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .open(format!("/proc/{pid}/mem"))
+                .is_err()
+        });
 
         let _ = child.kill();
         let _ = child.wait();

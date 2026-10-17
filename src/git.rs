@@ -241,17 +241,16 @@ pub fn is_shell_safe_repo_path(path: &str) -> bool {
 pub fn sync_dir(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        if path.is_dir() {
-            if let Ok(dir) = File::open(path) {
-                match dir.sync_all() {
-                    Ok(()) => {}
-                    Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
-                    Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
-                    Err(e) => {
-                        return Err(e).with_context(|| {
-                            format!("Failed to fsync directory {}", path.display())
-                        });
-                    }
+        if path.is_dir()
+            && let Ok(dir) = File::open(path)
+        {
+            match dir.sync_all() {
+                Ok(()) => {}
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("Failed to fsync directory {}", path.display()));
                 }
             }
         }

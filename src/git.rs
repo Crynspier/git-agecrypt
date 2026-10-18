@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow};
+use fs2::FileExt;
 use glob::Pattern;
 use sha2::Digest;
 use std::fs::{self, File};
@@ -388,54 +389,26 @@ pub fn run_git_cmd_with_index_retry(
     }
 }
 
-pub struct RecoveryLockGuard(PathBuf);
-
-impl Drop for RecoveryLockGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
+pub struct RecoveryLockGuard {
+    // Keeping this handle alive keeps the OS-level lock held. The operating
+    // system releases it when the handle or owning process goes away.
+    #[allow(dead_code)]
+    file: File,
 }
 
 fn acquire_recovery_lock(state_dir: &Path) -> Result<RecoveryLockGuard> {
     fs::create_dir_all(state_dir).context("Failed to create local state directory")?;
     let lock_path = state_dir.join("recovery.lock");
-    let start = std::time::Instant::now();
-    loop {
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(mut file) => {
-                let _ = writeln!(file, "{}", std::process::id());
-                return Ok(RecoveryLockGuard(lock_path));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                let mut stale = false;
-                if let Ok(content) = fs::read_to_string(&lock_path)
-                    && let Some(pid) = content.lines().next().and_then(|line| line.parse().ok())
-                {
-                    stale = !is_pid_alive(pid);
-                }
-                if !stale
-                    && let Ok(metadata) = fs::metadata(&lock_path)
-                    && let Ok(mtime) = metadata.modified()
-                    && let Ok(age) = mtime.elapsed()
-                {
-                    stale = age > std::time::Duration::from_secs(30);
-                }
-                if stale {
-                    let _ = fs::remove_file(&lock_path);
-                    continue;
-                }
-                if start.elapsed() > std::time::Duration::from_secs(30) {
-                    return Err(anyhow!("Timed out waiting for concurrent lock recovery"));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            Err(err) => return Err(err).context("Failed to acquire lock recovery guard"),
-        }
-    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open recovery lock {}", lock_path.display()))?;
+    file.lock_exclusive()
+        .with_context(|| format!("Failed to acquire recovery lock {}", lock_path.display()))?;
+    Ok(RecoveryLockGuard { file })
 }
 
 pub struct GitRepo {
@@ -1290,7 +1263,9 @@ impl GitRepo {
         Ok(())
     }
 
-    /// Executes a closure during lock, rolling back `repo.key` and re-smudging files if the operation fails.
+    /// Executes the mutation phase of a lock command while the caller holds
+    /// the repository-wide recovery guard, rolling back `repo.key` and
+    /// re-smudging files if the operation fails.
     /// Atomically stages `repo.key` -> `repo.key.locking`.
     /// If `f()` succeeds: removes `repo.key.locking` and `lock.journal`.
     /// If `f()` fails: restores `repo.key.locking` -> `repo.key` AND replays recovery from `lock.journal`.
@@ -1300,13 +1275,14 @@ impl GitRepo {
         f: F,
     ) -> Result<()> {
         let key_file = self.local_master_key_file_for_ring(ring);
+
+        // The caller holds the repository-wide recovery guard for the complete
+        // lock command, including its preflight checks. This prevents startup
+        // recovery or another key-changing command from observing half of the
+        // transaction between validation and mutation.
         if !key_file.exists() {
             return f();
         }
-
-        // Keep startup recovery from replaying the shared journal or invoking
-        // Git while this lock transaction is changing the worktree.
-        let _transaction_guard = acquire_recovery_lock(&self.local_state_dir())?;
 
         crash_point("before_tx_begin");
 
@@ -3178,6 +3154,34 @@ fn sweep_tmp_recursive(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_recovery_lock_serializes_concurrent_acquisition() {
+        let temp = tempfile::tempdir().expect("Failed to create temporary lock directory");
+        let state_dir = temp.path().to_path_buf();
+        let first = acquire_recovery_lock(&state_dir).expect("First lock acquisition failed");
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let waiter_dir = state_dir.clone();
+        let waiter = std::thread::spawn(move || {
+            let _guard =
+                acquire_recovery_lock(&waiter_dir).expect("Waiter lock acquisition failed");
+            acquired_tx
+                .send(())
+                .expect("Failed to report lock acquisition");
+        });
+
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "A second process must not enter while the first lock is held"
+        );
+        drop(first);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("Waiter did not acquire the lock after release");
+        waiter.join().expect("Lock waiter thread panicked");
+    }
 
     #[test]
     fn test_ensure_extended_path_slash_normalization() {

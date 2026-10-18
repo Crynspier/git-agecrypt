@@ -205,6 +205,7 @@ fn run(cli: Cli) -> Result<()> {
 fn cmd_init(create_gitattributes: bool, ai_shield: bool, ring_opt: Option<&str>) -> Result<()> {
     let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
+    let _recovery_guard = repo.acquire_recovery_lock()?;
     let is_default_ring = matches!(ring_opt, None | Some("default") | Some(""));
 
     if is_default_ring {
@@ -344,6 +345,7 @@ fn cmd_add_recipient(
 
     let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
+    let _recovery_guard = repo.acquire_recovery_lock()?;
     let master_key = repo.read_local_master_key_for_ring(ring_opt)?.ok_or_else(|| {
         anyhow!(
             "Repository/ring is locked. You must run 'git-agecrypt unlock' before adding recipients."
@@ -482,6 +484,7 @@ fn cmd_add_recipient(
 fn cmd_remove_recipient(name: &str, ring_opt: Option<&str>) -> Result<()> {
     let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
+    let _recovery_guard = repo.acquire_recovery_lock()?;
     let keys_dir = repo.keys_dir_for_ring(ring_opt);
     let label = name.trim_end_matches(".age");
     // M1: reject path separators, traversal segments, and control characters so a
@@ -820,6 +823,7 @@ impl Drop for ReadonlyGuard {
 
 fn cmd_rewrap(paths: &[PathBuf], all: bool, identity_opt: Option<&str>, force: bool) -> Result<()> {
     let repo = GitRepo::discover()?;
+    let _recovery_guard = repo.acquire_recovery_lock()?;
 
     let master_key_str = repo.read_local_master_key()?.ok_or_else(|| {
         anyhow!("Repository is locked. Run 'git-agecrypt unlock' before rewrapping.")
@@ -1270,6 +1274,7 @@ fn cmd_unlock(key_file: Option<&str>, force: bool, ring_opt: Option<&str>) -> Re
 fn cmd_lock(force: bool, ring_opt: Option<&str>) -> Result<()> {
     let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
+    let _transaction_guard = repo.acquire_recovery_lock()?;
 
     if let Some(op) = repo.check_active_git_operations()?
         && !force

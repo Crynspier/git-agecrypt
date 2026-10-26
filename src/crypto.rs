@@ -534,10 +534,11 @@ fn encrypt_plaintext_stream<R: Read, W: Write>(
             if is_valid {
                 // Touch mtime on cache hit to maintain true LRU (Least Recently Used) ordering
                 let _ = filetime::set_file_mtime(&cache_file, filetime::FileTime::now());
-                let mut cached_reader = File::open(&cache_file)?;
-                io::copy(&mut cached_reader, &mut output)?;
-                output.flush()?;
-                return Ok(());
+                if let Ok(mut cached_reader) = File::open(&cache_file) {
+                    io::copy(&mut cached_reader, &mut output)?;
+                    output.flush()?;
+                    return Ok(());
+                }
             } else {
                 // Corrupted, truncated, or tampered cache entry: treat as cache miss and purge bad entry
                 eprintln!(
@@ -840,7 +841,7 @@ pub fn smudge_stream<R: Read, W: Write>(
                 t.flush()?;
                 Ok(t)
             });
-        let cipher_temp = match spooled {
+        let mut cipher_temp = match spooled {
             Ok(t) => t,
             Err(e) => {
                 eprintln!(
@@ -853,8 +854,9 @@ pub fn smudge_stream<R: Read, W: Write>(
         };
 
         let hash_hex: String = {
-            let cipher_file = File::open(cipher_temp.path())?;
-            let decryptor = age::Decryptor::new(cipher_file)
+            use io::{Seek, SeekFrom};
+            cipher_temp.as_file_mut().seek(SeekFrom::Start(0))?;
+            let decryptor = age::Decryptor::new(cipher_temp.as_file_mut())
                 .map_err(|e| anyhow!("Failed to parse age ciphertext in smudge filter: {e}"))?;
 
             if decryptor.is_scrypt() {
@@ -873,8 +875,8 @@ pub fn smudge_stream<R: Read, W: Write>(
                         "git-agecrypt smudge [WARNING]: File is encrypted with a historical or foreign key (cannot decrypt with active master key). \
                          Leaving raw ciphertext on disk. Run 'git-agecrypt rewrap' to re-encrypt under active master key."
                     );
-                    let mut raw_file = File::open(cipher_temp.path())?;
-                    io::copy(&mut raw_file, &mut output)?;
+                    cipher_temp.as_file_mut().seek(SeekFrom::Start(0))?;
+                    io::copy(cipher_temp.as_file_mut(), &mut output)?;
                     output.flush()?;
                     return Ok(());
                 }

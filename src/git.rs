@@ -1639,8 +1639,11 @@ impl GitRepo {
             return Ok(None);
         }
         ensure_not_symlink_or_reparse(&key_file)?;
-        let content = fs::read_to_string(key_file)?;
-        Ok(Some(content.trim().to_string()))
+        match fs::read_to_string(&key_file) {
+            Ok(content) => Ok(Some(content.trim().to_string())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("Failed to read {}", key_file.display())),
+        }
     }
 
     /// Checks if the locally saved master key is stale relative to the committed `.git-agecrypt/repo.pub`.
@@ -3216,7 +3219,7 @@ impl GitRepo {
                                     .decrypt(std::iter::once(active_id as &dyn age::Identity))
                             {
                                 // Working-tree file is already decrypted plaintext, while the index blob
-                                // is still encrypted under a pre-rotation key (e.g. after an interrupted ekey).
+                                // is still encrypted under a pre-rotation key (e.g. after an interrupted rekey).
                                 // Preserve the working-tree plaintext and renormalize the index under the active key.
                                 files_to_renormalize.push(rel_path.to_string());
                                 continue;

@@ -101,7 +101,6 @@ fn test_run_fd_inheritance_boundaries() {
             "--",
             bin_path.to_str().unwrap(),
             "__test-dumpable",
-            "--output",
             dump_out_file.to_str().unwrap(),
         ]);
         cmd.assert().success();

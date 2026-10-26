@@ -1400,11 +1400,13 @@ impl GitRepo {
         Ok(unreachable)
     }
 
-    /// Recursively scans .git/git-agecrypt/ and removes any abandoned temporary spool files
-    /// (e.g. .tmp*, *tmp*, *.tmp) while strictly preserving persistent files (repo.key, *.age, *.pub).
     /// Recovers an interrupted rekey transaction for a ring, rolling back to the previous
     /// generation if interrupted before complete activation, or completing cleanup if all
     /// metadata was already activated.
+    ///
+    /// Preserves the journal and backups until restoration is verified consistent, and
+    /// propagates any restoration or verification errors to prevent premature deletion
+    /// of recovery material.
     pub fn recover_interrupted_rekey_for_ring(
         &self,
         ring: Option<&str>,
@@ -1445,49 +1447,158 @@ impl GitRepo {
             && current_pub_trimmed == expected_pub
             && master_matches_new
         {
-            // Completed rekey transaction: cleanup auxiliary staging and backup
+            // Completed key metadata rotation (Phase 1 key rotation succeeded before crash):
+            // Clean up auxiliary staging and backup directories, and delete journal.
             let _ = fs::remove_dir_all(&staging_dir);
-            let _ = fs::remove_dir_all(&backup_dir);
-            let _ = fs::remove_file(rekey_journal);
+            if backup_dir.exists() {
+                fs::remove_dir_all(&backup_dir).context(
+                    "Failed to clean up rekey backup directory after completed rotation",
+                )?;
+            }
+            fs::remove_file(rekey_journal)
+                .context("Failed to remove rekey journal after completed rotation")?;
+
+            let ring_label = ring.unwrap_or("default");
+            eprintln!(
+                "git-agecrypt [NOTICE]: Rekey key rotation for ring '{ring_label}' was previously completed. If any working tree secrets were not yet committed, run 'git-agecrypt rewrap --all' to ensure all files are re-staged."
+            );
         } else {
-            // Interrupted rekey transaction: roll back all recipient envelopes and master key
+            // Interrupted rekey transaction (interrupted before key rotation was fully active):
+            // Roll back all recipient envelopes, repo.pub, and master key to the previous generation.
             if backup_dir.exists() {
                 let backup_pub = backup_dir.join("repo.pub");
                 if backup_pub.exists() {
-                    let _ = fs::copy(&backup_pub, &pub_file);
+                    let pub_content = fs::read(&backup_pub).with_context(|| {
+                        format!("Failed to read backup public key {}", backup_pub.display())
+                    })?;
+                    write_atomic_metadata_file(&pub_file, &pub_content).with_context(|| {
+                        format!("Failed to restore public key from {}", backup_pub.display())
+                    })?;
                 }
+
                 let backup_keys = backup_dir.join("keys");
                 let keys_dir = self.keys_dir_for_ring(ring);
-                if backup_keys.exists() && keys_dir.exists() {
+                if backup_keys.exists() {
+                    fs::create_dir_all(&keys_dir).with_context(|| {
+                        format!("Failed to ensure keys directory {}", keys_dir.display())
+                    })?;
+
                     // Restore all backup keys
-                    if let Ok(entries) = fs::read_dir(&backup_keys) {
-                        for entry in entries.flatten() {
-                            let p = entry.path();
-                            if p.is_file() {
-                                let dest = keys_dir.join(entry.file_name());
-                                let _ = fs::copy(&p, &dest);
-                            }
+                    for entry in fs::read_dir(&backup_keys).with_context(|| {
+                        format!(
+                            "Failed to read backup keys directory {}",
+                            backup_keys.display()
+                        )
+                    })? {
+                        let entry = entry?;
+                        let p = entry.path();
+                        if p.is_file() {
+                            let dest = keys_dir.join(entry.file_name());
+                            let content = fs::read(&p).with_context(|| {
+                                format!("Failed to read backup key envelope {}", p.display())
+                            })?;
+                            write_atomic_metadata_file(&dest, &content).with_context(|| {
+                                format!("Failed to restore recipient envelope {}", dest.display())
+                            })?;
                         }
                     }
-                    // Remove any newly staged keys that didn't exist in backup
-                    if let Ok(entries) = fs::read_dir(&keys_dir) {
-                        for entry in entries.flatten() {
+
+                    // Remove any newly staged/activated keys that did not exist in backup
+                    if keys_dir.exists() {
+                        for entry in fs::read_dir(&keys_dir).with_context(|| {
+                            format!("Failed to read keys directory {}", keys_dir.display())
+                        })? {
+                            let entry = entry?;
                             let p = entry.path();
                             if p.is_file() && !backup_keys.join(entry.file_name()).exists() {
-                                let _ = fs::remove_file(&p);
+                                fs::remove_file(&p).with_context(|| {
+                                    format!(
+                                        "Failed to clean up uncommitted key envelope {}",
+                                        p.display()
+                                    )
+                                })?;
                             }
                         }
                     }
                 }
+
                 let backup_key = backup_dir.join("repo.key");
-                let dest_key = self.local_master_key_file_for_ring(ring);
                 if backup_key.exists() {
-                    let _ = fs::copy(&backup_key, &dest_key);
+                    let key_str = fs::read_to_string(&backup_key).with_context(|| {
+                        format!("Failed to read backup master key {}", backup_key.display())
+                    })?;
+                    self.save_local_master_key_for_ring(&key_str, ring)
+                        .context("Failed to restore local master key from backup")?;
+                }
+
+                // Verify repository consistency after restoration BEFORE deleting recovery assets:
+                // 1. Verify repo.pub matches backup_pub
+                if backup_pub.exists() {
+                    let current_pub = fs::read_to_string(&pub_file)
+                        .context("Failed to read restored public key for consistency check")?;
+                    let expected_backup_pub = fs::read_to_string(&backup_pub)
+                        .context("Failed to read backup public key for consistency check")?;
+                    if current_pub.trim() != expected_backup_pub.trim() {
+                        return Err(anyhow!(
+                            "Rekey recovery consistency check failed: restored public key does not match backup"
+                        ));
+                    }
+                }
+
+                // 2. Verify all restored recipient envelopes parse validly
+                if backup_keys.exists() {
+                    for entry in fs::read_dir(&backup_keys)? {
+                        let entry = entry?;
+                        let p = entry.path();
+                        if p.is_file() {
+                            let dest = keys_dir.join(entry.file_name());
+                            if !dest.exists() {
+                                return Err(anyhow!(
+                                    "Rekey recovery consistency check failed: restored key envelope {} is missing",
+                                    dest.display()
+                                ));
+                            }
+                            let content = fs::read_to_string(&dest).with_context(|| {
+                                format!("Failed to read restored envelope {}", dest.display())
+                            })?;
+                            crate::format::validate_wrapped_key_envelope(&content).with_context(
+                                || {
+                                    format!(
+                                        "Restored envelope {} failed envelope validation",
+                                        dest.display()
+                                    )
+                                },
+                            )?;
+                        }
+                    }
+                }
+
+                // 3. Verify local master key matches repo.pub if both are restored
+                if backup_key.exists() {
+                    let restored_master = self
+                        .read_local_master_key_for_ring(ring)
+                        .context("Failed to read restored master key for consistency check")?
+                        .ok_or_else(|| anyhow!("Restored master key is missing"))?;
+                    let id = age::x25519::Identity::from_str(&restored_master)
+                        .map_err(|e| anyhow!("Restored master key is invalid: {e}"))?;
+                    let restored_pub = fs::read_to_string(&pub_file)
+                        .context("Failed to read restored public key")?;
+                    if format!("{}", id.to_public()) != restored_pub.trim() {
+                        return Err(anyhow!(
+                            "Rekey recovery consistency check failed: restored master key does not match restored repo.pub"
+                        ));
+                    }
                 }
             }
+
+            // Only remove staging, backup, and journal AFTER restoration and verification succeed!
             let _ = fs::remove_dir_all(&staging_dir);
-            let _ = fs::remove_dir_all(&backup_dir);
-            let _ = fs::remove_file(rekey_journal);
+            if backup_dir.exists() {
+                fs::remove_dir_all(&backup_dir)
+                    .context("Failed to clean up rekey backup directory")?;
+            }
+            fs::remove_file(rekey_journal).context("Failed to remove rekey recovery journal")?;
+
             let ring_label = ring.unwrap_or("default");
             eprintln!(
                 "git-agecrypt [WARNING]: Recovered interrupted rekey transaction for ring '{ring_label}'. Rolled back recipient envelopes and master key to previous generation."
@@ -1497,6 +1608,8 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Recursively scans .git/git-agecrypt/ and removes any abandoned temporary spool files
+    /// (e.g. .tmp*, *tmp*, *.tmp) while strictly preserving persistent files (repo.key, *.age, *.pub).
     pub fn sweep_orphaned_tmp_files(&self) {
         let state_dir = self.local_state_dir();
         sweep_tmp_recursive(&state_dir);

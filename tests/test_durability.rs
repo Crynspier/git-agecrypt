@@ -323,4 +323,35 @@ fn test_interrupted_rekey_and_rewrap_recovery() {
     // `check` confirms the staged blob in the index is now encrypted under the active master key
     agecrypt_cmd(repo).arg("check").assert().success();
     assert_invariant_a(repo, "vault.secret.env", expected_secret);
+
+    // 4. Test crash during Phase 2 (after key metadata activation, before staging completion):
+    let mut crash_phase2 = agecrypt_cmd(repo);
+    crash_phase2
+        .env("GIT_AGECRYPT_CRASH_POINT", "after_rekey_cache_purge")
+        .arg("rekey")
+        .assert()
+        .failure();
+
+    // Verify recovery recognizes completed key rotation and retains active keys
+    let status_out = agecrypt_cmd(repo).arg("status").output().unwrap();
+    assert!(status_out.status.success());
+    let stderr_str = String::from_utf8_lossy(&status_out.stderr);
+    assert!(
+        stderr_str.contains("Rekey key rotation for ring 'default' was previously completed")
+            || stderr_str.contains("NOTICE"),
+        "stderr: {stderr_str}"
+    );
+
+    // Finalize staging with git add and check passes
+    run_git(repo, &["add", ".git-agecrypt", "vault.secret.env"]);
+    run_git(
+        repo,
+        &[
+            "commit",
+            "-m",
+            "Finalized rekey rotation after phase 2 interruption",
+        ],
+    );
+    agecrypt_cmd(repo).arg("check").assert().success();
+    assert_invariant_a(repo, "vault.secret.env", expected_secret);
 }

@@ -722,39 +722,97 @@ fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
         ));
     }
 
-    // 2. Generate brand new master identity
+    // 2. Setup transactional backup and staging directories
+    let state_dir = repo.ensure_local_state_dir_for_ring(ring_opt)?;
+    let backup_dir = state_dir.join("rekey.backup");
+    let staging_dir = state_dir.join("rekey.staging");
+    let rekey_journal = state_dir.join("rekey.journal");
+
+    if backup_dir.exists() {
+        let _ = fs::remove_dir_all(&backup_dir);
+    }
+    if staging_dir.exists() {
+        let _ = fs::remove_dir_all(&staging_dir);
+    }
+    fs::create_dir_all(backup_dir.join("keys"))?;
+    fs::create_dir_all(staging_dir.join("keys"))?;
+
+    let pub_file = repo.public_key_file_for_ring(ring_opt);
+    if pub_file.exists() {
+        fs::copy(&pub_file, backup_dir.join("repo.pub"))?;
+    }
+    for (path, _, _) in &recipients_to_rekey {
+        if let Some(file_name) = path.file_name() {
+            fs::copy(path, backup_dir.join("keys").join(file_name))?;
+        }
+    }
+    let local_key_file = repo.local_master_key_file_for_ring(ring_opt);
+    if local_key_file.exists() {
+        fs::copy(&local_key_file, backup_dir.join("repo.key"))?;
+    }
+
+    // 3. Generate brand new master identity
     let (new_identity, new_recipient) = crypto::generate_master_identity();
     let new_secret_str = new_identity.to_string();
 
-    // 3. Re-wrap new master key for all remaining recipients atomically
+    let journal_content = format!(
+        "# format-version: 1\nring: {}\nnew_recipient: {}\n",
+        ring_opt.unwrap_or("default"),
+        new_recipient
+    );
+    let mut jf = File::create(&rekey_journal)?;
+    jf.write_all(journal_content.as_bytes())?;
+    jf.flush()?;
+    jf.sync_all()?;
+    git::sync_dir(&state_dir)?;
+    git::crash_point("after_rekey_journal_create");
+
+    // 4. Re-wrap new master key for all recipients into staging and verify each
     for (path, pub_str, recipient) in &recipients_to_rekey {
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| anyhow!("Invalid recipient path {}", path.display()))?;
+        let staging_key_path = staging_dir.join("keys").join(file_name);
         let new_wrapped = crypto::wrap_master_key_with_metadata(
             new_secret_str.expose_secret(),
             recipient.as_ref(),
             pub_str,
         )?;
-        git::write_atomic_metadata_file(path, new_wrapped.as_bytes())?;
+        fs::write(&staging_key_path, new_wrapped.as_bytes())?;
+
+        // Cryptographically verify recipient envelope syntax and age header before activating
+        if let Err(e) = format::validate_wrapped_key_envelope(&new_wrapped) {
+            let _ = fs::remove_file(&rekey_journal);
+            let _ = fs::remove_dir_all(&staging_dir);
+            let _ = fs::remove_dir_all(&backup_dir);
+            return Err(anyhow!(
+                "Sanity check failed for newly wrapped recipient envelope {}: {e}",
+                staging_key_path.display()
+            ));
+        }
+    }
+    git::crash_point("after_rekey_staging_verified");
+
+    // 5. Activation phase: atomically replace recipient envelopes, repo.pub, and local master key
+    for (path, _, _) in &recipients_to_rekey {
+        let file_name = path.file_name().unwrap();
+        let staging_key_path = staging_dir.join("keys").join(file_name);
+        let content = fs::read(&staging_key_path)?;
+        git::write_atomic_metadata_file(path, &content)?;
         let name_display = path
             .file_name()
             .map(|s| s.to_string_lossy())
             .unwrap_or_default();
         eprintln!("  * Re-wrapped key for {name_display}");
     }
+    git::crash_point("during_rekey_envelope_switch");
 
-    // 4. Update repo.pub atomically
-    let pub_file = repo.public_key_file_for_ring(ring_opt);
     git::write_atomic_metadata_file(&pub_file, format!("{new_recipient}\n").as_bytes())?;
-
     git::crash_point("after_rekey_pub_write");
 
-    // 5. Update local master key in common git dir atomically and clear stale cache
     repo.save_local_master_key_for_ring(new_secret_str.expose_secret(), ring_opt)?;
     git::crash_point("after_rekey_key_saved");
-    // The cache contains only auxiliary ciphertext and is intentionally
-    // best-effort. A concurrent clean filter may have a cache file open;
-    // rekey must not fail or roll back key rotation because that cache cannot
-    // be removed immediately. The new public key selects a fresh cache
-    // namespace, so stale entries are unusable with the new master key.
+
     repo.clear_cache_for_ring(ring_opt, false)?;
     git::crash_point("after_rekey_cache_purge");
     git::crash_point("after_old_delete");
@@ -780,6 +838,7 @@ fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
     if !secret_files.is_empty() {
         eprintln!("Re-encrypting working tree secrets with the new master key...");
         let mut streamed_ok = false;
+        let mut last_staging_err = None;
         for attempt in 1..=3 {
             let child = git::git_cmd_with_path(&repo.root)
                 .args([
@@ -794,14 +853,20 @@ fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
 
             match child {
                 Ok(mut c) => {
+                    let mut stdin_err = None;
                     if let Some(mut stdin) = c.stdin.take() {
                         for f in &secret_files {
-                            let _ = stdin.write_all(f.as_bytes());
-                            let _ = stdin.write_all(b"\0");
+                            if let Err(e) = stdin
+                                .write_all(f.as_bytes())
+                                .and_then(|_| stdin.write_all(b"\0"))
+                            {
+                                stdin_err = Some(e);
+                                break;
+                            }
                         }
                     }
                     if let Ok(out) = c.wait_with_output() {
-                        if out.status.success() {
+                        if out.status.success() && stdin_err.is_none() {
                             streamed_ok = true;
                             break;
                         }
@@ -812,13 +877,26 @@ fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
                             ));
                             continue;
                         }
+                        last_staging_err = Some(if let Some(e) = stdin_err {
+                            format!("stdin write error: {e}; git add stderr: {err}")
+                        } else {
+                            format!("git add exit {}: {err}", out.status)
+                        });
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    last_staging_err = Some(format!("failed to spawn git add: {e}"));
+                    break;
+                }
             }
         }
 
         if !streamed_ok {
+            if let Some(ref err) = last_staging_err {
+                eprintln!(
+                    "git-agecrypt rekey [NOTICE]: Primary streamed staging fallback triggered: {err}"
+                );
+            }
             // Fallback for older git versions or environments without pathspec-from-file support:
             // small command-line batches respecting Windows 8,191/32,767 character limits
             let mut current_batch: Vec<&str> = Vec::new();
@@ -827,7 +905,17 @@ fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
                 if current_len + f.len() > 8000 && !current_batch.is_empty() {
                     let mut args = vec!["add", "--renormalize", "--"];
                     args.extend(current_batch.iter());
-                    let _ = git::run_git_cmd_with_index_retry(&repo.root, &args, 3);
+                    let out = git::run_git_cmd_with_index_retry(&repo.root, &args, 3)
+                        .with_context(|| "Failed to execute git add fallback batch")?;
+                    if !out.status.success() {
+                        let err_msg = String::from_utf8_lossy(&out.stderr);
+                        return Err(anyhow!(
+                            "Failed to re-stage re-encrypted secret files (batch exit {}): {err_msg}\n\
+                             Master key metadata was rotated, but staging of secrets failed.\n\
+                             Run 'git-agecrypt rewrap --all' to re-stage remaining secrets.",
+                            out.status
+                        ));
+                    }
                     current_batch.clear();
                     current_len = 0;
                 }
@@ -837,10 +925,26 @@ fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
             if !current_batch.is_empty() {
                 let mut args = vec!["add", "--renormalize", "--"];
                 args.extend(current_batch.iter());
-                let _ = git::run_git_cmd_with_index_retry(&repo.root, &args, 3);
+                let out = git::run_git_cmd_with_index_retry(&repo.root, &args, 3)
+                    .with_context(|| "Failed to execute git add fallback batch")?;
+                if !out.status.success() {
+                    let err_msg = String::from_utf8_lossy(&out.stderr);
+                    return Err(anyhow!(
+                        "Failed to re-stage re-encrypted secret files (batch exit {}): {err_msg}\n\
+                         Master key metadata was rotated, but staging of secrets failed.\n\
+                         Run 'git-agecrypt rewrap --all' to re-stage remaining secrets.",
+                        out.status
+                    ));
+                }
             }
         }
     }
+
+    // 7. Completed successfully: remove transaction journal, backup, and staging
+    let _ = fs::remove_dir_all(&staging_dir);
+    let _ = fs::remove_dir_all(&backup_dir);
+    let _ = fs::remove_file(&rekey_journal);
+    git::crash_point("after_rekey_cleanup");
 
     eprintln!();
     eprintln!("Repository successfully re-keyed!");

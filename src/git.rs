@@ -1083,6 +1083,18 @@ impl GitRepo {
             }
         }
 
+        // Check for interrupted rekey transactions across all rings
+        for (ring_name, state_dir) in &ring_state_dirs {
+            let rekey_journal = state_dir.join("rekey.journal");
+            if rekey_journal.exists() {
+                self.recover_interrupted_rekey_for_ring(
+                    ring_name.as_deref(),
+                    state_dir,
+                    &rekey_journal,
+                )?;
+            }
+        }
+
         if !any_locking_found && journal_file.exists() {
             // Validate journal syntax first so a corrupted journal is never silently discarded.
             let content = fs::read_to_string(&journal_file)
@@ -1390,6 +1402,101 @@ impl GitRepo {
 
     /// Recursively scans .git/git-agecrypt/ and removes any abandoned temporary spool files
     /// (e.g. .tmp*, *tmp*, *.tmp) while strictly preserving persistent files (repo.key, *.age, *.pub).
+    /// Recovers an interrupted rekey transaction for a ring, rolling back to the previous
+    /// generation if interrupted before complete activation, or completing cleanup if all
+    /// metadata was already activated.
+    pub fn recover_interrupted_rekey_for_ring(
+        &self,
+        ring: Option<&str>,
+        state_dir: &Path,
+        rekey_journal: &Path,
+    ) -> Result<()> {
+        let content =
+            fs::read_to_string(rekey_journal).context("Failed to read rekey recovery journal")?;
+
+        let mut new_recipient_expected = None;
+        for line in content.lines() {
+            let line = line.trim();
+            if let Some(val) = line.strip_prefix("new_recipient:") {
+                new_recipient_expected = Some(val.trim().to_string());
+            }
+        }
+
+        let pub_file = self.public_key_file_for_ring(ring);
+        let current_pub = fs::read_to_string(&pub_file).unwrap_or_default();
+        let current_pub_trimmed = current_pub.trim();
+
+        let current_master_key = self.read_local_master_key_for_ring(ring).ok().flatten();
+        let master_matches_new = match (&new_recipient_expected, &current_master_key) {
+            (Some(expected), Some(mk)) => {
+                if let Ok(id) = age::x25519::Identity::from_str(mk) {
+                    format!("{}", id.to_public()) == *expected
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+
+        let backup_dir = state_dir.join("rekey.backup");
+        let staging_dir = state_dir.join("rekey.staging");
+
+        if let Some(ref expected_pub) = new_recipient_expected
+            && current_pub_trimmed == expected_pub
+            && master_matches_new
+        {
+            // Completed rekey transaction: cleanup auxiliary staging and backup
+            let _ = fs::remove_dir_all(&staging_dir);
+            let _ = fs::remove_dir_all(&backup_dir);
+            let _ = fs::remove_file(rekey_journal);
+        } else {
+            // Interrupted rekey transaction: roll back all recipient envelopes and master key
+            if backup_dir.exists() {
+                let backup_pub = backup_dir.join("repo.pub");
+                if backup_pub.exists() {
+                    let _ = fs::copy(&backup_pub, &pub_file);
+                }
+                let backup_keys = backup_dir.join("keys");
+                let keys_dir = self.keys_dir_for_ring(ring);
+                if backup_keys.exists() && keys_dir.exists() {
+                    // Restore all backup keys
+                    if let Ok(entries) = fs::read_dir(&backup_keys) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.is_file() {
+                                let dest = keys_dir.join(entry.file_name());
+                                let _ = fs::copy(&p, &dest);
+                            }
+                        }
+                    }
+                    // Remove any newly staged keys that didn't exist in backup
+                    if let Ok(entries) = fs::read_dir(&keys_dir) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.is_file() && !backup_keys.join(entry.file_name()).exists() {
+                                let _ = fs::remove_file(&p);
+                            }
+                        }
+                    }
+                }
+                let backup_key = backup_dir.join("repo.key");
+                let dest_key = self.local_master_key_file_for_ring(ring);
+                if backup_key.exists() {
+                    let _ = fs::copy(&backup_key, &dest_key);
+                }
+            }
+            let _ = fs::remove_dir_all(&staging_dir);
+            let _ = fs::remove_dir_all(&backup_dir);
+            let _ = fs::remove_file(rekey_journal);
+            let ring_label = ring.unwrap_or("default");
+            eprintln!(
+                "git-agecrypt [WARNING]: Recovered interrupted rekey transaction for ring '{ring_label}'. Rolled back recipient envelopes and master key to previous generation."
+            );
+        }
+
+        Ok(())
+    }
+
     pub fn sweep_orphaned_tmp_files(&self) {
         let state_dir = self.local_state_dir();
         sweep_tmp_recursive(&state_dir);

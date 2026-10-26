@@ -830,95 +830,84 @@ pub fn smudge_stream<R: Read, W: Write>(
         return Ok(());
     };
 
-    if let (Some(c_dir), Some(key)) = (cache_dir, cache_key) {
-        // H13: the ciphertext cache is auxiliary. If the cache directory cannot be created
-        // or written (permissions, quota, read-only mount), fall back to passing the raw
-        // ciphertext through instead of aborting the user's checkout.
-        let spooled = fs::create_dir_all(c_dir)
-            .and_then(|_| tempfile::NamedTempFile::new_in(c_dir))
-            .and_then(|mut t| {
-                io::copy(&mut stream, &mut t)?;
-                t.flush()?;
-                Ok(t)
-            });
-        let mut cipher_temp = match spooled {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!(
-                    "git-agecrypt smudge [WARNING]: ciphertext cache unavailable ({e}); leaving raw ciphertext on disk."
-                );
-                io::copy(&mut stream, &mut output)?;
-                output.flush()?;
-                return Ok(());
-            }
-        };
+    // Spool the incoming ciphertext completely into memory (<=1 MiB) or disk tempfile (>1 MiB).
+    // This guarantees that any stream read failure fails closed before writing to output,
+    // and eliminates the stream truncation bug when retrying or falling back.
+    let (spool, _) = spool_stream(stream, cache_dir, None)?;
+    let probe_reader = spool.reader()?;
+    let decryptor = age::Decryptor::new(probe_reader)
+        .map_err(|e| anyhow!("Failed to parse age ciphertext in smudge filter: {e}"))?;
 
-        let hash_hex: String = {
-            use io::{Seek, SeekFrom};
-            cipher_temp.as_file_mut().seek(SeekFrom::Start(0))?;
-            let decryptor = age::Decryptor::new(cipher_temp.as_file_mut())
-                .map_err(|e| anyhow!("Failed to parse age ciphertext in smudge filter: {e}"))?;
+    if decryptor.is_scrypt() {
+        return Err(anyhow!(
+            "Unexpected passphrase-encrypted file in git repository"
+        ));
+    }
 
-            if decryptor.is_scrypt() {
-                return Err(anyhow!(
-                    "Unexpected passphrase-encrypted file in git repository"
-                ));
-            }
-
-            let decrypt_res = decryptor.decrypt(std::iter::once(id));
-            let mut reader = match decrypt_res {
-                Ok(r) => r,
-                Err(
-                    age::DecryptError::NoMatchingKeys | age::DecryptError::ExcessiveWork { .. },
-                ) => {
-                    eprintln!(
-                        "git-agecrypt smudge [WARNING]: File is encrypted with a historical or foreign key (cannot decrypt with active master key). \
-                         Leaving raw ciphertext on disk. Run 'git-agecrypt rewrap' to re-encrypt under active master key."
-                    );
-                    cipher_temp.as_file_mut().seek(SeekFrom::Start(0))?;
-                    io::copy(cipher_temp.as_file_mut(), &mut output)?;
-                    output.flush()?;
-                    return Ok(());
-                }
-                Err(e) => {
-                    return Err(anyhow!(
-                        "Failed to decrypt age ciphertext during smudge filter: {e}"
-                    ));
-                }
-            };
-
-            let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key valid");
-            let mut buf = [0u8; 64 * 1024];
-            loop {
-                let n = reader.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                mac.update(&buf[..n]);
-                output.write_all(&buf[..n])?;
-            }
+    let decrypt_res = decryptor.decrypt(std::iter::once(id));
+    let mut reader = match decrypt_res {
+        Ok(r) => r,
+        Err(age::DecryptError::NoMatchingKeys | age::DecryptError::ExcessiveWork { .. }) => {
+            eprintln!(
+                "git-agecrypt smudge [WARNING]: File is encrypted with a historical or foreign key (cannot decrypt with active master key). \
+                 Leaving raw ciphertext on disk. Run 'git-agecrypt rewrap' to re-encrypt under active master key."
+            );
+            let mut raw_file = spool.reader()?;
+            io::copy(&mut raw_file, &mut output)?;
             output.flush()?;
-            format_cache_hash(&mac.finalize().into_bytes())
-        };
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(anyhow!(
+                "Failed to decrypt age ciphertext during smudge filter: {e}"
+            ));
+        }
+    };
 
+    let hash_hex_opt = if let (Some(_c_dir), Some(key)) = (cache_dir, cache_key) {
+        let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key valid");
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            mac.update(&buf[..n]);
+            output.write_all(&buf[..n])?;
+        }
+        output.flush()?;
+        Some(format_cache_hash(&mac.finalize().into_bytes()))
+    } else {
+        io::copy(&mut reader, &mut output)
+            .context("Failed to write decrypted data to output during smudge filter")?;
+        output.flush()?;
+        None
+    };
+
+    // Auxiliary ciphertext cache write: only after cleartext has already been successfully delivered to Git
+    if let (Some(c_dir), Some(hash_hex)) = (cache_dir, hash_hex_opt.as_ref()) {
         let dest = c_dir.join(format!("{hash_hex}.age"));
         if !dest.exists() {
-            let mut current_temp = cipher_temp;
-            let mut persist_res = current_temp.persist(&dest);
-            let mut attempts = 0;
-            while let Err(e) = persist_res {
-                if dest.exists() && fs::metadata(&dest).map(|m| m.len() > 0).unwrap_or(false) {
-                    break;
+            if fs::create_dir_all(c_dir).is_ok() {
+                match &spool {
+                    SpoolBuffer::Memory(bytes) => {
+                        if let Ok(mut tmp) = tempfile::NamedTempFile::new_in(c_dir)
+                            && tmp.write_all(bytes).is_ok()
+                            && tmp.as_file().sync_all().is_ok()
+                        {
+                            let _ = tmp.persist(&dest);
+                        }
+                    }
+                    SpoolBuffer::Disk(temp_file) => {
+                        if let Ok(mut tmp) = tempfile::NamedTempFile::new_in(c_dir)
+                            && let Ok(mut f) = File::open(temp_file.path())
+                            && io::copy(&mut f, &mut tmp).is_ok()
+                            && tmp.as_file().sync_all().is_ok()
+                        {
+                            let _ = tmp.persist(&dest);
+                        }
+                    }
                 }
-                attempts += 1;
-                if attempts >= 5 {
-                    // Auxiliary cache persist failed after retries (e.g. concurrent lock or disk quota).
-                    // Do not fail the smudge filter since output cleartext was already delivered to Git.
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(15 * attempts as u64));
-                current_temp = e.file;
-                persist_res = current_temp.persist(&dest);
             }
             // Opportunistically prune (approx 1 in 32 cache writes) using runtime timestamp entropy
             // Dividing by 100 accounts for Windows FILETIME 100-nanosecond timer quantization
@@ -932,44 +921,6 @@ pub fn smudge_stream<R: Read, W: Write>(
         } else {
             let _ = filetime::set_file_mtime(&dest, filetime::FileTime::now());
         }
-    } else {
-        let mut cipher_temp = tempfile::NamedTempFile::new()?;
-        io::copy(&mut stream, &mut cipher_temp)?;
-        cipher_temp.flush()?;
-
-        let cipher_file = File::open(cipher_temp.path())?;
-        let decryptor = age::Decryptor::new(cipher_file)
-            .map_err(|e| anyhow!("Failed to parse age ciphertext in smudge filter: {e}"))?;
-
-        if decryptor.is_scrypt() {
-            return Err(anyhow!(
-                "Unexpected passphrase-encrypted file in git repository"
-            ));
-        }
-
-        let decrypt_res = decryptor.decrypt(std::iter::once(id));
-        let mut reader = match decrypt_res {
-            Ok(r) => r,
-            Err(age::DecryptError::NoMatchingKeys | age::DecryptError::ExcessiveWork { .. }) => {
-                eprintln!(
-                    "git-agecrypt smudge [WARNING]: File is encrypted with a historical or foreign key (cannot decrypt with active master key). \
-                     Leaving raw ciphertext on disk. Run 'git-agecrypt rewrap' to re-encrypt under active master key."
-                );
-                let mut raw_file = File::open(cipher_temp.path())?;
-                io::copy(&mut raw_file, &mut output)?;
-                output.flush()?;
-                return Ok(());
-            }
-            Err(e) => {
-                return Err(anyhow!(
-                    "Failed to decrypt age ciphertext during smudge filter: {e}"
-                ));
-            }
-        };
-
-        io::copy(&mut reader, &mut output)
-            .context("Failed to write decrypted data to output during smudge filter")?;
-        output.flush()?;
     }
 
     Ok(())

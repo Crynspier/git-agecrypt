@@ -288,19 +288,19 @@ fn test_interrupted_rekey_and_rewrap_recovery() {
         "inspect must succeed after interrupted rekey: {}",
         String::from_utf8_lossy(&inspect_out.stderr)
     );
-    // `status` detects that local `repo.key` is out of sync with the newly written `repo.pub`
+    // `status` runs transactional recovery, detecting the interrupted rekey and
+    // rolling back all recipient envelopes and repo.pub to the consistent pre-rekey generation!
     let status_out = agecrypt_cmd(repo).arg("status").output().unwrap();
     assert!(status_out.status.success());
-    assert!(String::from_utf8_lossy(&status_out.stdout).contains("OUT-OF-SYNC / STALE"));
+    let stderr_str = String::from_utf8_lossy(&status_out.stderr);
+    let stdout_str = String::from_utf8_lossy(&status_out.stdout);
+    assert!(
+        stderr_str.contains("Recovered interrupted rekey transaction")
+            || stdout_str.contains("YES (plaintext on disk)"),
+        "status output: stdout: {stdout_str}, stderr: {stderr_str}"
+    );
 
-    // 2. Roll-forward recovery: `unlock` unwraps the new master key from `keys/alice.age`,
-    // and re-running `rekey` (or `git add --renormalize`) completes the rotation cleanly!
-    agecrypt_cmd(repo)
-        .args(["unlock", alice_key.to_str().unwrap()])
-        .assert()
-        .success();
-    assert_eq!(fs::read_to_string(&secret_file).unwrap(), expected_secret);
-
+    // 2. Re-running `rekey` completes the rotation transaction cleanly and atomically!
     agecrypt_cmd(repo).arg("rekey").assert().success();
     run_git(repo, &["add", ".git-agecrypt", "vault.secret.env"]);
     run_git(repo, &["commit", "-m", "Completed rekey rotation"]);

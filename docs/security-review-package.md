@@ -143,13 +143,13 @@ Every `unsafe` block in the workspace is restricted to OS process/file primitive
 
 | File & Location | Platform | Syscall / FFI API | Purpose | Safety Invariants & Failure Handling |
 | :--- | :--- | :--- | :--- | :--- |
-| [`src/git.rs` (`crash_point`)](file:///C:/Users/leonz/Desktop/git-agecrypt/src/git.rs#L65-L95) | Unix / Windows | `libc::raise(SIGKILL)` / `TerminateProcess(GetCurrentProcess(), 137)` | Deterministic crash injection for test suite (`test_crash_matrix.rs`). | Gated behind **both** `GIT_AGECRYPT_CRASH_HOOKS_ARMED=1` AND `GIT_AGECRYPT_CRASH_POINT=<name>`. Never active in normal execution. |
-| [`src/git.rs` (`open_pinned_secret_file`)](file:///C:/Users/leonz/Desktop/git-agecrypt/src/git.rs#L102-L125) | Unix | `libc::openat`, `libc::close`, `File::from_raw_fd` | Opens secret/lock files relative to an open directory FD with `O_RDWR \| O_CLOEXEC \| O_NOFOLLOW` (and `O_CREAT \| O_EXCL` for temp keys) with mode `0600`. | `c_name` is validated by `CString::new` (no interior NUL). `dir_fd` is always closed before checking `fd < 0`. `File::from_raw_fd` is only called when `fd >= 0`. |
-| [`src/git.rs` (`is_pid_alive`)](file:///C:/Users/leonz/Desktop/git-agecrypt/src/git.rs#L245-L295) | Windows / Unix | `OpenProcess`, `GetExitCodeProcess`, `CloseHandle`, `GetLastError` / `libc::kill(pid, 0)` | Checks liveness of the PID recorded in auxiliary `refresh.lock`. | On Windows, `CloseHandle` is always called on non-null handles; `ERROR_ACCESS_DENIED` is treated as alive. Never used on `recovery.lock`. |
-| [`src/git.rs` (`save_local_master_key_for_ring`)](file:///C:/Users/leonz/Desktop/git-agecrypt/src/git.rs#L645-L685) | Windows | `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING \| MOVEFILE_WRITE_THROUGH)` | Atomic replacement of `repo.key` from ACL-restricted temp file on NTFS. | UTF-16 paths are explicitly NUL-terminated (`chain(Some(0))`). Retries up to 5 times; on failure, preserves existing `repo.key` and returns error. |
-| [`src/main.rs` (`main`)](file:///C:/Users/leonz/Desktop/git-agecrypt/src/main.rs#L68-L75) | Linux | `libc::prctl(PR_SET_DUMPABLE, 0)` | Restores non-dumpability in child `git-agecrypt` processes when `GIT_AGECRYPT_RUN_NON_DUMPABLE` is set. | Pure process-attribute syscall with integer constants; takes no pointers. |
-| [`src/main.rs` (`cmd_test_dumpable`)](file:///C:/Users/leonz/Desktop/git-agecrypt/src/main.rs#L1230-L1245) | Linux | `libc::prctl(PR_GET_DUMPABLE)` | Hidden test probe (`__test-dumpable`) verifying `PR_SET_DUMPABLE == 0` inheritance in security tests. | Checks `dumpable < 0` for OS errors; takes no pointers. |
-| [`src/main.rs` (`pass_via_memfd`)](file:///C:/Users/leonz/Desktop/git-agecrypt/src/main.rs#L1270-L1335) | Linux | `syscall(SYS_memfd_create, ..., MFD_CLOEXEC)`, `File::from_raw_fd`, `prctl(PR_SET_DUMPABLE, 0)`, `CommandExt::pre_exec` (`fcntl`), `libc::close` | Creates an anonymous in-memory file descriptor for `git-agecrypt run --fd`, clears `FD_CLOEXEC` only for the target FD in the child before `exec`, and disables core dumps / ptrace. | `fd < 0` is checked before `File::from_raw_fd`. `pre_exec` closure executes only async-signal-safe `fcntl` and `prctl` calls without heap allocation. |
+| [`src/git.rs` (`crash_point`)](../src/git.rs#L65-L95) | Unix / Windows | `libc::raise(SIGKILL)` / `TerminateProcess(GetCurrentProcess(), 137)` | Deterministic crash injection for test suite (`test_concurrency_crash_matrix.rs`). | Gated behind **both** `GIT_AGECRYPT_CRASH_HOOKS_ARMED=1` AND `GIT_AGECRYPT_CRASH_POINT=<name>`. Never active in normal execution. |
+| [`src/git.rs` (`open_pinned_secret_file`)](../src/git.rs#L102-L125) | Unix | `libc::openat`, `libc::close`, `File::from_raw_fd` | Opens secret/lock files relative to an open directory FD with `O_RDWR \| O_CLOEXEC \| O_NOFOLLOW` (and `O_CREAT \| O_EXCL` for temp keys) with mode `0600`. | `c_name` is validated by `CString::new` (no interior NUL). `dir_fd` is always closed before checking `fd < 0`. `File::from_raw_fd` is only called when `fd >= 0`. |
+| [`src/git.rs` (`is_pid_alive`)](../src/git.rs#L245-L295) | Windows / Unix | `OpenProcess`, `GetExitCodeProcess`, `CloseHandle`, `GetLastError` / `libc::kill(pid, 0)` | Checks liveness of the PID recorded in auxiliary `refresh.lock`. | On Windows, `CloseHandle` is always called on non-null handles; `ERROR_ACCESS_DENIED` is treated as alive. Never used on `recovery.lock`. |
+| [`src/git.rs` (`save_local_master_key_for_ring`)](../src/git.rs#L645-L685) | Windows | `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING \| MOVEFILE_WRITE_THROUGH)` | Atomic replacement of `repo.key` from ACL-restricted temp file on NTFS. | UTF-16 paths are explicitly NUL-terminated (`chain(Some(0))`). Retries up to 5 times; on failure, preserves existing `repo.key` and returns error. |
+| [`src/main.rs` (`main`)](../src/main.rs#L68-L75) | Linux | `libc::prctl(PR_SET_DUMPABLE, 0)` | Restores non-dumpability in child `git-agecrypt` processes when `GIT_AGECRYPT_RUN_NON_DUMPABLE` is set. | Pure process-attribute syscall with integer constants; takes no pointers. |
+| [`src/main.rs` (`cmd_test_dumpable`)](../src/main.rs#L1230-L1245) | Linux | `libc::prctl(PR_GET_DUMPABLE)` | Hidden test probe (`__test-dumpable`) verifying `PR_SET_DUMPABLE == 0` inheritance in security tests. | Checks `dumpable < 0` for OS errors; takes no pointers. |
+| [`src/main.rs` (`pass_via_memfd`)](../src/main.rs#L1270-L1335) | Linux | `syscall(SYS_memfd_create, ..., MFD_CLOEXEC)`, `File::from_raw_fd`, `prctl(PR_SET_DUMPABLE, 0)`, `CommandExt::pre_exec` (`fcntl`), `libc::close` | Creates an anonymous in-memory file descriptor for `git-agecrypt run --fd`, clears `FD_CLOEXEC` only for the target FD in the child before `exec`, and disables core dumps / ptrace. | `fd < 0` is checked before `File::from_raw_fd`. `pre_exec` closure executes only async-signal-safe `fcntl` and `prctl` calls without heap allocation. |
 
 ---
 
@@ -157,17 +157,18 @@ Every `unsafe` block in the workspace is restricted to OS process/file primitive
 
 | Crate | Version | Security & Architectural Role |
 | :--- | :--- | :--- |
-| `age` | `0.11` (`armor`, `ssh`) | Core cryptographic implementation of the age v1 specification (`X25519`, `ssh-ed25519`, `ssh-rsa`, `ChaCha20-Poly1305` STREAM, ASCII armor). |
-| `zeroize` | `1.8` | Deterministic memory scrubbing (`Zeroizing<T>`) for unwrapped master keys and decrypted secret buffers on drop. |
+| `age` | `0.12.1` (`armor`, `ssh`, `cli-common`, `plugin`) | Core cryptographic implementation of the age v1 specification (`X25519`, `ssh-ed25519`, `ssh-rsa`, `ChaCha20-Poly1305` STREAM, ASCII armor). |
+| `zeroize` | `1.9` | Deterministic memory scrubbing (`Zeroizing<T>`) for unwrapped master keys and decrypted secret buffers on drop. |
 | `sha2` | `0.10` | RustCrypto SHA-256 for cache namespace derivation (`SHA256(repo.pub)`) and streaming plaintext hashing. |
 | `hmac` | `0.12` | RustCrypto HMAC-SHA256 keyed by `repo.key` for convergence cache filenames (prevents offline plaintext dictionary attacks against `.git/git-agecrypt/cache/`). |
 | `fs2` | `0.4` | Cross-platform OS-level file locking (`flock` on Unix, `LockFileEx` on Windows) for `recovery.lock`. |
-| `tempfile` | `3.15` | Secure `O_EXCL` temporary file creation for streaming spools (`>8 MiB`) and same-filesystem atomic persistence. |
-| `ureq` | `3.0` (`rustls`) | Memory-safe TLS HTTP client (using `rustls`, no OpenSSL) solely for `add-recipient --github <user>`. |
+| `tempfile` | `3.27` | Secure `O_EXCL` temporary file creation for streaming spools (`>1 MiB`) and same-filesystem atomic persistence. |
+| `ureq` | `2.12` (`tls`) | Memory-safe TLS HTTP client (using `rustls`, no OpenSSL) solely for `add-recipient --github <user>`. |
 | `libc` | `0.2` | POSIX syscall bindings (`openat`, `fcntl`, `prctl`, `SYS_memfd_create`). |
-| `rpassword` | `7.3` | Terminal echo suppression when prompting for passphrase-protected SSH/age keys on `/dev/tty` or `CONIN$`. |
-| `ctrlc` | `3.4` | Clean `SIGINT`/`Ctrl+C` exit handler (`exit(130)`), delegating rollback to startup WAL recovery. |
-| `clap` / `anyhow` / `glob` / `dirs` / `hex` | Standard | CLI argument parsing, error context propagation, `.gitattributes` glob matching, home directory lookup, and hex encoding. |
+| `content_inspector` | `0.2` | Fast whole-file binary inspection guarding 3-way merge drivers against binary corruption. |
+| `filetime` | `0.2.29` | Cross-platform file modification time manipulation for true LRU cache eviction ordering. |
+| `ctrlc` | `3.5` | Clean `SIGINT`/`Ctrl+C` exit handler (`exit(130)`), delegating rollback to startup WAL recovery. |
+| `clap` / `anyhow` / `glob` / `dirs` | Standard | CLI argument parsing, error context propagation, `.gitattributes` glob matching, and user home directory lookup. |
 
 ---
 

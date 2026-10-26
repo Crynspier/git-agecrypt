@@ -36,7 +36,7 @@ fn test_run_fd_inheritance_boundaries() {
     // On Linux, test FD inheritance through fork/exec
     #[cfg(target_os = "linux")]
     {
-        // Test 1: Direct child can read FD from offset 0 and sees GIT_AGECRYPT_ENV_FD without GIT_AGECRYPT_ENV_FILE
+        // Test 1: Direct child can read FD from offset 0 and sees GIT_AGECRYPT_ENV_FD and GIT_AGECRYPT_ENV_FILE
         let mut cmd = agecrypt_cmd(repo);
         cmd.args([
             "run",
@@ -53,8 +53,9 @@ fn test_run_fd_inheritance_boundaries() {
             "Direct child must receive secret via FD from byte offset 0"
         );
 
-        // Test 2: Verify no extra parent file descriptors (besides 0, 1, 2, and GIT_AGECRYPT_ENV_FD)
-        // are leaked across exec into the child process.
+        // Test 2: Verify GIT_AGECRYPT_ENV_FD is backed by memfd_create (`memfd:git_agecrypt_env`)
+        // and no internal git-agecrypt file descriptors (such as `recovery.lock`, `repo.key`, or
+        // duplicate memfds) are leaked across exec into the child process.
         let mut cmd = agecrypt_cmd(repo);
         cmd.args([
             "run",
@@ -62,22 +63,33 @@ fn test_run_fd_inheritance_boundaries() {
             "--",
             "sh",
             "-c",
-            "for f in /proc/self/fd/*; do fd=$(basename \"$f\"); if [ \"$fd\" != \"0\" ] && [ \"$fd\" != \"1\" ] && [ \"$fd\" != \"2\" ] && [ \"$fd\" != \"$GIT_AGECRYPT_ENV_FD\" ] && [ -e \"$f\" ]; then echo \"FD:$fd\"; fi; done",
+            "for f in /proc/self/fd/*; do fd=$(basename \"$f\"); target=$(readlink \"$f\" 2>/dev/null || true); if [ -n \"$target\" ]; then echo \"FD:$fd:$target\"; fi; done",
         ]);
         let out = cmd.output().unwrap();
         assert!(out.status.success(), "FD enumeration must succeed");
-        let extra_fds: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        let stdout_str = String::from_utf8_lossy(&out.stdout);
+        let fd_entries: Vec<&str> = stdout_str
             .lines()
             .filter(|l| l.starts_with("FD:"))
-            .map(|l| l.to_string())
             .collect();
-        // Note: `sh` itself may open one internal script/dir FD when iterating `/proc/self/fd/*`,
-        // so at most 1 shell-internal FD may exist, never multiple leaked parent FDs.
-        assert!(
-            extra_fds.len() <= 1,
-            "Unexpected leaked file descriptors in child process: {:?}",
-            extra_fds
+        let memfd_entries: Vec<&&str> = fd_entries
+            .iter()
+            .filter(|l| l.contains("git_agecrypt_env"))
+            .collect();
+        assert_eq!(
+            memfd_entries.len(),
+            1,
+            "Exactly one memfd (GIT_AGECRYPT_ENV_FD) may be open in child process: {:?}",
+            fd_entries
         );
+        for entry in &fd_entries {
+            assert!(
+                !entry.contains("recovery.lock")
+                    && !entry.contains("repo.key")
+                    && !entry.contains("lock.journal"),
+                "Internal git-agecrypt file descriptor leaked into child process: {entry}"
+            );
+        }
 
         // Test 3: Verify PR_SET_DUMPABLE=0 is preserved across exec when spawning git-agecrypt test-dumpable
         let dump_out_file = repo.join("fd_dumpable_state.txt");

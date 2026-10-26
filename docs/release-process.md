@@ -15,7 +15,7 @@ Every tagged release (`v*`) built by [`.github/workflows/release.yml`](../.githu
 | `aarch64-apple-darwin` | macOS Apple Silicon (ARM64) | `git-agecrypt-macos-aarch64.tar.gz` | `git-agecrypt-macos-aarch64.tar.gz.sha256` |
 | `x86_64-pc-windows-msvc` | Windows x86_64 (MSVC) | `git-agecrypt-windows-x86_64.zip` | `git-agecrypt-windows-x86_64.zip.sha256` |
 
-Each release also publishes **GitHub Artifact Build Provenance Attestations** (`actions/attest-build-provenance` / SLSA build provenance signed via Sigstore Fulcio).
+Each release also publishes **GitHub Artifact Build Provenance Attestations** (`actions/attest-build-provenance` / SLSA build provenance signed via Sigstore Fulcio), and runs an automated post-upload `verify-release` job across Linux, macOS, and Windows that downloads each published archive, verifies its SHA-256 checksum and Sigstore attestation via `gh attestation verify`, and executes an end-to-end repository encryption round-trip.
 
 ---
 

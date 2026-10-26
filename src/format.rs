@@ -1107,7 +1107,6 @@ impl RepositoryInspection {
 /// Clean-room recovery helper: decrypts a wrapped master key envelope using a standard age/SSH
 /// private identity string or file content, and uses that unwrapped master key to decrypt an age
 /// secret blob without relying on any local `.git/git-agecrypt` state.
-#[allow(dead_code)]
 pub fn standalone_recover_secret_bytes(
     wrapped_master_key_armor: &str,
     user_identity_bytes: &[u8],
@@ -1605,26 +1604,61 @@ impl GitRepo {
         ref_label: &str,
         violations: &mut Vec<String>,
     ) -> Vec<(String, String)> {
-        if let Some(attr_bytes) = self.read_commit_tree_blob(commit, ".gitattributes", 256 * 1024) {
-            let attr_str = String::from_utf8_lossy(&attr_bytes);
-            match parse_gitattributes_rules(&attr_str) {
-                Ok(rules) => rules,
-                Err(e) => {
-                    violations.push(format!(
-                        "[{ref_label} @ {commit}] Invalid .gitattributes agecrypt rule: {e}"
-                    ));
-                    Vec::new()
+        let mut rules = Vec::new();
+        let tree_out = crate::git::git_cmd_with_path(&self.root)
+            .args(["ls-tree", "-r", "-z", commit])
+            .output();
+        if let Ok(to) = tree_out
+            && to.status.success()
+        {
+            for slice in to.stdout.split(|&b| b == 0) {
+                if slice.is_empty() {
+                    continue;
+                }
+                let line_str = String::from_utf8_lossy(slice);
+                if let Some((meta, path)) = line_str.split_once('\t') {
+                    let parts: Vec<&str> = meta.split_whitespace().collect();
+                    let norm = path.replace('\\', "/");
+                    if parts.len() >= 3
+                        && parts[1] == "blob"
+                        && (norm == ".gitattributes" || norm.ends_with("/.gitattributes"))
+                        && let Some(attr_bytes) = self.read_blob_header(parts[2], 256 * 1024)
+                    {
+                        let attr_str = String::from_utf8_lossy(&attr_bytes);
+                        let dir_prefix = norm
+                            .strip_suffix(".gitattributes")
+                            .unwrap_or("")
+                            .trim_end_matches('/');
+                        match parse_gitattributes_rules(&attr_str) {
+                            Ok(parsed) => {
+                                for (pat, ring) in parsed {
+                                    let scoped_pat = if dir_prefix.is_empty() {
+                                        pat
+                                    } else {
+                                        format!("{dir_prefix}/{}", pat.trim_start_matches('/'))
+                                    };
+                                    rules.push((scoped_pat, ring));
+                                }
+                            }
+                            Err(e) => {
+                                violations.push(format!(
+                                    "[{ref_label} @ {commit}] Invalid {norm} agecrypt rule: {e}"
+                                ));
+                            }
+                        }
+                    }
                 }
             }
-        } else if !self.is_bare() && self.root.join(".gitattributes").exists() {
-            if let Ok(attr_str) = fs::read_to_string(self.root.join(".gitattributes")) {
-                parse_gitattributes_rules(&attr_str).unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
         }
+        if rules.is_empty()
+            && !self.is_bare()
+            && self.root.join(".gitattributes").exists()
+            && let Ok(attr_str) = fs::read_to_string(self.root.join(".gitattributes"))
+            && let Ok(parsed) = parse_gitattributes_rules(&attr_str)
+        {
+            rules.extend(parsed);
+        }
+        rules
     }
 
     fn inspect_commit_for_enforcement(
@@ -1817,6 +1851,8 @@ impl GitRepo {
 
         // Validate .git-agecrypt metadata blobs in tip tree
         let mut rings_with_pub = std::collections::HashSet::new();
+        let mut ring_pub_keys: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         let mut rings_with_keys: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
 
@@ -1825,8 +1861,9 @@ impl GitRepo {
                 if let Some(bytes) = self.read_blob_header(sha, 16 * 1024) {
                     let content = String::from_utf8_lossy(&bytes);
                     match parse_and_validate_repo_pub(&content) {
-                        Ok(_) => {
+                        Ok((pk, _)) => {
                             rings_with_pub.insert("default".to_string());
+                            ring_pub_keys.insert("default".to_string(), pk);
                         }
                         Err(e) => violations.push(format!(
                             "[{ref_label} @ {tip_commit}] Invalid .git-agecrypt/repo.pub: {e}"
@@ -1859,8 +1896,9 @@ impl GitRepo {
                         if let Some(bytes) = self.read_blob_header(sha, 16 * 1024) {
                             let content = String::from_utf8_lossy(&bytes);
                             match parse_and_validate_repo_pub(&content) {
-                                Ok(_) => {
+                                Ok((pk, _)) => {
                                     rings_with_pub.insert((*ring_name).to_string());
+                                    ring_pub_keys.insert((*ring_name).to_string(), pk);
                                 }
                                 Err(e) => violations.push(format!(
                                     "[{ref_label} @ {tip_commit}] Invalid '{path}': {e}"
@@ -1904,7 +1942,7 @@ impl GitRepo {
                 continue;
             }
             if let Some(ring) = match_path_to_ring(norm_path, &rules) {
-                used_rings.insert(ring);
+                used_rings.insert(ring.clone());
                 if let Some(header) = self.read_blob_header(sha, 64 * 1024) {
                     let prefix_len = std::cmp::min(header.len(), AGE_HEADER_MAGIC.len());
                     if !is_age_ciphertext(&header[..prefix_len]) {
@@ -1914,12 +1952,43 @@ impl GitRepo {
                         if !violations.contains(&msg) {
                             violations.push(msg);
                         }
-                    } else if let Err(e) = age::Decryptor::new(&header[..]) {
-                        let msg = format!(
-                            "[{ref_label} @ {tip_commit}] Malformed or corrupted age ciphertext header in '{norm_path}': {e}"
-                        );
-                        if !violations.contains(&msg) {
-                            violations.push(msg);
+                    } else {
+                        match age::Decryptor::new(&header[..]) {
+                            Ok(decryptor) => {
+                                // When a local master key is present and matches the tip commit's
+                                // repo.pub for this ring, also verify that the tip blob decrypts
+                                // with that active master key (rejecting historical/revoked or
+                                // foreign key ciphertext).
+                                let ring_opt = if ring == "default" {
+                                    None
+                                } else {
+                                    Some(ring.as_str())
+                                };
+                                if let Some(exp_pub) = ring_pub_keys.get(&ring)
+                                    && let Ok(Some(local_key)) =
+                                        self.read_local_master_key_for_ring(ring_opt)
+                                    && let Ok(active_id) =
+                                        age::x25519::Identity::from_str(&local_key)
+                                    && &active_id.to_public().to_string() == exp_pub
+                                    && let Err(age::DecryptError::NoMatchingKeys) = decryptor
+                                        .decrypt(std::iter::once(&active_id as &dyn age::Identity))
+                                {
+                                    let msg = format!(
+                                        "[{ref_label} @ {tip_commit}] Protected secret '{norm_path}' in ring '{ring}' is encrypted under a historical or foreign key"
+                                    );
+                                    if !violations.contains(&msg) {
+                                        violations.push(msg);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let msg = format!(
+                                    "[{ref_label} @ {tip_commit}] Malformed or corrupted age ciphertext header in '{norm_path}': {e}"
+                                );
+                                if !violations.contains(&msg) {
+                                    violations.push(msg);
+                                }
+                            }
                         }
                     }
                 }

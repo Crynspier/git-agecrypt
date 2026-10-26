@@ -36,7 +36,7 @@ fn test_run_fd_inheritance_boundaries() {
     // On Linux, test FD inheritance through fork/exec
     #[cfg(target_os = "linux")]
     {
-        // Test 1: Direct child can read FD
+        // Test 1: Direct child can read FD from offset 0 and sees GIT_AGECRYPT_ENV_FD without GIT_AGECRYPT_ENV_FILE
         let mut cmd = agecrypt_cmd(repo);
         cmd.args([
             "run",
@@ -44,17 +44,17 @@ fn test_run_fd_inheritance_boundaries() {
             "--",
             "sh",
             "-c",
-            "cat /dev/fd/$GIT_AGECRYPT_ENV_FD",
+            "test -n \"$GIT_AGECRYPT_ENV_FD\" && test -z \"$GIT_AGECRYPT_ENV_FILE\" && cat /dev/fd/$GIT_AGECRYPT_ENV_FD",
         ]);
         let out = cmd.output().unwrap();
         assert!(out.status.success(), "Direct child must read FD");
         assert!(
-            String::from_utf8_lossy(&out.stdout).contains("INHERITANCE_SECRET"),
-            "Direct child must receive secret via FD"
+            String::from_utf8_lossy(&out.stdout).contains("INHERITANCE_SECRET=fd_test_value_12345"),
+            "Direct child must receive secret via FD from byte offset 0"
         );
 
-        // Test 2: Grandchild (fork + exec) should NOT inherit FD by default
-        // The FD should be closed on exec unless explicitly inherited
+        // Test 2: Verify no extra parent file descriptors (besides 0, 1, 2, and GIT_AGECRYPT_ENV_FD)
+        // are leaked across exec into the child process.
         let mut cmd = agecrypt_cmd(repo);
         cmd.args([
             "run",
@@ -62,20 +62,45 @@ fn test_run_fd_inheritance_boundaries() {
             "--",
             "sh",
             "-c",
-            "sh -c 'cat /dev/fd/$GIT_AGECRYPT_ENV_FD 2>&1 || echo FD_NOT_AVAILABLE'",
+            "for f in /proc/self/fd/*; do fd=$(basename \"$f\"); if [ \"$fd\" != \"0\" ] && [ \"$fd\" != \"1\" ] && [ \"$fd\" != \"2\" ] && [ \"$fd\" != \"$GIT_AGECRYPT_ENV_FD\" ] && [ -e \"$f\" ]; then echo \"FD:$fd\"; fi; done",
         ]);
         let out = cmd.output().unwrap();
-        assert!(out.status.success(), "Grandchild command must succeed");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        // The grandchild should either not see the FD or get an error
-        // This depends on whether the FD was marked close-on-exec
+        assert!(out.status.success(), "FD enumeration must succeed");
+        let extra_fds: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.starts_with("FD:"))
+            .map(|l| l.to_string())
+            .collect();
+        // Note: `sh` itself may open one internal script/dir FD when iterating `/proc/self/fd/*`,
+        // so at most 1 shell-internal FD may exist, never multiple leaked parent FDs.
         assert!(
-            stdout.contains("FD_NOT_AVAILABLE") || stdout.contains("INHERITANCE_SECRET"),
-            "Grandchild FD inheritance behavior must be deterministic: {}",
-            stdout
+            extra_fds.len() <= 1,
+            "Unexpected leaked file descriptors in child process: {:?}",
+            extra_fds
         );
 
-        // Test 3: Child that forks without exec should inherit FD
+        // Test 3: Verify PR_SET_DUMPABLE=0 is preserved across exec when spawning git-agecrypt test-dumpable
+        let dump_out_file = repo.join("fd_dumpable_state.txt");
+        let bin_path = assert_cmd::cargo::cargo_bin!("git-agecrypt");
+        let mut cmd = agecrypt_cmd(repo);
+        cmd.args([
+            "run",
+            "--fd",
+            "--",
+            bin_path.to_str().unwrap(),
+            "test-dumpable",
+            "--output",
+            dump_out_file.to_str().unwrap(),
+        ]);
+        cmd.assert().success();
+        let dumpable_val = fs::read_to_string(&dump_out_file).unwrap();
+        assert_eq!(
+            dumpable_val.trim(),
+            "0",
+            "PR_GET_DUMPABLE must be 0 in child process under run --fd"
+        );
+
+        // Test 4: Child that forks without exec should inherit FD
         let mut cmd = agecrypt_cmd(repo);
         cmd.args([
             "run",

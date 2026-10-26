@@ -8,6 +8,7 @@ use git_agecrypt::format::{
 use std::fs;
 use std::io::Read;
 use std::path::Path;
+use std::process::Command;
 use std::str::FromStr;
 use tempfile::TempDir;
 
@@ -43,6 +44,152 @@ fn test_golden_v1_fixture_and_clean_room_recovery() {
     assert_eq!(
         String::from_utf8(recovered).unwrap(),
         "GOLDEN_V1_SECRET=stable_format_v1_verified\n"
+    );
+}
+
+/// External `age` CLI interoperability and clean-room disaster recovery:
+/// When the external `age` binary is installed (enforced in CI via `GIT_AGECRYPT_REQUIRE_AGE_CLI=1`),
+/// verifies that an operator can recover repository secrets and exported `.age` files using ONLY
+/// standard `git` + external `age -d` CLI without invoking `git-agecrypt` for decryption.
+#[test]
+fn test_external_age_cli_clean_room_interoperability() {
+    let require_age_cli = std::env::var("GIT_AGECRYPT_REQUIRE_AGE_CLI")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let age_version = Command::new("age").arg("--version").output();
+    let age_available = matches!(age_version, Ok(ref out) if out.status.success());
+    if !age_available {
+        assert!(
+            !require_age_cli,
+            "GIT_AGECRYPT_REQUIRE_AGE_CLI=1 is set, but external 'age' CLI binary was not found on PATH"
+        );
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path();
+    init_repo(repo);
+
+    let (alice_sec, alice_pub) = generate_test_identity();
+    let (auditor_sec, auditor_pub) = generate_test_identity();
+    let alice_key_file = repo.join("alice_identity.txt");
+    let auditor_key_file = repo.join("auditor_identity.txt");
+    fs::write(&alice_key_file, format!("{alice_sec}\n")).unwrap();
+    fs::write(&auditor_key_file, format!("{auditor_sec}\n")).unwrap();
+
+    assert!(agecrypt_cmd(repo).arg("init").status().unwrap().success());
+    assert!(
+        agecrypt_cmd(repo)
+            .args(["add-recipient", "-i", &alice_pub, "-n", "alice"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    fs::create_dir_all(repo.join("secrets")).unwrap();
+    let expected_secret = "CLEAN_ROOM_AGE_CLI_SECRET=verified_with_external_age_binary_42\n";
+    fs::write(repo.join("secrets/prod.secret.env"), expected_secret).unwrap();
+    run_git(
+        repo,
+        &[
+            "add",
+            ".gitattributes",
+            ".git-agecrypt",
+            "secrets/prod.secret.env",
+        ],
+    );
+    run_git(
+        repo,
+        &["commit", "-m", "Add secret for external age CLI test"],
+    );
+
+    // Step 1: Unwrap `.git-agecrypt/keys/alice.age` using the external `age -d` binary
+    let unwrap_out = Command::new("age")
+        .args([
+            "-d",
+            "-i",
+            alice_key_file.to_str().unwrap(),
+            repo.join(".git-agecrypt/keys/alice.age").to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute external age CLI");
+    assert!(
+        unwrap_out.status.success(),
+        "External `age -d` failed to unwrap .git-agecrypt/keys/alice.age: {}",
+        String::from_utf8_lossy(&unwrap_out.stderr)
+    );
+    let recovered_master_key = String::from_utf8(unwrap_out.stdout).unwrap();
+    assert!(
+        recovered_master_key.trim().starts_with("AGE-SECRET-KEY-1"),
+        "Unwrapped master key must be a standard AGE-SECRET-KEY-1 identity"
+    );
+    let master_key_file = repo.join("recovered_master.key");
+    fs::write(
+        &master_key_file,
+        format!("{}\n", recovered_master_key.trim()),
+    )
+    .unwrap();
+
+    // Step 2: Extract raw ciphertext blob from Git (`git cat-file blob HEAD:secrets/prod.secret.env`)
+    // and decrypt it with external `age -d -i recovered_master.key`
+    let raw_blob_path = repo.join("raw_blob.age");
+    let raw_blob = common::git_out(repo, &["cat-file", "blob", "HEAD:secrets/prod.secret.env"]);
+    fs::write(&raw_blob_path, &raw_blob).unwrap();
+
+    let decrypt_blob_out = Command::new("age")
+        .args([
+            "-d",
+            "-i",
+            master_key_file.to_str().unwrap(),
+            raw_blob_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute external age CLI on blob");
+    assert!(
+        decrypt_blob_out.status.success(),
+        "External `age -d` failed to decrypt Git ciphertext blob: {}",
+        String::from_utf8_lossy(&decrypt_blob_out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(decrypt_blob_out.stdout).unwrap(),
+        expected_secret
+    );
+
+    // Step 3: Export secret with `git-agecrypt export-age` and decrypt with external `age -d`
+    let exported_age_path = repo.join("exported_for_auditor.age");
+    assert!(
+        agecrypt_cmd(repo)
+            .args([
+                "export-age",
+                "secrets/prod.secret.env",
+                "--recipient",
+                &auditor_pub,
+                "--output",
+                exported_age_path.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let decrypt_export_out = Command::new("age")
+        .args([
+            "-d",
+            "-i",
+            auditor_key_file.to_str().unwrap(),
+            exported_age_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute external age CLI on exported file");
+    assert!(
+        decrypt_export_out.status.success(),
+        "External `age -d` failed to decrypt export-age output: {}",
+        String::from_utf8_lossy(&decrypt_export_out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(decrypt_export_out.stdout).unwrap(),
+        expected_secret
     );
 }
 
@@ -280,17 +427,21 @@ fn test_inspect_and_export_age_interoperability() {
 
 /// G.1 & G.2: Historical migration and upgrade fixture test (simulating an implicit-v1
 /// repository created prior to v0.6.0 with multiple rings, key rotation, and historical
-/// branches, then upgrading to v0.6.0).
+/// branches, then upgrading to v0.6.0 and restoring secrets from a fresh clone).
 #[test]
 fn test_upgrade_and_migration_across_implicit_v1_and_rekey_history() {
     let temp = TempDir::new().unwrap();
-    let repo = temp.path();
+    let origin = temp.path().join("origin");
+    fs::create_dir_all(&origin).unwrap();
+    let repo = origin.as_path();
     init_repo(repo);
 
     let (alice_sec, alice_pub) = generate_test_identity();
     let (bob_sec, bob_pub) = generate_test_identity();
-    let alice_key = repo.join("alice.txt");
+    let alice_key = temp.path().join("alice.txt");
+    let bob_key = temp.path().join("bob.txt");
     fs::write(&alice_key, &alice_sec).unwrap();
+    fs::write(&bob_key, &bob_sec).unwrap();
 
     // Initialize default and 'prod' rings (implicit v1: no .git-agecrypt/format file)
     assert!(agecrypt_cmd(repo).arg("init").status().unwrap().success());
@@ -371,6 +522,8 @@ fn test_upgrade_and_migration_across_implicit_v1_and_rekey_history() {
 
     // Write explicit v1 format marker (.git-agecrypt/format = 1) and verify full compatibility
     fs::write(repo.join(".git-agecrypt/format"), "1\n").unwrap();
+    run_git(repo, &["add", ".git-agecrypt/format"]);
+    run_git(repo, &["commit", "-m", "Add explicit v1 format file"]);
 
     let inspect_out = agecrypt_cmd(repo)
         .args(["inspect", "--format", "json"])
@@ -381,24 +534,63 @@ fn test_upgrade_and_migration_across_implicit_v1_and_rekey_history() {
     assert!(inspect_json.contains("\"format_source\": \"explicit-file\""));
     assert!(inspect_json.contains("\"supported\": true"));
 
-    // Lock and unlock both rings with alice's key
-    assert!(agecrypt_cmd(repo).arg("lock").status().unwrap().success());
+    // Verify fresh-clone restoration for authorized recipient (Alice) vs revoked recipient (Bob)
+    let fresh_clone = temp.path().join("fresh_clone");
+    run_git(
+        temp.path(),
+        &[
+            "clone",
+            origin.to_str().unwrap(),
+            fresh_clone.to_str().unwrap(),
+        ],
+    );
+    // In a fresh clone before init/unlock, files on disk are raw age ciphertexts
     assert!(
-        agecrypt_cmd(repo)
-            .args(["lock", "--ring", "prod"])
+        fs::read(fresh_clone.join("app.secret.env"))
+            .unwrap()
+            .starts_with(b"age-encryption.org/v1\n")
+    );
+    assert!(
+        fs::read(fresh_clone.join("secrets/prod/db.env"))
+            .unwrap()
+            .starts_with(b"age-encryption.org/v1\n")
+    );
+
+    // Configure git filters in the fresh clone (`init`)
+    assert!(
+        agecrypt_cmd(&fresh_clone)
+            .arg("init")
             .status()
             .unwrap()
             .success()
     );
     assert!(
-        agecrypt_cmd(repo)
+        agecrypt_cmd(&fresh_clone)
+            .args(["init", "--ring", "prod"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Revoked recipient Bob CANNOT unlock the rotated repository in the fresh clone
+    assert!(
+        !agecrypt_cmd(&fresh_clone)
+            .args(["unlock", bob_key.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Authorized recipient Alice unlocks both default and 'prod' rings in the fresh clone and restores all secrets
+    assert!(
+        agecrypt_cmd(&fresh_clone)
             .args(["unlock", alice_key.to_str().unwrap()])
             .status()
             .unwrap()
             .success()
     );
     assert!(
-        agecrypt_cmd(repo)
+        agecrypt_cmd(&fresh_clone)
             .args(["unlock", "--ring", "prod", alice_key.to_str().unwrap()])
             .status()
             .unwrap()
@@ -406,12 +598,11 @@ fn test_upgrade_and_migration_across_implicit_v1_and_rekey_history() {
     );
 
     assert_eq!(
-        fs::read_to_string(repo.join("app.secret.env")).unwrap(),
+        fs::read_to_string(fresh_clone.join("app.secret.env")).unwrap(),
         "V1_VAL=initial\n"
     );
     assert_eq!(
-        fs::read_to_string(repo.join("secrets/prod/db.env")).unwrap(),
+        fs::read_to_string(fresh_clone.join("secrets/prod/db.env")).unwrap(),
         "PROD_DB=initial_prod\n"
     );
-    let _ = bob_sec;
 }

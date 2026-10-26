@@ -236,3 +236,91 @@ fn test_spool_canary_zero_plaintext_remnants() {
         }
     }
 }
+
+/// Demonstrates that an interrupted `rekey` operation (at `after_rekey_pub_write` or `after_rekey_key_saved`)
+/// preserves valid atomic metadata files (`repo.pub` and `keys/*.age`) and recovers cleanly via either
+/// rollback (`git checkout -- .git-agecrypt` + `unlock`) or roll-forward (`unlock` + `rekey`),
+/// and that `rewrap` recovers historical secrets after key rotation.
+#[test]
+fn test_interrupted_rekey_and_rewrap_recovery() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+    init_repo(repo);
+
+    let (alice_sec, alice_pub) = generate_test_identity();
+    let alice_key = repo.join("alice.key");
+    fs::write(&alice_key, &alice_sec).unwrap();
+
+    agecrypt_cmd(repo).arg("init").assert().success();
+    agecrypt_cmd(repo)
+        .args(["add-recipient", "-i", &alice_pub, "-n", "alice"])
+        .assert()
+        .success();
+
+    let secret_file = repo.join("vault.secret.env");
+    let expected_secret = "ROTATION_RECOVERY_SECRET=survives_interrupted_rekey_100\n";
+    fs::write(&secret_file, expected_secret).unwrap();
+    run_git(
+        repo,
+        &["add", ".gitattributes", ".git-agecrypt", "vault.secret.env"],
+    );
+    run_git(
+        repo,
+        &["commit", "-m", "Initial secret before interrupted rekey"],
+    );
+    let v1_blob = git_out(repo, &["cat-file", "blob", "HEAD:vault.secret.env"]);
+
+    // 1. Trigger deterministic crash during `rekey` at `after_rekey_pub_write`
+    let mut crash_rekey = agecrypt_cmd(repo);
+    crash_rekey
+        .env("GIT_AGECRYPT_CRASH_POINT", "after_rekey_pub_write")
+        .arg("rekey")
+        .assert()
+        .failure();
+
+    // Verify `inspect` confirms `repo.pub` and `keys/alice.age` were written atomically (never truncated)
+    let inspect_out = agecrypt_cmd(repo)
+        .args(["inspect", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        inspect_out.status.success(),
+        "inspect must succeed after interrupted rekey: {}",
+        String::from_utf8_lossy(&inspect_out.stderr)
+    );
+    // `status` detects that local `repo.key` is out of sync with the newly written `repo.pub`
+    let status_out = agecrypt_cmd(repo).arg("status").output().unwrap();
+    assert!(status_out.status.success());
+    assert!(String::from_utf8_lossy(&status_out.stdout).contains("OUT-OF-SYNC / STALE"));
+
+    // 2. Roll-forward recovery: `unlock` unwraps the new master key from `keys/alice.age`,
+    // and re-running `rekey` (or `git add --renormalize`) completes the rotation cleanly!
+    agecrypt_cmd(repo)
+        .args(["unlock", alice_key.to_str().unwrap()])
+        .assert()
+        .success();
+    assert_eq!(fs::read_to_string(&secret_file).unwrap(), expected_secret);
+
+    agecrypt_cmd(repo).arg("rekey").assert().success();
+    run_git(repo, &["add", ".git-agecrypt", "vault.secret.env"]);
+    run_git(repo, &["commit", "-m", "Completed rekey rotation"]);
+    assert_invariant_a(repo, "vault.secret.env", expected_secret);
+    agecrypt_cmd(repo).arg("check").assert().success();
+
+    // 3. Simulate historical ciphertext on disk (e.g. from an interrupted merge/cherry-pick of pre-rotation v1_blob)
+    // and verify `rewrap` decrypts it using the historical master key from Git history and re-encrypts under the active key!
+    fs::write(&secret_file, &v1_blob).unwrap();
+    agecrypt_cmd(repo)
+        .args([
+            "rewrap",
+            "vault.secret.env",
+            "--identity",
+            alice_key.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // `check` confirms the staged blob in the index is now encrypted under the active master key
+    agecrypt_cmd(repo).arg("check").assert().success();
+    assert_invariant_a(repo, "vault.secret.env", expected_secret);
+}

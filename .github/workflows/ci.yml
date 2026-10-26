@@ -52,12 +52,20 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install external age CLI for clean-room interop tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y age
       - name: Configure Git user identity for tests
         run: |
           git config --global user.name "CI Runner"
           git config --global user.email "ci@example.com"
       - name: Run tests
+        env:
+          GIT_AGECRYPT_REQUIRE_AGE_CLI: "1"
         run: cargo test --workspace --locked --verbose
+      - name: Check fuzz targets compile
+        run: cargo check --manifest-path fuzz/Cargo.toml --bins --locked
       # Benchmarks are compiled here; performance runs are opt-in locally.
       - name: Compile benchmarks
         run: cargo bench --no-run --locked
@@ -106,8 +114,8 @@ jobs:
         run: cargo build --workspace --locked --release --target ${{ matrix.target }}
       - name: Run platform smoke tests
         run: cargo test --workspace --locked --target ${{ matrix.target }} --lib --bins
-      - name: Run native macOS integration tests
-        if: startsWith(matrix.os, 'macos-')
+      - name: Run native macOS and Windows integration tests
+        if: startsWith(matrix.os, 'macos-') || startsWith(matrix.os, 'windows-')
         run: cargo test --workspace --locked --target ${{ matrix.target }} --tests
 
   supply-chain:

@@ -1,10 +1,4 @@
-mod cli;
-mod crypto;
-mod format;
-mod git;
-mod github;
-mod merge;
-mod shield;
+use git_agecrypt::{cli, crypto, format, git, github, merge, shield};
 
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -107,7 +101,7 @@ fn validate_ring_arg(ring: Option<&str>) -> Result<Option<&str>> {
     match ring {
         None => Ok(None),
         Some(r) => {
-            crate::git::validate_ring_name(r)?;
+            git::validate_ring_name(r)?;
             Ok(Some(r))
         }
     }
@@ -300,10 +294,7 @@ fn cmd_init_locked(
         }
     } else {
         let (identity, recipient) = crypto::generate_master_identity();
-        if let Some(parent) = pub_file.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&pub_file, format!("{}\n", recipient))?;
+        git::write_atomic_metadata_file(&pub_file, format!("{recipient}\n").as_bytes())?;
         repo.save_local_master_key_for_ring(identity.to_string().expose_secret(), ring_opt)?;
         if is_default_ring {
             eprintln!("Generated new 256-bit repository master key.");
@@ -326,7 +317,7 @@ fn cmd_init_locked(
                 &ssh_pub,
             )?;
             let initial_key_file = keys_dir.join("initial_user.age");
-            fs::write(initial_key_file, wrapped)?;
+            git::write_atomic_metadata_file(&initial_key_file, wrapped.as_bytes())?;
             eprintln!("Automatically enrolled your local SSH public key as a recipient.");
         }
     }
@@ -519,7 +510,7 @@ fn cmd_add_recipient_locked(
             dest = keys_dir.join(&filename);
         }
 
-        fs::write(&dest, wrapped)?;
+        git::write_atomic_metadata_file(&dest, wrapped.as_bytes())?;
         let is_default = matches!(ring_opt, None | Some("default") | Some(""));
         if is_default {
             eprintln!("Enrolled recipient '{label}' -> .git-agecrypt/keys/{filename}");
@@ -735,14 +726,14 @@ fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
     let (new_identity, new_recipient) = crypto::generate_master_identity();
     let new_secret_str = new_identity.to_string();
 
-    // 3. Re-wrap new master key for all remaining recipients
+    // 3. Re-wrap new master key for all remaining recipients atomically
     for (path, pub_str, recipient) in &recipients_to_rekey {
         let new_wrapped = crypto::wrap_master_key_with_metadata(
             new_secret_str.expose_secret(),
             recipient.as_ref(),
             pub_str,
         )?;
-        fs::write(path, new_wrapped)?;
+        git::write_atomic_metadata_file(path, new_wrapped.as_bytes())?;
         let name_display = path
             .file_name()
             .map(|s| s.to_string_lossy())
@@ -750,12 +741,9 @@ fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
         eprintln!("  * Re-wrapped key for {name_display}");
     }
 
-    // 4. Update repo.pub
+    // 4. Update repo.pub atomically
     let pub_file = repo.public_key_file_for_ring(ring_opt);
-    if let Some(parent) = pub_file.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&pub_file, format!("{}\n", new_recipient))?;
+    git::write_atomic_metadata_file(&pub_file, format!("{new_recipient}\n").as_bytes())?;
 
     git::crash_point("after_rekey_pub_write");
 

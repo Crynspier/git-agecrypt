@@ -279,6 +279,42 @@ pub fn ensure_not_symlink_or_reparse(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Atomically writes a committed metadata file (such as `repo.pub` or `.git-agecrypt/keys/*.age`)
+/// by writing to a same-directory temporary file, calling `sync_all()`, and atomically replacing
+/// the destination path so an interrupted `rekey` or `add-recipient` never leaves a truncated file.
+pub fn write_atomic_metadata_file(dest: &Path, contents: &[u8]) -> Result<()> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| anyhow!("Metadata file '{}' has no parent directory", dest.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create metadata directory {}", parent.display()))?;
+    ensure_not_symlink_or_reparse(parent)?;
+    if dest.exists() {
+        ensure_not_symlink_or_reparse(dest)?;
+    }
+
+    let mut temp = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "Failed to create temporary metadata file in {}",
+            parent.display()
+        )
+    })?;
+    temp.as_file_mut()
+        .write_all(contents)
+        .with_context(|| format!("Failed to write temporary file for {}", dest.display()))?;
+    temp.as_file_mut()
+        .flush()
+        .with_context(|| format!("Failed to flush temporary file for {}", dest.display()))?;
+    temp.as_file_mut()
+        .sync_all()
+        .with_context(|| format!("Failed to sync temporary file for {}", dest.display()))?;
+    temp.persist(dest)
+        .map_err(|e| e.error)
+        .with_context(|| format!("Failed to atomically replace {}", dest.display()))?;
+    sync_dir(parent)?;
+    Ok(())
+}
+
 /// Checks whether a process with the given PID is currently alive on the system.
 #[cfg(windows)]
 pub fn is_pid_alive(pid: u32) -> bool {
@@ -2673,11 +2709,6 @@ impl GitRepo {
             return Ok(());
         }
 
-        let patterns = self.get_tracked_patterns_all_rings()?;
-        if patterns.is_empty() {
-            return Ok(());
-        }
-
         let zero_sha = "0000000000000000000000000000000000000000";
         let mut inspected_blobs = std::collections::HashSet::new();
 
@@ -2751,13 +2782,14 @@ impl GitRepo {
                 };
 
             for commit in &commits {
-                // List files touched in this commit with raw modes and SHAs
+                // List files touched in this commit with raw modes, SHAs, and rename detection (-M)
                 let diff_out = git_cmd_with_path(&self.root)
                     .args([
                         "diff-tree",
                         "--root",
                         "--no-commit-id",
                         "-r",
+                        "-M",
                         "--raw",
                         "-z",
                         commit,
@@ -2791,11 +2823,12 @@ impl GitRepo {
                         let status = meta_parts[4];
 
                         let is_rename = status.starts_with('R') || status.starts_with('C');
-                        let path_str = if is_rename {
+                        let (old_path_opt, path_str) = if is_rename {
                             if idx + 2 < slices.len() {
-                                let p = String::from_utf8_lossy(slices[idx + 2]).to_string();
+                                let old_p = String::from_utf8_lossy(slices[idx + 1]).to_string();
+                                let new_p = String::from_utf8_lossy(slices[idx + 2]).to_string();
                                 idx += 3;
-                                p
+                                (Some(old_p), new_p)
                             } else {
                                 idx += 1;
                                 continue;
@@ -2804,7 +2837,7 @@ impl GitRepo {
                             if idx + 1 < slices.len() {
                                 let p = String::from_utf8_lossy(slices[idx + 1]).to_string();
                                 idx += 2;
-                                p
+                                (None, p)
                             } else {
                                 idx += 1;
                                 continue;
@@ -2825,6 +2858,32 @@ impl GitRepo {
                         }
 
                         let norm_path = path_str.replace('\\', "/");
+                        if let Some(old_p) = old_path_opt {
+                            let norm_old = old_p.replace('\\', "/");
+                            if self.is_file_tracked(&norm_old) && !self.is_file_tracked(&norm_path)
+                            {
+                                eprintln!();
+                                eprintln!(
+                                    "================================================================================"
+                                );
+                                eprintln!(
+                                    "  CRITICAL SECURITY ALERT: SECRET RENAMED TO UNENCRYPTED PATH IN PUSHED COMMIT!"
+                                );
+                                eprintln!(
+                                    "================================================================================"
+                                );
+                                eprintln!(
+                                    "Commit '{commit}' renames protected secret '{norm_old}' to unprotected path '{norm_path}'"
+                                );
+                                eprintln!(
+                                    "================================================================================"
+                                );
+                                return Err(anyhow!(
+                                    "Push rejected: protected secret '{norm_old}' renamed to unprotected path '{norm_path}' in commit '{commit}'"
+                                ));
+                            }
+                        }
+
                         if !self.is_file_tracked(&norm_path) {
                             continue;
                         }
@@ -2833,7 +2892,7 @@ impl GitRepo {
                             continue;
                         }
 
-                        // Fetch blob header directly by SHA to verify it is NOT unencrypted plaintext
+                        // Fetch blob header directly by SHA to verify it is valid age ciphertext
                         if let Some(header) = self.read_blob_header(new_sha, 64 * 1024) {
                             let prefix_len = std::cmp::min(header.len(), AGE_HEADER_MAGIC.len());
                             let prefix = &header[..prefix_len];
@@ -2859,6 +2918,27 @@ impl GitRepo {
                                 );
                                 return Err(anyhow!(
                                     "Push rejected: unencrypted secret in commit '{commit}': '{norm_path}'"
+                                ));
+                            }
+                            if let Err(err) = age::Decryptor::new(&header[..]) {
+                                eprintln!();
+                                eprintln!(
+                                    "================================================================================"
+                                );
+                                eprintln!(
+                                    "  CRITICAL SECURITY ALERT: CORRUPTED AGE CIPHERTEXT IN PUSHED COMMIT!"
+                                );
+                                eprintln!(
+                                    "================================================================================"
+                                );
+                                eprintln!(
+                                    "Commit '{commit}' contains malformed age header in '{norm_path}': {err}"
+                                );
+                                eprintln!(
+                                    "================================================================================"
+                                );
+                                return Err(anyhow!(
+                                    "Push rejected: corrupted age ciphertext in commit '{commit}': '{norm_path}' ({err})"
                                 ));
                             }
                             inspected_blobs.insert(new_sha.to_string());
@@ -3091,6 +3171,12 @@ impl GitRepo {
 
         let mut readonly_paths = Vec::new();
         let mut files_to_checkout = Vec::new();
+        let mut files_to_renormalize = Vec::new();
+        let active_master_id = if let Ok(Some(k)) = self.read_local_master_key_for_ring(ring) {
+            age::x25519::Identity::from_str(&k).ok()
+        } else {
+            None
+        };
 
         if let Ok(out) = ls_out {
             for path_slice in out.stdout.split(|&b| b == 0) {
@@ -3113,6 +3199,30 @@ impl GitRepo {
 
                     if should_refresh {
                         let full_path = self.root.join(rel_path);
+                        if let Some(ref active_id) = active_master_id
+                            && full_path.is_file()
+                            && let Ok(disk_bytes) = fs::read(&full_path)
+                        {
+                            let disk_prefix_len =
+                                std::cmp::min(disk_bytes.len(), AGE_HEADER_MAGIC.len());
+                            let disk_is_cipher = is_age_ciphertext(&disk_bytes[..disk_prefix_len]);
+                            let clean_rel = rel_path.replace('\\', "/");
+                            let blob_ref = format!(":0:{}", clean_rel.trim_start_matches('/'));
+                            if !disk_is_cipher
+                                && let Some(idx_header) =
+                                    self.read_blob_header(&blob_ref, 64 * 1024)
+                                && let Ok(decryptor) = age::Decryptor::new(&idx_header[..])
+                                && let Err(age::DecryptError::NoMatchingKeys) = decryptor
+                                    .decrypt(std::iter::once(active_id as &dyn age::Identity))
+                            {
+                                // Working-tree file is already decrypted plaintext, while the index blob
+                                // is still encrypted under a pre-rotation key (e.g. after an interrupted ekey).
+                                // Preserve the working-tree plaintext and renormalize the index under the active key.
+                                files_to_renormalize.push(rel_path.to_string());
+                                continue;
+                            }
+                        }
+
                         if full_path.exists() {
                             if let Ok(meta) = fs::metadata(&full_path)
                                 && meta.permissions().readonly()
@@ -3127,6 +3237,16 @@ impl GitRepo {
                         files_to_checkout.push(rel_path.to_string());
                     }
                 }
+            }
+        }
+
+        if !files_to_renormalize.is_empty() {
+            for chunk in files_to_renormalize.chunks(50) {
+                let mut args = vec!["add", "--renormalize", "--"];
+                for f in chunk {
+                    args.push(f.as_str());
+                }
+                let _ = run_git_cmd_with_index_retry(&self.root, &args, 3);
             }
         }
 

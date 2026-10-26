@@ -12,9 +12,9 @@ To enforce zero-trust verification on every push and pull request, `git-agecrypt
 
 When `git-agecrypt check --pre-receive` or `git-agecrypt check --commit-range <RANGE>` runs, it inspects the Git object database directly (supporting **bare repositories** without a working tree) and enforces:
 
-1. **No Plaintext Secrets on Protected Paths:** Every blob added, modified, or present in the target tip tree whose path matches a `filter=agecrypt` or `filter=agecrypt-<ring>` pattern in that commit's `.gitattributes` MUST begin with a valid `age-encryption.org/v1\n` header.
-2. **Valid `age` Ciphertext Header & Recipient Stanzas:** Every protected ciphertext blob is parsed through `age::Decryptor` to confirm structurally valid recipient stanzas and header MAC framing (rejecting truncated or corrupted ciphertexts).
-3. **No Unprotected Secret Renames:** Renaming a file from a path governed by `filter=agecrypt*` to a path not covered by `filter=agecrypt*` is rejected.
+1. **No Plaintext Secrets on Protected Paths:** Every blob added, modified, or present in the target tip tree whose path matches a `filter=agecrypt` or `filter=agecrypt-<ring>` pattern in that commit's root or nested `<subdir>/.gitattributes` files MUST begin with a valid `age-encryption.org/v1\n` header.
+2. **Valid `age` Ciphertext Header, Recipient Stanzas, and Active Key Match (When Unlocked):** Every protected ciphertext blob is parsed through `age::Decryptor` to confirm structurally valid recipient stanzas and header MAC framing (rejecting truncated or corrupted ciphertexts). When run in an unlocked repository where the local master key matches the commit's `repo.pub`, `check` also verifies that tip blobs decrypt under the active master key (rejecting stale/historical or foreign key ciphertexts).
+3. **No Unprotected Secret Renames:** Renaming or copying a file from a path governed by `filter=agecrypt*` to a path not covered by `filter=agecrypt*` is rejected in both local (`--pre-push`) and server/CI (`--pre-receive`, `--commit-range`) enforcement modes.
 4. **Shell-Safe Tracked Paths:** Paths containing `"`, `` ` ``, `$`, `\`, or control characters (`0x00..=0x1F`, `0x7F`) are rejected to prevent Git filter command-line shell injection.
 5. **Ring & Metadata Consistency:**
    - Validates `.git-agecrypt/format` (and per-ring `format` files) against `FORMAT_VERSION = 1`.

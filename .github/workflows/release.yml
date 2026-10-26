@@ -29,6 +29,10 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install external age CLI for clean-room interop tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y age
       - name: Configure Git user identity for tests
         run: |
           git config --global user.name "CI Runner"
@@ -41,10 +45,6 @@ jobs:
             exit 1
           fi
           BASE_TAG="${RELEASE_TAG%%-*}"
-          if [ "$BASE_TAG" != "v0.6.0" ]; then
-            echo "Only v0.6.0 and its prerelease tags are permitted by this release workflow"
-            exit 1
-          fi
           EXPECTED="${BASE_TAG#v}"
           ACTUAL=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
           if [ "$EXPECTED" != "$ACTUAL" ]; then
@@ -55,6 +55,8 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace --locked --verbose
       - name: Run full test suite
+        env:
+          GIT_AGECRYPT_REQUIRE_AGE_CLI: "1"
         run: cargo test --workspace --locked --verbose
 
   create-release:
@@ -128,15 +130,18 @@ jobs:
       - name: Smoke-test packaged binary (Unix)
         if: runner.os != 'Windows'
         run: |
+          EXPECTED_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
           VERSION=$(target/${{ matrix.target }}/release/${{ matrix.binary_name }} --version)
-          test "$VERSION" = "git-agecrypt 0.6.0"
+          test "$VERSION" = "git-agecrypt $EXPECTED_VER"
           tar -tzf "${{ matrix.asset_name }}" | grep -Fx "${{ matrix.binary_name }}"
       - name: Smoke-test packaged binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $cargoToml = Get-Content -LiteralPath Cargo.toml
+          $expectedVer = ($cargoToml | Select-String '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           $version = & "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" --version
-          if ($version -ne 'git-agecrypt 0.6.0') { throw "Unexpected version: $version" }
+          if ($version -ne "git-agecrypt $expectedVer") { throw "Unexpected version: $version (expected git-agecrypt $expectedVer)" }
           $extractPath = Join-Path $env:RUNNER_TEMP 'git-agecrypt-archive-check'
           Remove-Item -LiteralPath $extractPath -Recurse -Force -ErrorAction SilentlyContinue
           Expand-Archive -LiteralPath "${{ matrix.asset_name }}" -DestinationPath $extractPath
@@ -168,3 +173,98 @@ jobs:
         run: |
           set -euo pipefail
           gh release upload "$RELEASE_TAG" "${{ matrix.asset_name }}" "${{ matrix.asset_name }}.sha256" --clobber
+
+  verify-release:
+    name: Verify Release (${{ matrix.asset_name }})
+    needs: build-assets
+    permissions:
+      contents: read
+      attestations: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_name: git-agecrypt-linux-x86_64.tar.gz
+            binary_name: git-agecrypt
+          - os: macos-15-intel
+            asset_name: git-agecrypt-macos-x86_64.tar.gz
+            binary_name: git-agecrypt
+          - os: macos-14
+            asset_name: git-agecrypt-macos-aarch64.tar.gz
+            binary_name: git-agecrypt
+          - os: windows-latest
+            asset_name: git-agecrypt-windows-x86_64.zip
+            binary_name: git-agecrypt.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Download release asset and checksum
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "${{ matrix.asset_name }}" --pattern "${{ matrix.asset_name }}.sha256" --clobber
+      - name: Verify SHA-256 checksum and Sigstore attestation (Unix)
+        if: runner.os != 'Windows'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shasum -a 256 --check "${{ matrix.asset_name }}.sha256"
+          gh attestation verify "${{ matrix.asset_name }}" --repo "$GITHUB_REPOSITORY"
+          mkdir -p "$RUNNER_TEMP/verify-bin"
+          tar -xzf "${{ matrix.asset_name }}" -C "$RUNNER_TEMP/verify-bin"
+          chmod +x "$RUNNER_TEMP/verify-bin/${{ matrix.binary_name }}"
+          export PATH="$RUNNER_TEMP/verify-bin:$PATH"
+          git config --global user.name "Release Verifier"
+          git config --global user.email "verify@example.com"
+          REPO_DIR="$RUNNER_TEMP/verify-repo"
+          mkdir -p "$REPO_DIR"
+          cd "$REPO_DIR"
+          git init
+          git-agecrypt init
+          printf "*.secret.env filter=agecrypt diff=agecrypt merge=agecrypt -text\n" > .gitattributes
+          printf "RELEASE_SECRET=verified_123\n" > app.secret.env
+          git add .gitattributes .git-agecrypt app.secret.env
+          git commit -m "Verify release binary round-trip"
+          git cat-file -p HEAD:app.secret.env | head -n 1 | grep -Fx "age-encryption.org/v1"
+          git-agecrypt check
+          git-agecrypt inspect --format json
+      - name: Verify SHA-256 checksum and Sigstore attestation (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $expected = (Get-Content ".\${{ matrix.asset_name }}.sha256").Split(' ')[0].Trim()
+          $actual = (Get-FileHash ".\${{ matrix.asset_name }}" -Algorithm SHA256).Hash.ToLower()
+          if ($expected -ne $actual) { throw "SHA-256 mismatch: expected $expected, got $actual" }
+          gh attestation verify "${{ matrix.asset_name }}" --repo "$env:GITHUB_REPOSITORY"
+          if ($LASTEXITCODE -ne 0) { throw "Attestation verification failed" }
+          $binDir = Join-Path $env:RUNNER_TEMP 'verify-bin'
+          Remove-Item -LiteralPath $binDir -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath "${{ matrix.asset_name }}" -DestinationPath $binDir
+          $env:PATH = "$binDir;$env:PATH"
+          git config --global user.name "Release Verifier"
+          git config --global user.email "verify@example.com"
+          $repoDir = Join-Path $env:RUNNER_TEMP 'verify-repo'
+          Remove-Item -LiteralPath $repoDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $repoDir | Out-Null
+          Push-Location $repoDir
+          try {
+            git init
+            git-agecrypt init
+            Set-Content -Path .gitattributes -Value "*.secret.env filter=agecrypt diff=agecrypt merge=agecrypt -text`n" -NoNewline
+            Set-Content -Path app.secret.env -Value "RELEASE_SECRET=verified_123`n" -NoNewline
+            git add .gitattributes .git-agecrypt app.secret.env
+            git commit -m "Verify release binary round-trip"
+            $blob = git cat-file -p HEAD:app.secret.env
+            if (-not ($blob -join "`n").StartsWith("age-encryption.org/v1")) { throw "Committed blob is not encrypted" }
+            git-agecrypt check
+            if ($LASTEXITCODE -ne 0) { throw "git-agecrypt check failed" }
+            git-agecrypt inspect --format json | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "git-agecrypt inspect failed" }
+          } finally {
+            Pop-Location
+          }

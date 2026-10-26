@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 300" width="880" height="300" role="img" aria-label="git-agecrypt Architecture and Trust Boundary Diagram">
+  <defs>
+    <style>
+      .bg { fill: #0f172a; rx: 12px; }
+      .zone { fill: #1e293b; stroke: #475569; stroke-width: 1.5; rx: 8px; }
+      .zone-untrusted { fill: #1e1b2e; stroke: #7c3aed; stroke-width: 1.5; rx: 8px; }
+      .box { fill: #0f172a; stroke: #38bdf8; stroke-width: 1.5; rx: 6px; }
+      .box-key { fill: #0f172a; stroke: #22c55e; stroke-width: 1.5; rx: 6px; }
+      .box-remote { fill: #0f172a; stroke: #a855f7; stroke-width: 1.5; rx: 6px; }
+      .title { font: 700 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #f8fafc; }
+      .subtitle { font: 600 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #94a3b8; }
+      .label { font: 500 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #e2e8f0; }
+      .note { font: 400 10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #38bdf8; }
+      .arrow { stroke: #38bdf8; stroke-width: 1.8; fill: none; marker-end: url(#arrow); }
+      .arrow-key { stroke: #22c55e; stroke-width: 1.8; fill: none; marker-end: url(#arrow-green); }
+      .arrow-remote { stroke: #a855f7; stroke-width: 1.8; fill: none; marker-end: url(#arrow-purple); }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#22c55e"/>
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#a855f7"/>
+    </marker>
+  </defs>
+
+  <rect width="880" height="300" class="bg"/>
+
+  <!-- Left Zone: Trusted Local Host -->
+  <rect x="20" y="20" width="585" height="260" class="zone"/>
+  <text x="36" y="44" class="title">TRUSTED LOCAL WORKSTATION / CI RUNNER</text>
+
+  <!-- Working Tree Box -->
+  <rect x="38" y="65" width="165" height="85" class="box"/>
+  <text x="50" y="88" class="label">Working Tree</text>
+  <text x="50" y="108" class="subtitle">secrets/prod.env</text>
+  <text x="50" y="128" class="note">Plaintext when unlocked</text>
+
+  <!-- Local State Box -->
+  <rect x="38" y="175" width="165" height="85" class="box-key"/>
+  <text x="50" y="198" class="label">.git/git-agecrypt/</text>
+  <text x="50" y="218" class="subtitle">repo.key (0600/ACL)</text>
+  <text x="50" y="238" class="note">recovery.lock + cache/</text>
+
+  <!-- Filter Engine Box -->
+  <rect x="242" y="65" width="145" height="85" class="box"/>
+  <text x="256" y="88" class="label">git-agecrypt</text>
+  <text x="256" y="108" class="subtitle">clean / smudge</text>
+  <text x="256" y="128" class="note">3-way merge + check</text>
+
+  <!-- Committed Metadata Box -->
+  <rect x="242" y="175" width="145" height="85" class="box-key"/>
+  <text x="254" y="198" class="label">.git-agecrypt/</text>
+  <text x="254" y="218" class="subtitle">repo.pub + keys/</text>
+  <text x="254" y="238" class="note">Wrapped age envelopes</text>
+
+  <!-- Git Index Box -->
+  <rect x="425" y="65" width="162" height="195" class="box"/>
+  <text x="439" y="92" class="label">Git Index &amp; Objects</text>
+  <text x="439" y="118" class="subtitle">age-encryption.org/v1</text>
+  <text x="439" y="142" class="note">X25519 + ChaCha20</text>
+  <text x="439" y="162" class="note">Poly1305 Ciphertext</text>
+  <text x="439" y="195" class="subtitle">Never stores</text>
+  <text x="439" y="213" class="subtitle">plaintext secrets</text>
+
+  <!-- Right Zone: Untrusted Remote Git Server -->
+  <rect x="625" y="20" width="235" height="260" class="zone-untrusted"/>
+  <text x="641" y="44" class="title">UNTRUSTED GIT REMOTE</text>
+
+  <rect x="643" y="65" width="199" height="195" class="box-remote"/>
+  <text x="657" y="92" class="label">Remote Repository</text>
+  <text x="657" y="118" class="subtitle">Ciphertext Blobs Only</text>
+  <text x="657" y="148" class="note">+ pre-receive hook</text>
+  <text x="657" y="168" class="note">+ GitHub Action verify</text>
+  <text x="657" y="202" class="subtitle">Zero access to</text>
+  <text x="657" y="220" class="subtitle">repo.key or SSH keys</text>
+
+  <!-- Arrows -->
+  <line x1="203" y1="98" x2="238" y2="98" class="arrow"/>
+  <line x1="242" y1="120" x2="207" y2="120" class="arrow"/>
+  <line x1="387" y1="108" x2="421" y2="108" class="arrow"/>
+  <line x1="242" y1="215" x2="207" y2="215" class="arrow-key"/>
+  <line x1="165" y1="175" x2="265" y2="152" class="arrow-key"/>
+  <line x1="587" y1="155" x2="639" y2="155" class="arrow-remote"/>
+</svg>

@@ -1,468 +1,126 @@
-# git-agecrypt
-
-Transparent client-side Git encryption using [age](https://age-encryption.org/v1), SSH keys, and hardware tokens.
+# `git-agecrypt`
 
 [![CI](https://github.com/Crynspier/git-agecrypt/actions/workflows/ci.yml/badge.svg)](https://github.com/Crynspier/git-agecrypt/actions/workflows/ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
-[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![Release](https://github.com/Crynspier/git-agecrypt/actions/workflows/release.yml/badge.svg)](https://github.com/Crynspier/git-agecrypt/actions/workflows/release.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
+**Transparent, GPG-free Git file encryption powered by [`age`](https://age-encryption.org/) and existing SSH keys.**
+
+`git-agecrypt` encrypts sensitive files (`*.secret.env`, `secrets/**`, certificates, configuration files) transparently inside Git repositories using Git's native `clean`, `smudge`, `textconv`, and 3-way `merge` drivers. Files stay decrypted in your local working tree while unlocked, and are guaranteed to be stored as binary **age v1** (`X25519` + `ChaCha20-Poly1305`) ciphertext in the Git index, commit history, and remote servers.
+
+![git-agecrypt Architecture and Trust Boundary Diagram](docs/architecture.svg)
 
 ---
 
-`git-agecrypt` provides transparent file encryption and decryption for Git repositories using Git's native filter drivers (`clean`, `smudge`, `diff`, and `merge`).
+## Why `git-agecrypt`?
 
-Files matching the configured Git filters remain cleartext in your local working directory so your editor, linters, and compiler can access them normally. When those files are staged through the configured filters, Git stores authenticated `age` ciphertexts in the index and object database. Files outside the filter configuration, already-committed plaintext, and other Git metadata are not retroactively protected.
-
-It is designed as a modern replacement for `git-crypt`, substituting GPG and OpenSSL dependencies with the `age` format (X25519, ChaCha20-Poly1305), standard SSH Ed25519 or RSA keys, and native Age hardware plugins (YubiKey, Apple Secure Enclave, TPM).
-
----
-
-## Contents
-
-- [Architecture](#architecture)
-- [Features](#features)
-- [How It Compares](#how-it-compares)
-- [Installation](#installation)
-- [Quickstart](#quickstart)
-- [CI / CD Integration](#ci--cd-integration)
-- [Migration from git-crypt](#migration-from-git-crypt)
-- [CLI Reference](#cli-reference)
-- [Documentation & Deep Dives](#documentation--deep-dives)
-- [Minimum Supported Versions](#minimum-supported-versions)
-- [License](#license)
+| Capability | `git-agecrypt` | `git-crypt` | `sops` |
+| :--- | :--- | :--- | :--- |
+| **Cryptographic Backend** | Modern `age` v1 (`X25519` + `ChaCha20-Poly1305`) | Legacy GPG keyring (`gpg`) or symmetric key | `age`, PGP, Cloud KMS |
+| **Uses Existing SSH Keys (`id_ed25519` / `id_rsa`)** | Yes (native `age-ssh`) | No | Via `ssh-to-age` conversion |
+| **Transparent Git Working Tree (`clean`/`smudge`)** | Yes (any text or binary file) | Yes | No (manual edit/decrypt wrapper) |
+| **Key Revocation & Rotation (`rekey` + `rewrap`)** | Built-in (`git-agecrypt rekey` & `rewrap`) | Not built-in | Manual `sops updatekeys` |
+| **Scoped Multi-Ring Isolation (`--ring prod`)** | Built-in per-environment rings | Symmetric key files only | File-level `.sops.yaml` rules |
+| **3-Way Encrypted Merge Driver (`merge`)** | Built-in with semantic key=value conflict warnings | Binary conflict | No native Git merge driver |
+| **Crash-Safe Lock Journal & Recovery (`inspect`)** | OS-locked WAL journal (`recovery.lock` + `lock.journal`) | None | N/A |
+| **Server-Side `pre-receive` & CI Enforcement** | Built-in (`check --pre-receive` & `--commit-range`) | External scripts | External scripts |
 
 ---
 
-## Architecture
-
-### Transparent Filter Pipeline
-
-```text
-Working Tree                 Git Index & Staging              Remote (GitHub, etc.)
-(Cleartext on disk)          (Local object store)             (Encrypted ciphertext)
-
-+------------------+         +------------------+             +------------------+
-|  secrets.env     | git add | age-encryption/v1|  git push   | age-encryption/v1|
-|  PASS=secret     |-------->| [authenticated]  |------------>| [authenticated]  |
-+------------------+  clean  +------------------+             +------------------+
-         ^                            |
-         |        git checkout        |
-         +----------------------------+
-                     smudge
-```
-
-### Key Management
-
-`git-agecrypt` uses a two-tier key envelope:
-
-1. **Repository Master Key:** A 256-bit symmetric key that encrypts files routed to the repository's configured secret filters.
-2. **Recipient Envelopes (`.git-agecrypt/keys/<name>.age`):** The master key is encrypted individually for each authorized team member using their SSH public key (`~/.ssh/id_ed25519.pub`, `~/.ssh/id_rsa.pub`), native `age` identity, or hardware token recipient.
-
-When a team member rotates the master key via `git-agecrypt rekey`, the new recipient envelopes and ciphertexts must be committed and distributed. Collaborators then unlock or refresh their local checkout using an authorized identity.
-
----
-
-## Features
-
-- **No GPG required:** Uses standard SSH keys (`~/.ssh/id_ed25519`, `~/.ssh/id_rsa`), native `age` keys, or hardware tokens via Age plugins. No GPG daemon, keyrings, or pinentry prompts.
-- **Hardware token & Age plugin support:** Seamlessly enroll YubiKeys (`age-plugin-yubikey`), Apple Secure Enclave (`age-plugin-se`), and TPM tokens (`age-plugin-tpm`) via standard Age plugin recipients (`age1yubikey1...`, `age1se1...`).
-- **Scoped recipient rings (multi-environment secrets):** Segment secrets across independent access domains (e.g. `--ring prod`, `--ring dev`) with dedicated master keys, recipient sets, and `.gitattributes` filter bindings (`filter=agecrypt-prod`).
-- **Runtime secret injection:** Execute child commands with in-memory decrypted environment variables (`git-agecrypt run -- <cmd>`) without writing cleartext `.env` files to disk.
-- **Anonymous in-memory secret passing (`run --fd`):** Pass secrets via Linux kernel anonymous RAM descriptors (`SYS_memfd_create`), avoiding `/proc/<pid>/environ` inspection or cleartext temporary files.
-- **In-memory clean fast-path:** Inputs below 1 MiB use the in-memory spool path and do not intentionally create a temporary spool file. The primary spool buffer uses zeroization on drop; this does not guarantee that every intermediate or library/OS copy is erased immediately.
-- **Bounded streaming for large files:** Streams of 1 MiB or more are processed in chunks and may use temporary files; memory use does not scale with the complete file size, although exact usage depends on the encryption and I/O layers.
-- **Cryptographic cache authentication:** Eliminates phantom `git diff` churn using keyed HMAC-SHA256 digests. Cached ciphertext hits are decrypted and authenticated in RAM before trust, with corrupted entries evicted. Rekey switches to a fresh cache namespace and attempts to purge old entries; auxiliary cache cleanup is best effort under concurrency and filesystem failures.
-- **Durability checks on critical state:** Key, journal, and merge-target writes check synchronization and replacement errors. Cache cleanup and other auxiliary cleanup paths may be best effort; filesystem and storage hardware behavior remains outside the application's control.
-- **Semantic merge conflict detection:** 3-way merge driver detects conflicting duplicate key definitions on concurrent branch edits to `.env` and configuration files and emits actionable warnings.
-- **GitHub user key enrollment:** Add team members directly by GitHub username (`git-agecrypt add-recipient --github <user>`).
-- **Safe locked clones:** Cloning without a configured key succeeds cleanly (exit code 0). Files remain encrypted on disk until unlocked.
-- **Transactional lock with WAL:** `git-agecrypt lock` re-smudges files on disk to encrypted ciphertext with write-ahead logging; interrupted recovery either completes or retains metadata and fails closed. Recovery and key-changing operations serialize across concurrent CLI processes using a cross-platform OS file lock, and temporary key files are invocation-unique.
-- **Automated 3-way merge driver:** Decrypts conflicting branches, performs line-based 3-way merging, re-encrypts the result, and protects binary secrets from corruption.
-- **Worktree native:** A single unlock operates across all linked Git worktrees via `--git-common-dir`.
-- **Safeguard hooks:** Pre-commit and pre-push hooks inspect staged blobs in the Git index (`:0:<path>`) to block accidental cleartext leaks or commits encrypted under revoked keys. Hooks are local safeguards and can be bypassed; use server-side enforcement for mandatory policy.
-- **Untracked secret leak scanner:** Pre-commit safeguard scans all staged files and aborts commits if untracked files matching secret heuristics (e.g. `.env`, private keys) are staged in plaintext. Heuristics are defense in depth, not a complete secret detector.
-- **AI and IDE shielding:** Synchronizes ignore rules across `.cursorignore`, `.claudeignore`, `.aiderignore`, and `.aiignore`. These are advisory integrations: tool support varies, and ignore rules cannot remove secrets already indexed or transmitted.
-- **Headless CI/CD friendly:** Unlocks from stdin (`echo "$KEY" | git-agecrypt unlock -`) with zero daemon processes.
-- **Standalone binary:** Implemented in Rust and built as a target-specific release binary; it does not require the project's application to link against OpenSSL.
-
----
-
-## How It Compares
-
-This is a high-level comparison of default workflows; capabilities and defaults can vary by tool version and configuration.
-
-| Aspect | `git-agecrypt` | `git-crypt` | Mozilla `sops` |
-|---|---|---|---|
-| **Working Tree State** | Git-filter cleartext on disk, or runtime injection with `git-agecrypt run` | Git-filter cleartext on disk | Encrypted files on disk, edited through the `sops` command or an editor integration |
-| **Payload Encryption** | `age` (X25519, ChaCha20-Poly1305) | OpenSSL-based encryption with GPG/OpenPGP key wrapping | Age, PGP, or supported cloud/KMS key services |
-| **Identity Mechanism** | SSH keys, native age identities, or age plugins | GPG keys or symmetric mode | PGP/age identities and configured KMS/key services |
-| **Repeat Staging** | Authenticated HMAC/index caching can reuse ciphertext for identical plaintext | Tool-specific encrypted-filter behavior | No `git-agecrypt`-style Git-filter cache; ciphertext changes depend on the SOPS workflow |
-| **Locked Clone Behavior** | Encrypted payload can pass through when the local key is unavailable | Filter checkout commonly requires an available key | Encrypted files remain encrypted until explicitly decrypted |
-| **Binary/Runtime Model** | Rust application with target-specific release builds | Native application with platform crypto dependencies | Go application |
-| **3-Way Merge Driver** | Built-in merge driver with semantic conflict warnings | No built-in semantic merge driver | No `git-agecrypt`-style transparent encrypted-file merge driver |
-
----
-
-## Installation
-
-### Pre-Compiled Binaries
-
-Download pre-compiled standalone binaries for a published release from the [GitHub Releases](https://github.com/Crynspier/git-agecrypt/releases) page. Select the release and asset matching the version you intend to install:
-
-- **Linux:** `git-agecrypt-linux-x86_64.tar.gz` (x86_64)
-- **macOS:** `git-agecrypt-macos-aarch64.tar.gz` (Apple Silicon M-series), `git-agecrypt-macos-x86_64.tar.gz` (Intel)
-- **Windows:** `git-agecrypt-windows-x86_64.zip` (`git-agecrypt.exe`)
-
-Extract the binary and place it in your system `PATH` (e.g. `/usr/local/bin` on Unix, or `C:\Program Files\Git\usr\bin` on Windows).
-
-### Building From Source
-
-Requires Rust 1.88 or later (Rust 2024 edition):
+## 60-Second Quickstart
 
 ```bash
-git clone https://github.com/Crynspier/git-agecrypt.git
-cd git-agecrypt
-cargo install --path .
-```
-
-Or build a release binary directly:
-
-```bash
-cargo build --release
-# Binary is located at target/release/git-agecrypt (or target/release/git-agecrypt.exe)
-```
-
-Verify installation:
-
-```bash
-git-agecrypt --version
-# Confirm that the reported version matches the release or source checkout you intended to install.
-```
-
-When release archives are published, the package set is limited to four targets: Linux x86_64, macOS x86_64 (Intel), macOS arm64 (Apple Silicon), and Windows x86_64. Published archives include a matching `.sha256` checksum file; verify a downloaded archive before placing the binary in `PATH`:
-
-```bash
-# Linux/macOS
-sha256sum -c git-agecrypt-linux-x86_64.tar.gz.sha256  # use shasum -a 256 on macOS if needed
-
-# Windows PowerShell
-$asset = '.\\git-agecrypt-windows-x86_64.zip'
-$expected = (Get-Content "$asset.sha256").Trim().Split()[0].ToLowerInvariant()
-$actual = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($actual -ne $expected) { throw "Checksum mismatch" }
-```
-
----
-
-## Quickstart
-
-### 1. Initialize a Repository
-
-Inside any Git repository:
-
-```bash
-cd my-project
+# 1. Initialize git-agecrypt in your Git repository (creates .gitattributes, repo.pub, and hooks)
 git-agecrypt init
-```
 
-This:
-- Generates a new 256-bit symmetric repository master key.
-- Enrolls your local SSH key (`~/.ssh/id_ed25519.pub` or `~/.ssh/id_rsa.pub`).
-- Configures Git filter and diff drivers in `.git/config`.
-- Installs non-destructive safeguard hooks (`pre-commit`, `pre-merge-commit`, `pre-push`).
+# 2. Enroll a teammate or CI runner using an age or SSH public key (or --github <username>)
+git-agecrypt add-recipient -i ~/.ssh/id_ed25519.pub -n alice
 
-### 2. Configure Files to Encrypt
+# 3. Create a secret file matching .gitattributes and commit normally
+mkdir -p secrets
+echo "DATABASE_URL=postgres://app:supersecret@db.internal:5432/prod" > secrets/app.secret.env
+git add .gitattributes .git-agecrypt secrets/app.secret.env
+git commit -m "feat: add encrypted application secrets"
 
-Specify files in `.gitattributes`. Always include `-text` to prevent Git from converting CRLF/LF line endings on encrypted payloads:
+# 4. Verify that the blob stored in Git is age v1 ciphertext (never plaintext!)
+git show HEAD:secrets/app.secret.env | head -c 21
+# -> age-encryption.org/v1
 
-```gitattributes
-# Secrets and environment configs
-*.secret.env filter=agecrypt diff=agecrypt merge=agecrypt -text
-.env.production filter=agecrypt diff=agecrypt merge=agecrypt -text
-secrets/** filter=agecrypt diff=agecrypt merge=agecrypt -text
-```
-
-Commit the configuration:
-
-```bash
-git add .gitattributes .git-agecrypt/
-git commit -m "Initialize git-agecrypt configuration"
-```
-
-### 3. Add Collaborators
-
-Enroll teammates using their public key file, public key string, or GitHub username:
-
-```bash
-# From an SSH public key file
-git-agecrypt add-recipient -i ~/.ssh/id_ed25519.pub --name alice
-
-# Directly from GitHub
-git-agecrypt add-recipient --github octocat --name octocat
-
-# From a key string
-git-agecrypt add-recipient -i "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..." --name bob
-
-# Hardware token recipient via Age plugin (e.g. YubiKey or Apple Secure Enclave)
-git-agecrypt add-recipient -i "age1yubikey1..." --name yubikey-alice
-
-# List enrolled recipients
-git-agecrypt list-recipients
-```
-
-Commit the new recipient wrappers:
-
-```bash
-git add .git-agecrypt/keys/
-git commit -m "Add Alice and Bob to repository recipients"
-git push
-```
-
-### 4. Daily Workflow
-
-No special commands are needed for daily development:
-
-```bash
-# Edit your secret file normally
-echo "DATABASE_URL=postgres://app:secret@localhost/db" > secrets/app.secret.env
-
-# git add transparently runs the clean filter (encrypts to age container)
-git add secrets/app.secret.env
-
-# Commit and push normally
-git commit -m "Update database connection string"
-git push
-```
-
-To view cleartext diffs:
-
-```bash
-git diff secrets/app.secret.env
-```
-
-To verify the staged blob is encrypted (read from the index, not `HEAD`):
-
-```bash
-git cat-file -p :0:secrets/app.secret.env
-```
-
-### 5. Locking and Unlocking
-
-**Unlock a fresh clone:**
-
-```bash
-# Auto-detects ~/.ssh/id_ed25519 and ~/.ssh/id_rsa
-git-agecrypt unlock
-
-# Or provide a specific key path
-git-agecrypt unlock ~/.ssh/custom_key
-
-# Or supply key from stdin (for CI/CD)
-echo "$DEPLOY_KEY" | git-agecrypt unlock -
-```
-
-**Lock the working tree (re-encrypt files on disk):**
-
-```bash
+# 5. Lock the working tree when done (or unlock on a fresh clone with `git-agecrypt unlock`)
 git-agecrypt lock
-```
-
-Files on disk are replaced with their encrypted `.age` ciphertexts, and cached credentials in `.git/` are cleared.
-
-### 6. Ephemeral Runtime Secret Injection (`run`)
-
-To execute applications or tests without keeping unencrypted secrets on disk, use `git-agecrypt run`:
-
-```bash
-# Decrypt repository .env in memory and inject into child process environment
-git-agecrypt run -- cargo run
-
-# Anonymous in-memory descriptor passing via Linux memfd_create (bypasses /proc/<pid>/environ)
-git-agecrypt run --fd -- ./app_server
-
-# On Windows/macOS, allow fallback from --fd to in-memory environment injection
-git-agecrypt run --fd --allow-env-fallback -- node server.js
-
-# Run a server or script with specific encrypted env file or scoped ring
-git-agecrypt run -e production.secret.env --ring prod -- node server.js
-
-# Run automated tests with injected environment secrets
-git-agecrypt run -- npm test
-```
-
-Secrets are decrypted for the child process and are not intentionally written to application-created cleartext files. The environment path uses process environment variables, and the Linux `--fd` path uses an anonymous memfd exposed through `GIT_AGECRYPT_ENV_FD`; memory may still be retained or paged by the operating system. On non-Linux hosts where `memfd_create` is unavailable, `--fd` fails closed unless `--allow-env-fallback` is supplied. When `-e` is omitted, `run` discovers tracked environment-style files and matching encrypted paths, including `.env`, `*.secret.env`, ring-specific environment layouts, and related `.gitattributes` patterns; it also has a current-directory `.env` fallback.
-
-### 7. Scoped Recipient Rings (Multi-Environment Secrets)
-
-Segment secrets across different access boundaries (e.g. `prod` vs `dev`):
-
-```bash
-# 1. Initialize a scoped ring (names must match ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$)
-git-agecrypt init --ring prod
-
-# 2. Configure .gitattributes to route specific paths to the prod ring
-echo "secrets/prod/** filter=agecrypt-prod diff=agecrypt-prod merge=agecrypt-prod -text" >> .gitattributes
-
-# 3. Enroll ops team public keys to the prod ring
-git-agecrypt add-recipient -i ~/.ssh/ops_key.pub --name ops-alice --ring prod
-
-# 4. Lock or unlock rings independently
-git-agecrypt lock --ring prod
-git-agecrypt unlock ~/.ssh/ops_key --ring prod
-
-# 5. Rekey a single ring independently
-git-agecrypt rekey --ring prod
-```
-
-Ring identifiers are strictly validated to prevent directory traversal and OS device name collisions (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`).
-
-
-### 8. Offboarding and Key Rotation
-
-When a collaborator leaves:
-
-```bash
-# 1. Remove the recipient key
-git-agecrypt remove-recipient bob
-
-# 2. Rotate the master key and re-encrypt all working tree secrets
-git-agecrypt rekey
-
-# 3. Commit the rotated configuration
-git add .git-agecrypt
-git commit -m "Rotate master key and remove bob"
-git push
-```
-
-After the new key and re-encrypted files are distributed, the offboarded developer cannot decrypt ciphertext produced under that new key unless they obtain another authorized recipient key. Historical commits encrypted under keys they already possessed remain readable to them.
-
-### 9. Resolving Historical Branches (`rewrap`)
-
-When cherry-picking or merging an older commit created under a previous master key:
-
-```bash
-# Rewrap a specific file under the current active key
-git-agecrypt rewrap secrets/app.secret.env
-
-# Or rewrap all tracked historical secrets
-git-agecrypt rewrap --all
+git-agecrypt unlock ~/.ssh/id_ed25519
 ```
 
 ---
 
-## CI / CD Integration
+## Installation & Verification
 
-`git-agecrypt` runs headlessly without background daemons:
-
-### GitHub Actions
-
-```yaml
-name: Test Suite
-on: [push, pull_request]
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # Option A: Download standalone pre-compiled release binary (checksum-verified)
-      - name: Install git-agecrypt
-        run: |
-          curl -sSLO https://github.com/Crynspier/git-agecrypt/releases/latest/download/git-agecrypt-linux-x86_64.tar.gz
-          curl -sSLO https://github.com/Crynspier/git-agecrypt/releases/latest/download/git-agecrypt-linux-x86_64.tar.gz.sha256
-          sha256sum -c git-agecrypt-linux-x86_64.tar.gz.sha256
-          tar -xzf git-agecrypt-linux-x86_64.tar.gz
-          sudo mv git-agecrypt /usr/local/bin/
-
-      # Option B (if Rust toolchain is already installed):
-      # - run: cargo install --git https://github.com/Crynspier/git-agecrypt.git
-
-      - name: Unlock Secrets
-        env:
-          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
-        run: echo "$DEPLOY_KEY" | git-agecrypt unlock -
-
-      - name: Run Tests
-        run: cargo test
-```
-
----
-
-## Migration from `git-crypt`
-
-To migrate a repository currently using `git-crypt`:
+### 1. Prebuilt Release Binaries (Linux, macOS, Windows)
+Download the archive for your platform (`git-agecrypt-linux-x86_64.tar.gz`, `git-agecrypt-macos-x86_64.tar.gz`, `git-agecrypt-macos-aarch64.tar.gz`, or `git-agecrypt-windows-x86_64.zip`) and its `.sha256` checksum file from [GitHub Releases](https://github.com/Crynspier/git-agecrypt/releases), then verify its integrity and provenance:
 
 ```bash
-# 1. Ensure the repository is unlocked with git-crypt
-git-crypt unlock
+# Verify SHA-256 checksum (Linux / macOS)
+shasum -a 256 --check git-agecrypt-linux-x86_64.tar.gz.sha256
 
-# 2. Run automated migration (uses the local SSH key by default)
-git-agecrypt migrate-from-git-crypt
-# Or enroll a specific initial recipient:
-# git-agecrypt migrate-from-git-crypt -i ~/.ssh/id_ed25519.pub
+# Verify GitHub Sigstore build provenance attestation
+gh attestation verify git-agecrypt-linux-x86_64.tar.gz \
+  --repo Crynspier/git-agecrypt
+```
 
-# 3. Review and commit changes
-git add .gitattributes .git-agecrypt/
-git commit -m "Migrate from git-crypt to git-agecrypt"
+### 2. Build from Source with Cargo
+```bash
+cargo install --locked git-agecrypt
+# Or from a local checkout:
+cargo install --path . --locked
 ```
 
 ---
 
-## CLI Reference
+## Core Workflows & CLI Reference
 
-| Command | Options | Description |
-|---|---|---|
-| `init` | `[--ring <RING>], [--gitattributes], [--ai-shield]` | Initialize master key, enroll current SSH key, configure Git filters, and install hooks. |
-| `add-recipient` | `-i, --identity <KEY>`, `--github <USER>`, `-n, --name <NAME>`, `[--ring <RING>]` | Enroll a new recipient public key. |
-| `remove-recipient` | `<NAME>`, `[--ring <RING>]` | Remove an enrolled recipient. |
-| `list-recipients` | `[--ring <RING>]` | Display all enrolled recipients in alphabetical order. |
-| `unlock` | `[KEY_FILE]`, `-f, --force`, `[--ring <RING>]` | Decrypt master key and smudge secret files on disk. |
-| `lock` | `-f, --force`, `[--ring <RING>]` | Re-smudge disk files to ciphertext and remove cached master key. |
-| `rekey` | `-f, --force`, `[--ring <RING>]` | Rotate the master key and re-encrypt all tracked secret files. |
-| `rewrap` | `[PATH]...`, `-a, --all`, `-i, --identity <KEY>`, `-f, --force` | Re-encrypt historical ciphertexts under the active master key. |
-| `status` | *(none)* | Display repository status, active key fingerprint, and tracked files. |
-| `shield` | `[--check]` | Synchronize AI agent and IDE ignore files (`.cursorignore`, `.claudeignore`, `.aiderignore`, `.aiignore`). |
-| `install-hooks` | *(none)* | Install or update safeguard hooks (`pre-commit`, `pre-merge-commit`, `pre-push`). |
-| `check` | `[--pre-push], [--allow-untracked-secrets]` | Validate staged files or outgoing commits against unencrypted or untracked secret leaks. |
-| `clean` | `[PATH]`, `[--ring <RING>]` | Git clean filter (streams stdin plaintext to stdout ciphertext). |
-| `smudge` | `[PATH]`, `[--ring <RING>]` | Git smudge filter (streams stdin ciphertext to stdout plaintext). |
-| `textconv` | `<PATH>`, `[--ring <RING>]` | Git diff driver (decrypts target for cleartext diffs). |
-| `merge` | `<O> <A> <B> [L] [P]`, `[--ring <RING>]` | Git 3-way merge driver. |
-| `run` | `[-e, --env-file <PATH>], [--fd], [--allow-env-fallback], [--ring <RING>] -- <COMMAND>...` | Execute child process with in-memory decrypted secrets (environment variables or anonymous Linux memfd). |
-| `migrate-from-git-crypt` | `-i, --identity <KEY>` | Convert an existing git-crypt repository. |
+| Command | Description |
+| :--- | :--- |
+| `git-agecrypt init [--ring <RING>] [--ai-shield]` | Initialize repository or named ring, configure `.git/config` drivers, and install safeguard hooks. |
+| `git-agecrypt add-recipient (-i <KEY> \| --github <USER>) [-n <NAME>] [--ring <RING>]` | Enroll an `age1...` or SSH public key (`ssh-ed25519` / `ssh-rsa`) as a recipient. |
+| `git-agecrypt remove-recipient <NAME> [--ring <RING>]` | Remove a recipient envelope from `.git-agecrypt/keys/`. |
+| `git-agecrypt list-recipients [--ring <RING>]` | List enrolled recipient envelopes and public key prefixes. |
+| `git-agecrypt rekey [-f] [--ring <RING>]` | Rotate the ring's master key, re-wrap for remaining recipients, and re-encrypt working tree secrets. |
+| `git-agecrypt rewrap (<PATH>... \| --all) [-i <KEY>] [-f]` | Re-encrypt historical or cherry-picked ciphertexts under the current active master key. |
+| `git-agecrypt unlock [<KEY_FILE> \| -] [-f] [--ring <RING>]` | Unwrap the master key using your private key and decrypt tracked secrets across worktrees. |
+| `git-agecrypt lock [-f] [--ring <RING>]` | Transactionally wipe local `repo.key` and replace working tree secrets with ciphertext. |
+| `git-agecrypt status` | Show lock status, active public key, tracked `.gitattributes` patterns, and configured rings. |
+| `git-agecrypt inspect [--format text\|json] [--ring <RING>]` | Read-only diagnostic report of format version, recipient envelopes, key state, and recovery actions. |
+| `git-agecrypt export-age <FILE> -r <RECIPIENT> -o <OUT_FILE> [--ring <RING>] [-i <KEY>] [-y]` | Export a tracked secret to a standalone standard `age` file without writing plaintext to stdout. |
+| `git-agecrypt check [--pre-push \| --pre-receive \| --commit-range <RANGE>] [--report-only]` | Verify staged files, outgoing pushes, incoming server refs, or CI commit ranges against plaintext leaks. |
+| `git-agecrypt run [-e <ENV_FILE>] [--ring <RING>] [--fd] -- <CMD> [ARGS...]` | Run a subprocess with decrypted `.env` secrets injected (supports Linux `memfd_create` via `--fd`). |
+| `git-agecrypt shield [--check]` | Synchronize tracked secret patterns into `.cursorignore`, `.claudeignore`, `.aiderignore`, and `.aiignore`. |
+| `git-agecrypt migrate-from-git-crypt [-i <KEY>]` | Migrate `.gitattributes` rules and tracked secrets from `git-crypt` to `git-agecrypt`. |
 
 ---
 
-## Documentation & Deep Dives
+## Security Posture & Limitations
 
-Comprehensive specifications and architecture guides are available in the [`docs/`](docs/) directory:
-
-- **[Security Model & Threat Analysis](docs/security-model.md):**
-  Detailed threat model, cryptographic primitives (ChaCha20-Poly1305, X25519, HMAC caching), documented invariants, POSIX permissions (`0o700`/`0o600`), crash-recovery boundaries, Merkle DAG historical-access behavior, runtime secret injection boundaries, and enterprise server-side `pre-receive` hook enforcement.
-
-- **[Internal Architecture & Driver Mechanics](docs/internals.md):**
-  In-depth breakdown of the Git filter lifecycle (`clean`, `smudge`, `textconv`, `merge`), two-tier spooling architecture, scoped ring grammar validation, stage-0 index deduplication, cache validation, and the 3-way semantic merge driver conflict algorithms.
-
-- **[Verification & Invariant Matrix](docs/verification-matrix.md):**
-  Traceability matrix mapping the implemented verification suites (generative state machine, multi-ring combinatorial DAG, crash points, mixed-operation concurrency, forensic canary sweeps, Linux prctl lockdown, symlink/case-collision defense) and documented invariants to automated test suites, with explicit platform and coverage limits.
-
-- **[Specification & Security Guarantees](docs/spec-guarantees.md):**
-  Explicit cryptographic, durability, cache, process-isolation, hardware-token, and platform-specific verification boundaries.
+- **Evidence-Bounded Claims:** `git-agecrypt` has not yet undergone a paid third-party cryptographic audit. All cryptographic operations use the upstream [`age`](https://crates.io/crates/age) crate (`X25519`, `ChaCha20-Poly1305`) and RustCrypto [`sha2`](https://crates.io/crates/sha2) / [`hmac`](https://crates.io/crates/hmac). See [`docs/security-review-package.md`](docs/security-review-package.md) for the complete `unsafe`/syscall inventory and threat model.
+- **Git History Immutability:** Removing a collaborator (`remove-recipient` + `rekey`) prevents them from decrypting *future* commits, but cannot erase their access to historical commits they already cloned. Always rotate actual external credentials when offboarding.
+- **Server-Side Enforcement Recommended:** Client-side Git hooks can be skipped with `--no-verify`. Production repositories should enable the reference server-side `pre-receive` hook ([`examples/hooks/pre-receive`](examples/hooks/pre-receive)) or GitHub Action workflow ([`examples/github-actions/agecrypt-verify.yml`](examples/github-actions/agecrypt-verify.yml)).
+- **Clean-Room Recovery Without `git-agecrypt`:** Because Format Version 1 uses standard `age` v1 files, you can recover any secret using only `git` and the standard `age` CLI (`age -d -i <your_key> .git-agecrypt/keys/<you>.age > repo.key && git show HEAD:<secret> | age -d -i repo.key`).
 
 ---
 
-## Minimum Supported Versions
+## Documentation Index
 
-- **Rust:** 1.88.0+ (Rust 2024 edition)
-- **Git:** 2.25.0+ is the project support baseline. Some plumbing operations include compatibility fallbacks for older Git versions; `--pathspec-from-file` and `-z` null-delimited plumbing are preferred when available.
+- **[Format Specification (v1)](docs/format-spec.md)** — Normative on-disk and in-Git format specification, compatibility policy, and recovery rules.
+- **[Operations & Disaster Recovery Guide](docs/operations.md)** — Onboarding, offboarding, multi-ring isolation, upgrades, `inspect`, `export-age`, and clean-room recovery.
+- **[Server & CI Enforcement Guide](docs/server-enforcement.md)** — Deploying bare-repository `pre-receive` hooks and GitHub Actions verification.
+- **[Internals & Locking Architecture](docs/internals.md)** — Envelope encryption, convergence cache, shared-state mutation table, and WAL lock transactions.
+- **[Security Model & Threat Boundaries](docs/security-model.md)** — Threat actors, platform mitigations, and residual risks.
+- **[External Security Review Package](docs/security-review-package.md)** — Data-flow diagrams, complete `unsafe`/syscall inventory, and auditor focus areas.
+- **[Specification Guarantees](docs/spec-guarantees.md)** — Formal operational invariants and failure-mode guarantees.
+- **[Verification Matrix](docs/verification-matrix.md)** — Mapping of security invariants to automated unit, integration, crash, concurrency, and fuzz tests.
+- **[Release Process & Provenance](docs/release-process.md)** — Checksum verification, Sigstore build provenance attestations, and reproducible builds.
 
 ---
 
 ## License
 
-Dual-licensed under either:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT License ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT License](LICENSE-MIT) at your option.

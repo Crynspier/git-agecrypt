@@ -4,17 +4,9 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(text) = std::str::from_utf8(data) {
-        // Fuzz recovery journal log lines
-        for line in text.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if let Some(op) = parts.first() {
-                match *op {
-                    "BEGIN" | "RENAME" | "COMMIT" | "ROLLBACK" => {
-                        let _ = parts.get(1);
-                    }
-                    _ => {}
-                }
-            }
-        }
+        let _ = git_agecrypt::format::parse_and_validate_lock_journal(text);
+        let _ = git_agecrypt::format::parse_format_file_content(text);
+        let _ = git_agecrypt::format::parse_and_validate_repo_pub(text);
+        let _ = git_agecrypt::format::validate_wrapped_key_envelope(text);
     }
 });

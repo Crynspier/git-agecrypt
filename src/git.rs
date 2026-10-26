@@ -389,26 +389,164 @@ pub fn run_git_cmd_with_index_retry(
     }
 }
 
+/// Default maximum wait time (30 seconds) when acquiring `recovery.lock`.
+/// Can be overridden via `GIT_AGECRYPT_LOCK_TIMEOUT_MS` for deterministic testing.
+pub const DEFAULT_RECOVERY_LOCK_TIMEOUT_MS: u64 = 30_000;
+
+/// Guard representing exclusive ownership of the repository-wide OS-level recovery and
+/// mutation lock (`.git/git-agecrypt/recovery.lock` in `common_dir`).
+///
+/// # Locking & Durability Contract
+/// - **Exclusive Coordinator**: All commands that mutate local keys (`repo.key`, `repo.key.locking`),
+///   recovery journals (`lock.journal`), recipient envelopes (`.git-agecrypt/keys/*.age`),
+///   or `.git/config` filter definitions must hold `RecoveryLockGuard` from before preflight
+///   validation through completion.
+/// - **OS-Managed Release**: Relies strictly on kernel-managed file descriptor/handle locks
+///   (`flock` on Unix, `LockFileEx` on Windows). When a process exits or is killed (`SIGKILL` /
+///   `TerminateProcess`), the OS kernel automatically releases the lock. `recovery.lock` is
+///   never reclaimed via heuristic PID or mtime checks.
+/// - **Path-Replacement Protection**: On Windows, `recovery.lock` is opened without
+///   `FILE_SHARE_DELETE`, preventing unlinking or renaming while any handle is open. On Unix,
+///   after `try_lock_exclusive()` succeeds, the locked file descriptor's `(st_dev, st_ino)` is
+///   verified against `symlink_metadata(lock_path)` so an unlinked or replaced lock file is
+///   never trusted.
+/// - **Lock Ordering**: `recovery.lock` is the outermost lock across the repository and all
+///   linked worktrees. Git's `index.lock` is acquired only inside a held `RecoveryLockGuard`.
+/// - **Network Filesystem Caveat**: Network filesystems without reliable POSIX `flock` or SMB
+///   byte-range locking (e.g., NFSv3 without `rpc.lockd`, mounts with `nolock`) are not
+///   supported for concurrent multi-writer operations.
 pub struct RecoveryLockGuard {
     // Keeping this handle alive keeps the OS-level lock held. The operating
     // system releases it when the handle or owning process goes away.
-    #[allow(dead_code)]
     file: File,
 }
 
-fn acquire_recovery_lock(state_dir: &Path) -> Result<RecoveryLockGuard> {
+impl Drop for RecoveryLockGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+pub fn configured_recovery_lock_timeout() -> std::time::Duration {
+    if let Ok(val) = std::env::var("GIT_AGECRYPT_LOCK_TIMEOUT_MS")
+        && let Ok(ms) = val.trim().parse::<u64>()
+    {
+        return std::time::Duration::from_millis(ms);
+    }
+    std::time::Duration::from_millis(DEFAULT_RECOVERY_LOCK_TIMEOUT_MS)
+}
+
+pub fn acquire_recovery_lock(state_dir: &Path) -> Result<RecoveryLockGuard> {
+    acquire_recovery_lock_with_timeout(state_dir, configured_recovery_lock_timeout())
+}
+
+pub fn acquire_recovery_lock_with_timeout(
+    state_dir: &Path,
+    timeout: std::time::Duration,
+) -> Result<RecoveryLockGuard> {
+    if state_dir.exists() {
+        ensure_not_symlink_or_reparse(state_dir)?;
+    }
     fs::create_dir_all(state_dir).context("Failed to create local state directory")?;
+    ensure_not_symlink_or_reparse(state_dir)?;
     let lock_path = state_dir.join("recovery.lock");
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("Failed to open recovery lock {}", lock_path.display()))?;
-    file.lock_exclusive()
-        .with_context(|| format!("Failed to acquire recovery lock {}", lock_path.display()))?;
-    Ok(RecoveryLockGuard { file })
+    ensure_not_symlink_or_reparse(&lock_path)?;
+
+    let start = std::time::Instant::now();
+    let mut attempt: u64 = 0;
+
+    loop {
+        ensure_not_symlink_or_reparse(&lock_path)?;
+
+        #[cfg(windows)]
+        let open_res = {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x00000001;
+            const FILE_SHARE_WRITE: u32 = 0x00000002;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+            // Omit FILE_SHARE_DELETE so no concurrent process can unlink or replace recovery.lock
+            // while a lock holder or waiter has an open handle.
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&lock_path)
+        };
+
+        #[cfg(not(windows))]
+        let open_res = open_pinned_secret_file(state_dir, "recovery.lock", false);
+
+        let file = match open_res {
+            Ok(f) => f,
+            Err(e) => {
+                if start.elapsed() >= timeout {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "Timed out after {:?} opening repository recovery lock '{}'",
+                            timeout,
+                            lock_path.display()
+                        )
+                    });
+                }
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10.min(5 * attempt)));
+                continue;
+            }
+        };
+
+        ensure_not_symlink_or_reparse(&lock_path)?;
+
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let fd_meta = file
+                        .metadata()
+                        .context("Failed to stat locked recovery.lock fd")?;
+                    match fs::symlink_metadata(&lock_path) {
+                        Ok(path_meta) => {
+                            if path_meta.file_type().is_symlink() {
+                                let _ = fs2::FileExt::unlock(&file);
+                                return Err(anyhow!(
+                                    "Security violation: recovery lock path '{}' was replaced with a symlink",
+                                    lock_path.display()
+                                ));
+                            }
+                            if fd_meta.dev() != path_meta.dev() || fd_meta.ino() != path_meta.ino()
+                            {
+                                // Coordination path was unlinked or replaced while waiting; retry on the live path.
+                                let _ = fs2::FileExt::unlock(&file);
+                                continue;
+                            }
+                        }
+                        Err(_) => {
+                            // File was unlinked on disk after we opened it; retry so we recreate and lock the live path.
+                            let _ = fs2::FileExt::unlock(&file);
+                            continue;
+                        }
+                    }
+                }
+                return Ok(RecoveryLockGuard { file });
+            }
+            Err(lock_err) => {
+                if start.elapsed() >= timeout {
+                    return Err(anyhow!(
+                        "Timed out after {:?} waiting to acquire repository recovery lock '{}' (held by another active git-agecrypt process: {}). Wait for the concurrent operation to finish or terminate any hung git-agecrypt process.",
+                        timeout,
+                        lock_path.display(),
+                        lock_err
+                    ));
+                }
+                attempt += 1;
+                let sleep_ms = (10 + attempt * 5).min(50);
+                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+            }
+        }
+    }
 }
 
 pub struct GitRepo {
@@ -425,9 +563,9 @@ impl GitRepo {
                 "-c",
                 "color.ui=false",
                 "rev-parse",
-                "--show-toplevel",
                 "--git-dir",
                 "--git-common-dir",
+                "--is-bare-repository",
             ])
             .output()
             .map_err(|e| anyhow!("Failed to execute git command: {e}. Is git installed?"))?;
@@ -437,30 +575,45 @@ impl GitRepo {
         }
 
         let text = String::from_utf8(output.stdout)?;
-        let mut lines = text.lines();
-        let root_str = lines
-            .next()
-            .ok_or_else(|| anyhow!("Failed to obtain repository root"))?;
+        let mut lines = text.lines().map(|l| l.trim());
         let git_dir_str = lines
             .next()
             .ok_or_else(|| anyhow!("Failed to obtain git directory"))?;
         let common_dir_str = lines.next().unwrap_or(git_dir_str);
+        let is_bare_str = lines.next().unwrap_or("false");
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        let root = PathBuf::from(root_str.trim());
-        let cwd = std::env::current_dir().unwrap_or_else(|_| root.clone());
+        let root_opt = if is_bare_str == "true" {
+            None
+        } else {
+            let top_out = Command::new("git")
+                .args(["-c", "color.ui=false", "rev-parse", "--show-toplevel"])
+                .output()
+                .map_err(|e| anyhow!("Failed to execute git command: {e}"))?;
+            if !top_out.status.success() {
+                return Err(anyhow!("Failed to obtain repository root"));
+            }
+            let top_str = String::from_utf8(top_out.stdout)?.trim().to_string();
+            Some(top_str)
+        };
 
-        let git_dir_path = PathBuf::from(git_dir_str.trim());
+        let git_dir_path = PathBuf::from(git_dir_str);
         let git_dir = if git_dir_path.is_absolute() {
             git_dir_path
         } else {
             cwd.join(git_dir_path)
         };
 
-        let common_dir_path = PathBuf::from(common_dir_str.trim());
+        let common_dir_path = PathBuf::from(common_dir_str);
         let common_dir = if common_dir_path.is_absolute() {
             common_dir_path
         } else {
             cwd.join(common_dir_path)
+        };
+
+        let root = match root_opt {
+            Some(r) => PathBuf::from(r),
+            None => git_dir.clone(),
         };
 
         Ok(Self {
@@ -468,6 +621,19 @@ impl GitRepo {
             git_dir,
             common_dir,
         })
+    }
+
+    /// Checks whether this repository is a bare repository (no working tree).
+    pub fn is_bare(&self) -> bool {
+        let out = git_cmd_with_path(&self.root)
+            .args(["rev-parse", "--is-bare-repository"])
+            .output();
+        if let Ok(o) = out
+            && o.status.success()
+        {
+            return String::from_utf8_lossy(&o.stdout).trim() == "true";
+        }
+        false
     }
 
     /// Checks whether this repository is a shallow clone (e.g. created with `--depth 1`).
@@ -619,18 +785,6 @@ impl GitRepo {
                 eprintln!("git-agecrypt [WARN]: Non-fatal cache eviction error: {e}");
             }
         }
-        Ok(())
-    }
-
-    /// Purges all cached ciphertexts (e.g. during rekey or lock) and sweeps temp files.
-    #[allow(dead_code)]
-    pub fn clear_cache(&self) -> Result<()> {
-        self.clear_cache_for_ring(None, false)?;
-        let rings_cache = self.local_state_dir().join("rings");
-        if rings_cache.exists() {
-            let _ = fs::remove_dir_all(&rings_cache);
-        }
-        self.sweep_orphaned_tmp_files();
         Ok(())
     }
 
@@ -816,49 +970,94 @@ impl GitRepo {
     ///   Uncommitted plaintext modifications in any linked worktree are never overwritten.
     ///
     /// Also sweeps any orphaned temporary spool files left in .git/git-agecrypt/.
+    /// Acquires the repository-wide `recovery.lock` and atomically performs any pending
+    /// crash/lock-transaction recovery while holding the same lock guard.
+    ///
+    /// Because recovery runs under the returned `RecoveryLockGuard`, callers that hold this
+    /// guard across preflight checks and mutations never have a lock gap between startup
+    /// recovery and command execution.
     pub fn acquire_recovery_lock(&self) -> Result<RecoveryLockGuard> {
-        acquire_recovery_lock(&self.local_state_dir())
+        let guard = acquire_recovery_lock(&self.local_state_dir())?;
+        self.recover_interrupted_transaction_locked()?;
+        Ok(guard)
     }
 
     pub fn recover_interrupted_transaction(&self) -> Result<()> {
-        // Startup recovery mutates the shared lock journal, worktree files, and
-        // Git index. Multiple concurrent CLI processes may all run this method
-        // before doing their requested command, so serialize the whole recovery
-        // sweep rather than allowing one process to remove the journal while
-        // another is replaying it.
-        let _recovery_guard = acquire_recovery_lock(&self.local_state_dir())?;
+        let _recovery_guard = self.acquire_recovery_lock()?;
+        Ok(())
+    }
 
-        let locking_file = self.local_state_dir().join("repo.key.locking");
+    fn recover_interrupted_transaction_locked(&self) -> Result<()> {
         let journal_file = self.lock_journal_file();
+        let mut any_locking_found = false;
+        let mut any_key_present = self.local_master_key_file().exists();
 
-        if locking_file.exists() {
-            let key_file = self.local_master_key_file();
-            if key_file.exists() {
-                fs::remove_file(&locking_file)
-                    .context("Failed to remove stale locking key after completed transaction")?;
-                if journal_file.exists() {
-                    fs::remove_file(&journal_file)
-                        .context("Failed to remove completed lock journal")?;
+        // Collect all ring state directories (default ring + any scoped rings under rings/)
+        let mut ring_state_dirs: Vec<(Option<String>, PathBuf)> =
+            vec![(None, self.local_state_dir())];
+        let rings_parent = self.local_state_dir().join("rings");
+        if rings_parent.exists()
+            && let Ok(entries) = fs::read_dir(&rings_parent)
+        {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    let rname = entry.file_name().to_string_lossy().to_string();
+                    ring_state_dirs.push((Some(rname), entry.path()));
                 }
-            } else {
-                let lock_mtime = fs::metadata(&locking_file)
-                    .and_then(|m| m.modified())
-                    .context("Failed to inspect interrupted lock transaction")?;
-                fs::rename(&locking_file, &key_file)
-                    .context("Failed to restore master key from interrupted lock transaction")?;
-                eprintln!(
-                    "git-agecrypt [WARNING]: Recovered interrupted lock transaction. Master key has been restored."
-                );
-                // Replay recovery from WAL journal if present, or fallback to selective scan.
-                // The journal is retained automatically if replay fails.
-                self.replay_lock_journal_or_selective(Some(lock_mtime))?;
             }
-        } else if journal_file.exists() {
+        }
+
+        for (ring_name, state_dir) in &ring_state_dirs {
+            let locking_file = state_dir.join("repo.key.locking");
+            let key_file = state_dir.join("repo.key");
+            if key_file.exists() {
+                any_key_present = true;
+            }
+            if locking_file.exists() {
+                any_locking_found = true;
+                if key_file.exists() {
+                    fs::remove_file(&locking_file).context(
+                        "Failed to remove stale locking key after completed transaction",
+                    )?;
+                    if journal_file.exists() {
+                        fs::remove_file(&journal_file)
+                            .context("Failed to remove completed lock journal")?;
+                    }
+                } else {
+                    let lock_mtime = fs::metadata(&locking_file)
+                        .and_then(|m| m.modified())
+                        .context("Failed to inspect interrupted lock transaction")?;
+                    fs::rename(&locking_file, &key_file).context(
+                        "Failed to restore master key from interrupted lock transaction",
+                    )?;
+                    sync_dir(state_dir)?;
+                    any_key_present = true;
+                    match ring_name {
+                        Some(r) => eprintln!(
+                            "git-agecrypt [WARNING]: Recovered interrupted lock transaction for ring '{r}'. Master key has been restored."
+                        ),
+                        None => eprintln!(
+                            "git-agecrypt [WARNING]: Recovered interrupted lock transaction. Master key has been restored."
+                        ),
+                    }
+                    // Replay recovery from WAL journal if present, or fallback to selective scan.
+                    // The journal is retained automatically if replay fails.
+                    self.replay_lock_journal_or_selective(Some(lock_mtime))?;
+                }
+            }
+        }
+
+        if !any_locking_found && journal_file.exists() {
+            // Validate journal syntax first so a corrupted journal is never silently discarded.
+            let content = fs::read_to_string(&journal_file)
+                .context("Failed to read lock recovery journal")?;
+            crate::format::parse_and_validate_lock_journal(&content)?;
+
             // A journal with an intact active key can only be from a crash
             // before the destructive key transition. It is safe to discard
             // that uncommitted journal. If the key is absent, however, the
             // repository state is ambiguous and the journal must be retained.
-            if self.local_master_key_file().exists() {
+            if any_key_present {
                 fs::remove_file(&journal_file)
                     .context("Failed to remove pre-transaction lock journal")?;
             } else {
@@ -895,13 +1094,10 @@ impl GitRepo {
         if journal_file.exists() {
             let content = fs::read_to_string(&journal_file)
                 .context("Failed to read lock recovery journal")?;
-            for line in content.lines() {
-                let parts: Vec<&str> = line.split('\t').collect();
-                if parts.len() != 2 {
-                    return Err(anyhow!("Malformed lock recovery journal entry"));
-                }
-                let wt_path = PathBuf::from(parts[0]);
-                let rel_path = parts[1];
+            let entries = crate::format::parse_and_validate_lock_journal(&content)?;
+            for (wt_str, rel_str) in &entries {
+                let wt_path = PathBuf::from(wt_str);
+                let rel_path = rel_str.as_str();
                 let full_path = wt_path.join(rel_path);
                 if full_path.exists() {
                     let repo_for_wt = GitRepo {
@@ -1607,6 +1803,7 @@ impl GitRepo {
                 {
                     continue;
                 }
+                let _recovery_guard = acquire_recovery_lock(&self.local_state_dir())?;
                 self.save_local_master_key_for_ring(&master_key, ring)?;
                 return Ok(Some(master_key));
             }
@@ -2802,12 +2999,6 @@ impl GitRepo {
         Ok(dirty_secrets)
     }
 
-    /// Returns a list of tracked secret files that currently have unstaged/uncommitted changes across all rings.
-    #[allow(dead_code)]
-    pub fn get_dirty_tracked_files(&self) -> Result<Vec<String>> {
-        self.get_dirty_tracked_files_for_ring(None)
-    }
-
     /// Returns a list of tracked NON-SECRET files that currently have unstaged/uncommitted changes.
     /// Used by `cmd_rekey` to prevent accidentally staging and committing developer WIP code.
     pub fn get_dirty_non_secret_files(&self) -> Result<Vec<String>> {
@@ -2991,13 +3182,6 @@ impl GitRepo {
         Ok(())
     }
 
-    /// Refreshes the working tree non-destructively by default across all rings.
-    #[allow(dead_code)]
-    pub fn refresh_working_tree(&self, force: bool) -> Result<()> {
-        let _ = self.get_dirty_tracked_files()?;
-        self.refresh_working_tree_for_ring(force, None)
-    }
-
     /// Discovers all registered worktrees linked to this repository using `git worktree list --porcelain`.
     pub fn list_all_registered_worktrees(&self) -> Result<Vec<PathBuf>> {
         let output = git_cmd_with_path(&self.root)
@@ -3102,24 +3286,6 @@ impl GitRepo {
             repo_for_wt.refresh_working_tree_for_ring(force, ring)?;
         }
 
-        Ok(())
-    }
-
-    /// Refreshes the working tree across all linked worktrees across all rings.
-    #[allow(dead_code)]
-    pub fn refresh_all_worktrees(&self, force: bool) -> Result<()> {
-        let worktrees = self.list_worktrees()?;
-        for wt in worktrees {
-            if !wt.join(".git").exists() {
-                continue;
-            }
-            let repo_for_wt = GitRepo {
-                root: wt,
-                git_dir: self.git_dir.clone(),
-                common_dir: self.common_dir.clone(),
-            };
-            repo_for_wt.refresh_working_tree(force)?;
-        }
         Ok(())
     }
 }

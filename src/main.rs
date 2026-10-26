@@ -1,5 +1,6 @@
 mod cli;
 mod crypto;
+mod format;
 mod git;
 mod github;
 mod merge;
@@ -113,18 +114,34 @@ fn validate_ring_arg(ring: Option<&str>) -> Result<Option<&str>> {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    // For non-filter management commands, recover any interrupted lock transaction
+    // Mutating commands (`init`, `add-recipient`, `remove-recipient`, `rekey`, `rewrap`,
+    // `unlock`, `lock`, `migrate-from-git-crypt`, `install-hooks`, `shield`) acquire
+    // `repo.acquire_recovery_lock()` themselves and hold that single guard across startup
+    // recovery, preflight validation, and mutation with zero lock gap.
+    // `inspect` is strictly read-only so it can report pending recovery state without mutating it.
+    // Other non-filter commands (`status`, `list-recipients`, `export-age`, `run`, `check`)
+    // run startup recovery first unless running in bare/pre-receive mode.
     match &cli.command {
-        Commands::Clean { .. }
-        | Commands::Smudge { .. }
-        | Commands::Textconv { .. }
-        | Commands::Merge { .. } => {}
-        _ => {
-            if let Ok(repo) = GitRepo::discover() {
+        Commands::Status
+        | Commands::ListRecipients { .. }
+        | Commands::ExportAge { .. }
+        | Commands::Run { .. } => {
+            if let Ok(repo) = GitRepo::discover()
+                && !repo.is_bare()
+            {
                 repo.recover_interrupted_transaction()
                     .context("Failed to recover interrupted lock transaction")?;
             }
         }
+        Commands::Check { pre_receive, .. } if !*pre_receive => {
+            if let Ok(repo) = GitRepo::discover()
+                && !repo.is_bare()
+            {
+                repo.recover_interrupted_transaction()
+                    .context("Failed to recover interrupted lock transaction")?;
+            }
+        }
+        _ => {}
     }
 
     match cli.command {
@@ -160,12 +177,37 @@ fn run(cli: Cli) -> Result<()> {
         } => cmd_unlock(key_file.as_deref(), force, ring.as_deref()),
         Commands::Lock { force, ring } => cmd_lock(force, ring.as_deref()),
         Commands::Status => cmd_status(),
+        Commands::Inspect { format, ring } => cmd_inspect(&format, ring.as_deref()),
+        Commands::ExportAge {
+            file,
+            recipient,
+            output,
+            ring,
+            identity,
+            yes,
+        } => cmd_export_age(
+            &file,
+            &recipient,
+            &output,
+            ring.as_deref(),
+            identity.as_deref(),
+            yes,
+        ),
         Commands::Shield { check } => cmd_shield(check),
         Commands::InstallHooks => cmd_install_hooks(),
         Commands::Check {
             pre_push,
+            pre_receive,
+            commit_range,
+            report_only,
             allow_untracked_secrets,
-        } => cmd_check(pre_push, allow_untracked_secrets),
+        } => cmd_check(
+            pre_push,
+            pre_receive,
+            commit_range.as_deref(),
+            report_only,
+            allow_untracked_secrets,
+        ),
         Commands::Clean { file_path, ring } => cmd_clean(file_path.as_deref(), ring.as_deref()),
         Commands::Smudge { file_path, ring } => cmd_smudge(file_path.as_deref(), ring.as_deref()),
         Commands::Textconv { file, ring } => cmd_textconv(&file, ring.as_deref()),
@@ -206,6 +248,16 @@ fn cmd_init(create_gitattributes: bool, ai_shield: bool, ring_opt: Option<&str>)
     let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
     let _recovery_guard = repo.acquire_recovery_lock()?;
+    cmd_init_locked(&repo, create_gitattributes, ai_shield, ring_opt)
+}
+
+fn cmd_init_locked(
+    repo: &GitRepo,
+    create_gitattributes: bool,
+    ai_shield: bool,
+    ring_opt: Option<&str>,
+) -> Result<()> {
+    format::ensure_supported_repository_format(repo, ring_opt)?;
     let is_default_ring = matches!(ring_opt, None | Some("default") | Some(""));
 
     if is_default_ring {
@@ -346,6 +398,17 @@ fn cmd_add_recipient(
     let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
     let _recovery_guard = repo.acquire_recovery_lock()?;
+    cmd_add_recipient_locked(&repo, identity, github, name, ring_opt)
+}
+
+fn cmd_add_recipient_locked(
+    repo: &GitRepo,
+    identity: Option<&str>,
+    github: Option<&str>,
+    name: Option<&str>,
+    ring_opt: Option<&str>,
+) -> Result<()> {
+    format::ensure_supported_repository_format(repo, ring_opt)?;
     let master_key = repo.read_local_master_key_for_ring(ring_opt)?.ok_or_else(|| {
         anyhow!(
             "Repository/ring is locked. You must run 'git-agecrypt unlock' before adding recipients."
@@ -485,6 +548,7 @@ fn cmd_remove_recipient(name: &str, ring_opt: Option<&str>) -> Result<()> {
     let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
     let _recovery_guard = repo.acquire_recovery_lock()?;
+    format::ensure_supported_repository_format(&repo, ring_opt)?;
     let keys_dir = repo.keys_dir_for_ring(ring_opt);
     let label = name.trim_end_matches(".age");
     // M1: reject path separators, traversal segments, and control characters so a
@@ -546,6 +610,7 @@ fn cmd_remove_recipient(name: &str, ring_opt: Option<&str>) -> Result<()> {
 fn cmd_list_recipients(ring_opt: Option<&str>) -> Result<()> {
     let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
+    format::ensure_supported_repository_format(&repo, ring_opt)?;
     let keys_dir = repo.keys_dir_for_ring(ring_opt);
     if !keys_dir.exists() {
         eprintln!("No recipients directory found in {}.", keys_dir.display());
@@ -588,6 +653,7 @@ fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
     let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
     let _transaction_guard = repo.acquire_recovery_lock()?;
+    format::ensure_supported_repository_format(&repo, ring_opt)?;
     if !repo.is_unlocked_for_ring(ring_opt) {
         return Err(anyhow!(
             "Repository/ring is locked. You must run 'git-agecrypt unlock' before rekeying."
@@ -824,6 +890,7 @@ impl Drop for ReadonlyGuard {
 fn cmd_rewrap(paths: &[PathBuf], all: bool, identity_opt: Option<&str>, force: bool) -> Result<()> {
     let repo = GitRepo::discover()?;
     let _recovery_guard = repo.acquire_recovery_lock()?;
+    format::ensure_supported_repository_format(&repo, None)?;
 
     let master_key_str = repo.read_local_master_key()?.ok_or_else(|| {
         anyhow!("Repository is locked. Run 'git-agecrypt unlock' before rewrapping.")
@@ -1168,6 +1235,7 @@ fn cmd_unlock(key_file: Option<&str>, force: bool, ring_opt: Option<&str>) -> Re
     let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
     let _transaction_guard = repo.acquire_recovery_lock()?;
+    format::ensure_supported_repository_format(&repo, ring_opt)?;
     let keys_dir = repo.keys_dir_for_ring(ring_opt);
     if !keys_dir.exists() {
         return Err(anyhow!(
@@ -1275,6 +1343,7 @@ fn cmd_lock(force: bool, ring_opt: Option<&str>) -> Result<()> {
     let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
     let _transaction_guard = repo.acquire_recovery_lock()?;
+    format::ensure_supported_repository_format(&repo, ring_opt)?;
 
     if let Some(op) = repo.check_active_git_operations()?
         && !force
@@ -1351,6 +1420,7 @@ fn cmd_lock(force: bool, ring_opt: Option<&str>) -> Result<()> {
 
 fn cmd_status() -> Result<()> {
     let repo = GitRepo::discover()?;
+    format::ensure_supported_repository_format(&repo, None)?;
     println!("git-agecrypt Status:");
     println!("  Repository root:   {}", repo.root.display());
 
@@ -1402,8 +1472,54 @@ fn cmd_status() -> Result<()> {
     Ok(())
 }
 
+fn cmd_inspect(format_opt: &str, ring_opt: Option<&str>) -> Result<()> {
+    let ring_opt = validate_ring_arg(ring_opt)?;
+    let repo = GitRepo::discover()?;
+    let report = format::inspect_repository(&repo, ring_opt)?;
+    match format_opt.trim().to_ascii_lowercase().as_str() {
+        "json" => {
+            print!("{}", report.to_json());
+        }
+        "text" => {
+            print!("{}", report.to_text());
+        }
+        other => {
+            return Err(anyhow!(
+                "Unsupported inspect output format '{}': expected 'text' or 'json'",
+                other
+            ));
+        }
+    }
+    if !report.supported {
+        return Err(anyhow!(
+            "Repository metadata uses an unsupported or malformed format version"
+        ));
+    }
+    Ok(())
+}
+
+fn cmd_export_age(
+    file: &Path,
+    recipient: &str,
+    output: &Path,
+    ring_opt: Option<&str>,
+    identity_opt: Option<&str>,
+    yes: bool,
+) -> Result<()> {
+    let ring_opt = validate_ring_arg(ring_opt)?;
+    let repo = GitRepo::discover()?;
+    format::export_secret_to_age_file(&repo, file, recipient, output, ring_opt, identity_opt, yes)?;
+    eprintln!(
+        "Exported '{}' encrypted for recipient to standalone age file '{}'.",
+        file.display(),
+        output.display()
+    );
+    Ok(())
+}
+
 fn cmd_shield(check: bool) -> Result<()> {
     let repo = GitRepo::discover()?;
+    let _recovery_guard = repo.acquire_recovery_lock()?;
     let patterns = repo.get_tracked_patterns()?;
     if check {
         let synced = shield::check_ai_shields(&repo.root, &patterns)?;
@@ -1437,17 +1553,41 @@ fn cmd_shield(check: bool) -> Result<()> {
 
 fn cmd_install_hooks() -> Result<()> {
     let repo = GitRepo::discover()?;
+    let _recovery_guard = repo.acquire_recovery_lock()?;
     repo.install_pre_commit_hook()?;
     eprintln!("Safeguard hooks (pre-commit, pre-merge-commit, pre-push) successfully installed.");
     Ok(())
 }
 
-fn cmd_check(pre_push: bool, allow_untracked_secrets: bool) -> Result<()> {
+fn cmd_check(
+    pre_push: bool,
+    pre_receive: bool,
+    commit_range: Option<&str>,
+    report_only: bool,
+    allow_untracked_secrets: bool,
+) -> Result<()> {
     let repo = GitRepo::discover()?;
-    if pre_push {
-        repo.check_pushed_commits()?;
+    if pre_receive {
+        repo.check_pre_receive(report_only, allow_untracked_secrets)?;
+    } else if let Some(range) = commit_range {
+        repo.check_commit_range(range, report_only, allow_untracked_secrets)?;
+    } else if pre_push {
+        match repo.check_pushed_commits() {
+            Ok(()) => {}
+            Err(e) if report_only => {
+                eprintln!("git-agecrypt check [REPORT-ONLY]: {e}");
+            }
+            Err(e) => return Err(e),
+        }
     } else {
-        repo.check_staged_files(allow_untracked_secrets)?;
+        format::ensure_supported_repository_format(&repo, None)?;
+        match repo.check_staged_files(allow_untracked_secrets) {
+            Ok(()) => {}
+            Err(e) if report_only => {
+                eprintln!("git-agecrypt check [REPORT-ONLY]: {e}");
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }
@@ -1457,6 +1597,7 @@ fn cmd_clean(file_path: Option<&str>, ring_opt: Option<&str>) -> Result<()> {
     // Git clean filter: reads stdin, writes stdout.
     // ALL LOGGING MUST BE ON STDERR.
     let repo = GitRepo::discover().context("git-agecrypt clean: failed to discover git repo")?;
+    format::ensure_supported_repository_format(&repo, ring_opt)?;
 
     // If file_path is provided, verify whether it is a symlink on disk.
     // Git pipes symlink target text through clean filter; symlink targets MUST NOT be encrypted!
@@ -1528,6 +1669,7 @@ fn cmd_smudge(file_path: Option<&str>, ring_opt: Option<&str>) -> Result<()> {
     // Git smudge filter: reads stdin, writes stdout.
     // ALL LOGGING MUST BE ON STDERR.
     let repo = GitRepo::discover().context("git-agecrypt smudge: failed to discover git repo")?;
+    format::ensure_supported_repository_format(&repo, ring_opt)?;
 
     let is_stale = repo
         .is_local_master_key_stale_for_ring(ring_opt)
@@ -1586,6 +1728,7 @@ fn cmd_smudge(file_path: Option<&str>, ring_opt: Option<&str>) -> Result<()> {
 fn cmd_textconv(file: &Path, ring_opt: Option<&str>) -> Result<()> {
     let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
+    format::ensure_supported_repository_format(&repo, ring_opt)?;
     let key_opt = if repo
         .is_local_master_key_stale_for_ring(ring_opt)
         .unwrap_or(false)
@@ -1661,6 +1804,7 @@ fn cmd_merge(
 ) -> Result<()> {
     let ring_opt = validate_ring_arg(ring_opt)?;
     let repo = GitRepo::discover()?;
+    format::ensure_supported_repository_format(&repo, ring_opt)?;
     let key_str = if repo
         .is_local_master_key_stale_for_ring(ring_opt)
         .unwrap_or(false)
@@ -1706,6 +1850,8 @@ fn cmd_merge(
 
 fn cmd_migrate(identity: Option<&str>) -> Result<()> {
     let repo = GitRepo::discover()?;
+    let _recovery_guard = repo.acquire_recovery_lock()?;
+    format::ensure_supported_repository_format(&repo, None)?;
     eprintln!("Checking repository for git-crypt migration...");
 
     let gitattributes_path = repo.root.join(".gitattributes");
@@ -1731,11 +1877,11 @@ fn cmd_migrate(identity: Option<&str>) -> Result<()> {
     fs::write(&gitattributes_path, updated_attr)?;
     eprintln!("Updated .gitattributes: migrated filter=git-crypt -> filter=agecrypt");
 
-    // Run init
-    cmd_init(false, false, None)?;
+    // Run init and optional recipient enrollment while holding the same _recovery_guard
+    cmd_init_locked(&repo, false, false, None)?;
 
     if let Some(id) = identity {
-        cmd_add_recipient(Some(id), None, Some("migration-recipient"), None)?;
+        cmd_add_recipient_locked(&repo, Some(id), None, Some("migration-recipient"), None)?;
     }
 
     // Renormalize git index so clean filter is invoked on existing files

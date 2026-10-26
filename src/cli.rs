@@ -106,6 +106,44 @@ pub enum Commands {
     /// Display git-agecrypt status, lock state, recipients, and tracked files
     Status,
 
+    /// Inspect repository metadata, format version, recipient envelopes, and recovery state
+    Inspect {
+        /// Output format: 'text' or 'json'
+        #[arg(long, default_value = "text")]
+        format: String,
+
+        /// Optional scoped recipient ring to inspect
+        #[arg(long)]
+        ring: Option<String>,
+    },
+
+    /// Export a tracked secret to a standalone standard age-encrypted file for recovery or interoperability
+    ExportAge {
+        /// Path to the secret file to export
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+
+        /// Target age or SSH public key recipient (e.g. 'age1...' or 'ssh-ed25519 ...')
+        #[arg(short, long)]
+        recipient: String,
+
+        /// Output path for the exported standalone .age file (never writes plaintext to stdout)
+        #[arg(short, long, value_name = "OUTPUT_FILE")]
+        output: PathBuf,
+
+        /// Optional scoped recipient ring
+        #[arg(long)]
+        ring: Option<String>,
+
+        /// Optional decryption private key file if the repository is locked
+        #[arg(short, long, value_name = "KEY_FILE")]
+        identity: Option<String>,
+
+        /// Overwrite the output file if it already exists
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+    },
+
     /// Synchronize AI agent and IDE ignore files (.cursorignore, .claudeignore, .aiderignore, .aiignore) with .gitattributes
     Shield {
         /// Check whether AI shield ignore files are synchronized without modifying disk
@@ -116,11 +154,23 @@ pub enum Commands {
     /// Install automated pre-commit safeguard hook into .git/hooks/pre-commit
     InstallHooks,
 
-    /// Inspect staged files or outgoing commits to prevent plaintext secret leaks
+    /// Inspect staged files, outgoing commits, or server pre-receive refs to prevent plaintext secret leaks
     Check {
         /// Inspect outgoing commits passed via stdin by git pre-push hook
         #[arg(long)]
         pre_push: bool,
+
+        /// Inspect incoming ref updates (<old_oid> <new_oid> <refname>) passed via stdin by git pre-receive hook
+        #[arg(long)]
+        pre_receive: bool,
+
+        /// Inspect a specific commit or commit range (e.g. 'HEAD', 'origin/main..HEAD') in CI
+        #[arg(long, value_name = "REV_RANGE")]
+        commit_range: Option<String>,
+
+        /// Report policy violations to stderr without failing (non-blocking audit mode for gradual rollout)
+        #[arg(long)]
+        report_only: bool,
 
         /// Allow untracked files matching secret heuristics to be committed as plaintext
         #[arg(long)]

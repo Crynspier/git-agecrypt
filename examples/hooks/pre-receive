@@ -1,36 +1,132 @@
-﻿#!/usr/bin/env bash
-# Server-side pre-receive hook for git-agecrypt:
-# Rejects any git push containing unencrypted secret files matching filter=agecrypt.
+#!/usr/bin/env sh
+# ==============================================================================
+# git-agecrypt Server-Side Pre-Receive Hook (Reference Implementation)
+# ==============================================================================
+# Place this script in your bare repository on the Git server at:
+#   hooks/pre-receive
+# and make it executable:
+#   chmod +x hooks/pre-receive
 #
-# Installation:
-# Place this script in your server repository's hooks/ directory as `pre-receive`
-# and ensure it has executable permissions (`chmod +x pre-receive`).
-set -euo pipefail
+# Configuration environment variables:
+#   GIT_AGECRYPT_REPORT_ONLY=1          Log policy violations without rejecting
+#                                       the push (for gradual rollout).
+#   GIT_AGECRYPT_ALLOW_UNTRACKED=1      Skip heuristic scanning on paths not
+#                                       listed in .gitattributes.
+#
+# Behavior:
+# 1. If the `git-agecrypt` binary is available on the server, delegates directly
+#    to `git-agecrypt check --pre-receive`, which validates:
+#    - No plaintext secrets on paths governed by `filter=agecrypt*` in .gitattributes
+#    - Valid `age-encryption.org/v1` headers and recipient stanzas on encrypted blobs
+#    - Valid `.git-agecrypt/format`, `repo.pub`, and `keys/*.age` envelopes per ring
+#    - Branch creation, branch deletion, force-pushes, merges, and multi-ref pushes
+#    - Bare repository object inspection without requiring a working tree
+# 2. If `git-agecrypt` is not installed on the server, falls back to POSIX sh + git
+#    inspection of incoming commits and trees.
+# ==============================================================================
 
-while read -r oldrev newrev refname; do
-    if [ "$newrev" = "0000000000000000000000000000000000000000" ]; then
-        continue # Branch deletion
+set -e
+
+INPUT="$(cat)"
+if [ -z "$INPUT" ]; then
+    exit 0
+fi
+
+EXTRA_FLAGS=""
+if [ "${GIT_AGECRYPT_REPORT_ONLY:-0}" = "1" ]; then
+    EXTRA_FLAGS="$EXTRA_FLAGS --report-only"
+fi
+if [ "${GIT_AGECRYPT_ALLOW_UNTRACKED:-0}" = "1" ]; then
+    EXTRA_FLAGS="$EXTRA_FLAGS --allow-untracked-secrets"
+fi
+
+if command -v git-agecrypt >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    printf '%s\n' "$INPUT" | git-agecrypt check --pre-receive $EXTRA_FLAGS
+    exit $?
+fi
+
+ZERO_OID="0000000000000000000000000000000000000000"
+AGE_MAGIC="age-encryption.org/v1"
+VIOLATIONS=0
+
+printf '%s\n' "$INPUT" | while read -r old_oid new_oid refname; do
+    [ -z "$new_oid" ] && continue
+
+    # Skip branch or tag deletion
+    case "$new_oid" in
+        "$ZERO_OID"*|0000000000000000000000000000000000000000*)
+            continue
+            ;;
+    esac
+
+    # Peel annotated tags to commits; skip non-commit objects
+    if ! target_commit="$(git rev-parse --verify "${new_oid}^{commit}" 2>/dev/null)"; then
+        continue
     fi
 
-    if [ "$oldrev" = "0000000000000000000000000000000000000000" ]; then
-        revs="$newrev"
+    if [ "$old_oid" = "$ZERO_OID" ]; then
+        COMMITS="$(git rev-list "$target_commit" --not --all 2>/dev/null || git rev-list "$target_commit")"
     else
-        revs="$oldrev..$newrev"
+        COMMITS="$(git rev-list "${old_oid}..${target_commit}" 2>/dev/null || printf '%s\n' "$target_commit")"
     fi
 
-    for commit in $(git rev-list "$revs"); do
-        for path in $(git diff-tree -r --name-only --no-commit-id "$commit"); do
-            if git check-attr filter -- "$path" | grep -q 'filter: agecrypt'; then
-                header=$(git cat-file -p "$commit:$path" | head -n 1 || true)
-                if [[ ! "$header" =~ ^age-encryption\.org/v1 ]]; then
-                    echo "===============================================================" >&2
-                    echo "PUSH REJECTED BY SERVER PRE-RECEIVE HOOK" >&2
-                    echo "Commit $commit contains UNENCRYPTED secret file: $path" >&2
-                    echo "Please configure git-agecrypt locally and re-commit." >&2
-                    echo "===============================================================" >&2
-                    exit 1
+    for commit in $COMMITS $target_commit; do
+        if ! git cat-file -e "${commit}:.gitattributes" 2>/dev/null; then
+            continue
+        fi
+
+        PATTERNS="$(git cat-file blob "${commit}:.gitattributes" | grep 'filter=agecrypt' | awk '{print $1}' || true)"
+        [ -z "$PATTERNS" ] && continue
+
+        # Verify repo.pub exists when default ring is used
+        if git cat-file blob "${commit}:.gitattributes" | grep -q 'filter=agecrypt\b'; then
+            if ! git cat-file -e "${commit}:.git-agecrypt/repo.pub" 2>/dev/null; then
+                echo "================================================================================" >&2
+                echo "  CRITICAL SECURITY ALERT: MISSING .git-agecrypt/repo.pub IN PUSHED COMMIT!" >&2
+                echo "================================================================================" >&2
+                echo "  Ref:    $refname" >&2
+                echo "  Commit: $commit" >&2
+                echo "================================================================================" >&2
+                VIOLATIONS=$((VIOLATIONS + 1))
+            fi
+        fi
+
+        FILES="$(git diff-tree --root --no-commit-id --name-only -r --diff-filter=ACMR "$commit" 2>/dev/null || true)"
+        for file in $FILES; do
+            MATCHED=0
+            for pat in $PATTERNS; do
+                clean_prefix="${pat%/**}"
+                # shellcheck disable=SC2254
+                case "$file" in
+                    $pat|"$clean_prefix"/*)
+                        MATCHED=1
+                        break
+                        ;;
+                esac
+            done
+
+            if [ "$MATCHED" -eq 1 ]; then
+                HEADER="$(git cat-file blob "${commit}:${file}" 2>/dev/null | head -c 21 || true)"
+                if [ "$HEADER" != "$AGE_MAGIC" ]; then
+                    echo "================================================================================" >&2
+                    echo "  CRITICAL SECURITY ALERT: UNENCRYPTED SECRET REJECTED BY SERVER HOOK!" >&2
+                    echo "================================================================================" >&2
+                    echo "  Ref:    $refname" >&2
+                    echo "  Commit: $commit" >&2
+                    echo "  File:   $file" >&2
+                    echo "================================================================================" >&2
+                    VIOLATIONS=$((VIOLATIONS + 1))
                 fi
             fi
         done
     done
+
+    if [ "$VIOLATIONS" -gt 0 ]; then
+        if [ "${GIT_AGECRYPT_REPORT_ONLY:-0}" = "1" ]; then
+            echo "git-agecrypt pre-receive [REPORT-ONLY]: $VIOLATIONS violation(s) logged." >&2
+            exit 0
+        fi
+        exit 1
+    fi
 done

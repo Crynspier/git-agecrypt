@@ -1,271 +1,104 @@
-# Internal Architecture & Implementation Details
+# `git-agecrypt` Internals & Cryptographic Architecture
 
-This document covers the internal design, runtime lifecycle, streaming buffers, and merge algorithms implemented in `git-agecrypt`.
+This document provides a technical deep-dive into the internal architecture, cryptographic design, shared-state locking invariants, convergence caching, and crash-consistency mechanisms of `git-agecrypt`.
+
+For the normative on-disk and in-Git wire format specification, see [`docs/format-spec.md`](format-spec.md). For the external security review package and complete `unsafe`/syscall inventory, see [`docs/security-review-package.md`](security-review-package.md).
 
 ---
 
-## 1. Git Filter Driver Lifecycle
+## 1. Envelope Encryption Architecture
 
-Git integrates with `git-agecrypt` using custom filter and diff drivers configured in `.git/config` and applied via `.gitattributes`.
+`git-agecrypt` implements a **two-tier envelope encryption architecture** to avoid O(N) ciphertext bloat and enable instant recipient onboarding without re-encrypting historical Git blobs:
 
 ```text
-+--------------------------------------------------------------------------------+
-|                                Git Worktree                                    |
-|                                                                                |
-|  [ Working Tree (Plaintext) ]                                                  |
-|        |                  ^                                                    |
-|     git add          git checkout / git switch                                 |
-|        |                  |                                                    |
-|        v                  |                                                    |
-|  +-------------+   +---------------+                                           |
-|  | clean       |   | smudge        |                                           |
-|  | driver      |   | driver        |                                           |
-|  +-------------+   +---------------+                                           |
-|        |                  ^                                                    |
-|        v                  |                                                    |
-|  [ Git Index (Ciphertext) ]                                                    |
-|        |                                                                       |
-|     git commit                                                                 |
-|        |                                                                       |
-|        v                                                                       |
-|  [ Git Object DB (.git/objects) (Authenticated age ciphertext) ]               |
-|        |                                                                       |
-|        +------> git diff / git log -p ------> [ textconv driver ]              |
-|        |                                                                       |
-|        +------> git merge (concurrent edit) -> [ 3-way merge driver ]          |
-+--------------------------------------------------------------------------------+
++-------------------------------------------------------------------+
+| 1. Collaborator Private Key (SSH Ed25519 / RSA or age X25519)      |
++-------------------------------------------------------------------+
+                                  |
+                                  | Decrypts (.git-agecrypt/keys/<user>.age)
+                                  v
++-------------------------------------------------------------------+
+| 2. Repository Master Key (256-bit age X25519 Identity)            |
+|    - Public Key:  .git-agecrypt/repo.pub (Committed)              |
+|    - Secret Key:  .git/git-agecrypt/repo.key (Untracked, 0600)    |
++-------------------------------------------------------------------+
+                                  |
+                                  | Encrypts / Decrypts (clean / smudge / merge)
+                                  v
++-------------------------------------------------------------------+
+| 3. Tracked Secret Files (e.g., secrets/prod.env)                  |
+|    - Working Tree: Plaintext (when unlocked)                      |
+|    - Git Index/DB: age-encryption.org/v1 Binary Ciphertext        |
++-------------------------------------------------------------------+
 ```
 
-### 1.1 The `clean` Filter
-
-The `clean` filter converts cleartext from standard input into authenticated `age` ciphertext on standard output when files are staged (`git add`).
-
-**Execution Pipeline:**
-1. **Repository & Key Verification:** Reads the unlocked repository key from `.git/git-agecrypt/repo.key`. If the key is missing or locked, `clean` aborts with an error to prevent committing unencrypted data.
-2. **Two-Tier Ingest:** The incoming stream from `stdin` is read into memory up to 1 MiB. If the stream exceeds 1 MiB, the stream spool uses the host temporary-file facility.
-3. **Stage-0 Index Deduplication:** If the target path is provided, `git-agecrypt` inspects the existing blob at `:0:<path>` in the Git index. If the existing index blob decrypts to identical plaintext, the existing ciphertext is reused directly, producing bitwise-identical commits without re-encryption overhead.
-4. **Keyed HMAC Cache Check:** Computes an HMAC-SHA256 digest of the plaintext using the master key. If a matching ciphertext exists in `.git/git-agecrypt/cache/<hmac>`, the cached header is validated (`is_age_ciphertext`). If valid, the cached ciphertext is emitted.
-5. **Streaming Encryption:** On a cache miss, the plaintext is encrypted into an `age-encryption.org/v1` container using ChaCha20-Poly1305 in 64 KiB chunks. The result is written to `stdout`, and atomically cached with `sync_all()`.
-
-### 1.2 The `smudge` Filter
-
-The `smudge` filter converts ciphertext from standard input into cleartext on standard output during checkout or switch operations (`git checkout`, `git switch`, `git reset`).
-
-**Execution Pipeline:**
-1. **Pass-Through on Locked Repositories:** If the repository is locked or no enrolled key is present, `smudge` is designed to stream standard input directly to standard output with exit code `0`. This allows the encrypted payload to remain checked out, subject to other Git and filesystem errors.
-2. **Decryption:** If unlocked, the `age` container is decrypted using the master key. Small files are decrypted in RAM; files larger than 1 MiB are streamed through disk spools in 64 KiB chunks.
-
-### 1.3 The `textconv` Driver
-
-Configured for `git diff` and `git log -p`:
-- Git passes the target ciphertext file path as an argument.
-- `git-agecrypt textconv <path>` decrypts the file and writes cleartext to `stdout`.
-- Diffs appear naturally in terminals and GUIs as standard plaintext diffs while the underlying repository objects remain encrypted.
+### Why Envelope Encryption?
+1. **Constant-Size Blobs:** Encrypting a file directly to 50 team members in `age` adds 50 recipient stanzas to every encrypted file header. Envelope encryption encrypts each secret file to **one** recipient (`.git-agecrypt/repo.pub`), keeping headers compact regardless of team size.
+2. **Zero-Churn Onboarding:** Adding a new collaborator (`git-agecrypt add-recipient`) only creates a ~300-byte `.git-agecrypt/keys/<name>.age` file wrapping the master key. No tracked secret files need to be re-encrypted or modified.
+3. **Scoped Rings (`--ring <NAME>`):** Each ring maintains its own isolated `repo.pub`, `keys/*.age`, and local `repo.key`, providing cryptographic domain separation across environments (`dev`, `staging`, `prod`).
 
 ---
 
-## 2. Two-Tier Spooling & Memory Management
+## 2. Shared-State Mutation Path Inventory & Locking Contract
 
-`git-agecrypt` uses separate in-memory and temporary-file paths for small and large inputs. Exact resource usage depends on the age and I/O layers:
+Every command or internal helper that mutates repository-wide local state (`.git/git-agecrypt/`), committed key metadata (`.git-agecrypt/`), working-tree secret files, or `.git/config` is coordinated by the OS-level exclusive lock `recovery.lock` (`GitRepo::acquire_recovery_lock`).
 
-| Tier | Payload Size | Storage Medium | Zeroization | Memory Footprint |
-|---|---|---|---|---|
-| **Tier 1 (RAM)** | $< 1\text{ MiB}$ | Heap buffer (`Zeroizing<Vec<u8>>`) | Automatic on `drop` | $O(N)$ up to 1 MiB |
-| **Tier 2 (Temporary Spool)** | $\ge 1\text{ MiB}$ | Host temporary-file facility | Removed on close when cleanup succeeds | Bounded, implementation-dependent memory |
+| Command / Operation | Shared State Read | Shared State Mutated | Lock Acquired | Hold Scope (Start -> End) | Failure / Rollback Behavior |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `startup recovery` (`recover_interrupted_transaction`) | `repo.key.locking`, `repo.key`, `lock.journal`, `refresh.lock` | `repo.key`, `repo.key.locking`, `lock.journal`, worktree secret files, orphaned `.tmp` files | `recovery.lock` (OS exclusive via `flock` / `LockFileEx`) | Acquired before inspecting `repo.key.locking` or `lock.journal`; held until journal replay and tmp sweep complete. | Retains `lock.journal` if replay fails or if journal is malformed/ambiguous. |
+| `init` (`cmd_init`) | `repo.pub`, `repo.key`, `.gitattributes` | `.git-agecrypt/repo.pub`, `.git-agecrypt/keys/initial_user.age`, `.git/git-agecrypt/repo.key`, `.git/config`, `.git/hooks/*`, AI shield files | `recovery.lock` | Acquired once at start of `cmd_init` (including atomic startup recovery) and held until hooks and AI shield files finish writing. | Atomic temp-file write + rename for `repo.key`; fails closed on unsupported format version. |
+| `add-recipient` (`cmd_add_recipient`) | `repo.key`, `repo.pub`, `.git-agecrypt/keys/*.age` | `.git-agecrypt/keys/<label>.age` | `recovery.lock` | Acquired before reading `repo.key` and held until all new `.age` recipient envelopes are written. | Disambiguates case-insensitive key collisions with a SHA-256 suffix; never clobbers existing keys. |
+| `remove-recipient` (`cmd_remove_recipient`) | `.git-agecrypt/keys/*.age` | Unlinks `.git-agecrypt/keys/<label>.age` | `recovery.lock` | Acquired before scanning `keys/` and held until recipient file removal completes. | Rejects path traversal/control characters; fails if recipient does not exist. |
+| `rekey` (`cmd_rekey`) | `repo.key`, `keys/*.age`, worktree dirty status | `keys/*.age`, `repo.pub`, `repo.key`, `cache/`, Git index (`git add --renormalize`) | `recovery.lock` | Acquired before dirty-tree validation and held continuously through key rotation, `repo.key` replacement, cache purge, and index renormalization. | Aborts before mutation if non-secret files are dirty (unless `--force`) or if zero valid recipients exist. |
+| `rewrap` (`cmd_rewrap`) | `repo.key`, `keys/*.age`, Git history commits, tracked secret files | Working-tree secret files (via atomic temp persist), Git index (`git add`) | `recovery.lock` | Acquired before reading `repo.key` and held across historical key discovery, file decryption, atomic persistence, and staging. | Preserves read-only permissions via `ReadonlyGuard`; aborts on unstaged plaintext edits unless `--force`. |
+| `unlock` (`cmd_unlock`) | `keys/*.age`, user private key, worktree dirty status | `repo.key`, tracked secret files across all linked worktrees (`git checkout-index`) | `recovery.lock` | Acquired before reading `keys/*.age` and held through `save_local_master_key_for_ring` and `refresh_all_worktrees_for_ring`. | Atomic `repo.key` replacement; skips dirty secret files unless `--force`. |
+| `lock` (`cmd_lock`) | `repo.key`, worktree dirty/reachability status, active Git op markers | `lock.journal`, `repo.key` -> `repo.key.locking`, worktree secret files, `cache/` | `recovery.lock` | Acquired before checking active Git ops / dirty files / unreachable worktrees and held until `repo.key.locking`, `lock.journal`, and `cache/` are removed. | Full WAL rollback (`repo.key.locking` -> `repo.key` + `replay_lock_journal_or_selective`) on any error or crash. |
+| `migrate-from-git-crypt` (`cmd_migrate`) | `.gitattributes`, `.git-crypt` | `.gitattributes`, `.git-agecrypt/`, `repo.key`, `.git/config`, Git index | `recovery.lock` | Single `RecoveryLockGuard` held across `.gitattributes` update, `cmd_init_locked`, `cmd_add_recipient_locked`, and `git add --renormalize`. | Fails closed if `.gitattributes` is missing or format is unsupported. |
+| `shield` / `install-hooks` | `.gitattributes`, `.git/hooks/*` | `.cursorignore`, `.claudeignore`, `.aiderignore`, `.aiignore` / `.git/hooks/*` | `recovery.lock` | Acquired at command start and held until ignore files or hook scripts are written. | Preserves existing user content outside managed blocks. |
+| `smudge` / `textconv` / `merge` auto-refresh (`try_auto_refresh_master_key_for_ring`) | `repo.pub`, `repo.key`, `keys/*.age`, default SSH/age keys | `refresh.lock`, `repo.key` | `refresh.lock` (advisory wait-and-adopt) + `recovery.lock` (around `save_local_master_key_for_ring`) | `refresh.lock` coordinates parallel filter workers; `recovery.lock` serializes the actual `repo.key` atomic write against concurrent CLI commands. | If `refresh.lock` times out (5s), degrades safely to existing key state without racing. |
 
-### 2.1 Tier 1: In-Memory Fast Path
-
-For inputs below the 1 MiB threshold on the in-memory path:
-- The implementation does not intentionally create a temporary spool file.
-- The primary spool buffer uses Rust's `zeroize` crate on deallocation; this does not guarantee that every intermediate or operating-system copy is wiped.
-
-### 2.2 Tier 2: Bounded Streaming for Large Files
-
-For datasets, database dumps, archives, or binary blobs $\ge 1\text{ MiB}$:
-- The stream spool is created through the host temporary-file facility; it is not currently forced into `.git/git-agecrypt/spool/`.
-- Encryption and decryption use the implementation's streaming buffers; exact memory usage depends on the age and I/O layers.
-- The design avoids loading the complete file into one application buffer, but this document does not promise a fixed peak-memory figure.
-
----
-
-## 3. Deterministic HMAC Caching & Index Deduplication
-
-### 3.1 Eliminating Phantom Diffs
-
-Because `age` uses randomized nonces, re-encrypting identical plaintext normally yields different ciphertexts. In Git, this would cause `git diff` to show modified binary files even when no content changed.
-
-`git-agecrypt` eliminates phantom diffs through a two-level deduplication strategy:
-
-```text
-[ Plaintext Ingest ]
-        |
-        v
-[ Stage 0 Index Check ] -------- Match found? --------> [ Emit Existing Blob ]
-        | No
-        v
-[ Keyed HMAC Cache Check ] ----- Valid Hit? ----------> [ Emit Cached Blob ]
-        | Miss / Invalid
-        v
-[ age Encryption Engine ] ----> [ Atomic Cache Write (sync_all) ] ----> [ Emit New Ciphertext ]
-```
-
-1. **Stage 0 Index Deduplication:** Prior to encryption, `git-agecrypt` checks `:0:<path>` in the Git index. If that blob decrypts to the current plaintext, the exact existing ciphertext is reused.
-2. **Keyed HMAC Cache:** If the index entry is unavailable or different, `git-agecrypt` computes `HMAC-SHA256(master_key, plaintext)`. The digest addresses the cache file at `.git/git-agecrypt/cache/<fingerprint>/<digest>`.
-3. **Cryptographic Cache Authentication:** When a cache hit candidate is discovered, `git-agecrypt` does NOT simply trust the file structure. It decrypts the cached ciphertext in RAM using the active master identity and verifies that `HMAC-SHA256(master_key, decrypted_bytes) == digest`. If the HMAC matches and decryption succeeds, the ciphertext is safely emitted.
-4. **Automatic Eviction & Fail-Closed Fallback:** If the candidate cache file has been tampered with, originates from a foreign key epoch, or contains bit flips, `git-agecrypt` automatically removes the corrupted entry (`fs::remove_file`) and falls back to a clean encryption of the genuine working tree file.
-5. **Key Epoch Cache Purging:** During `git-agecrypt rekey`, all cached ciphertexts across `.git/git-agecrypt/cache/` are immediately purged to prevent ciphertext reuse across different master key generations.
+### `recovery.lock` Hardening Invariants
+1. **OS-Managed Exclusive File Lock:** Uses `fs2::FileExt::try_lock_exclusive` (`flock(LOCK_EX | LOCK_NB)` on Unix, `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY)` on Windows) in a bounded retry loop (`DEFAULT_RECOVERY_LOCK_TIMEOUT_MS = 30_000`, configurable via `GIT_AGECRYPT_LOCK_TIMEOUT_MS`).
+2. **Zero Heuristic Stale Lock Breaking:** `recovery.lock` is never deleted or broken based on PID or mtime heuristics. When a holding process terminates or crashes (`SIGKILL` / `TerminateProcess`), the operating system kernel releases the file handle lock automatically.
+3. **Coordination-Path Replacement Protection:**
+   - On Windows, `recovery.lock` is opened with `FILE_SHARE_READ | FILE_SHARE_WRITE` (omitting `FILE_SHARE_DELETE`), preventing any process from unlinking or renaming `recovery.lock` while a handle is open.
+   - On Unix, `recovery.lock` is opened via `openat(..., O_NOFOLLOW | O_CLOEXEC)` and, after `try_lock_exclusive()` succeeds, its file descriptor `(st_dev, st_ino)` is verified against `symlink_metadata(lock_path)`. If the path was unlinked or replaced while waiting, the stale descriptor is unlocked and acquisition retries on the live path.
 
 ---
 
-## 4. 3-Way Semantic Merge Driver
+## 3. Convergence & Idempotency (Defeating the "Phantom Modified" Bug)
 
-When two developers modify an encrypted file concurrently on different branches, Git invokes the custom merge driver configured in `.gitattributes`:
+`age` encryption is randomized: encrypting the same plaintext twice produces two completely different ciphertexts due to ephemeral X25519 keys and random nonces. In a naive Git `clean` filter, running `git status` or `git add` causes Git to re-invoke `clean`, see a new ciphertext SHA-1, and mark unmodified files as perpetually `modified`.
 
-$$\text{merge driver invocation: } \texttt{git-agecrypt merge <\%O> <\%A> <\%B> [\%L] [\%P]}$$
+`git-agecrypt` achieves **100% deterministic convergence** via a two-tier lookup in `crypto::clean_stream`:
 
-- `%O`: Ancestor / Base version (encrypted)
-- `%A`: Current branch / "Ours" (encrypted)
-- `%B`: Other branch / "Theirs" (encrypted)
-- `%L`: Conflict marker length (default: 7)
-- `%P`: Target file path
+### Tier 1: Index-First Inspection (Primary — Works on Fresh Clones)
+1. When `git-agecrypt clean "%f"` runs, it fetches the currently staged blob from the Git index (`git cat-file blob :0:<path>`, capped at 512 MiB).
+2. It attempts to decrypt the staged blob in-memory using the local master key (`repo.key`).
+3. If the decrypted staged blob matches the incoming `stdin` plaintext byte-for-byte (verified via SHA-256 and length), `clean` outputs the **exact existing staged ciphertext bytes** from the index.
 
-### 4.1 Execution Sequence
-
-1. **Decryption:** `%O`, `%A`, and `%B` are decrypted into temporary cleartext files managed by the host temporary-file facility.
-2. **Binary Detection:** If any decrypted version contains null bytes (`0x00`), the file is treated as binary. Clean 3-way line merging is aborted; a conflict is declared immediately to protect binary data from corruption.
-3. **Git 3-Way Merge:** Executes `git merge-file -L <our> -L <base> -L <their> <tmp_A> <tmp_O> <tmp_B>`.
-4. **Semantic Key Analysis:** If merging `.env` or key-value configuration files, `git-agecrypt` scans the merged output for conflicting assignments or duplicate keys and emits diagnostic warnings.
-5. **False-Merge Prevention:**
-   - If `git merge-file` exited with code `> 0` or conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) exist in the output:
-     - The output is sanitized to prevent double carriage-return (`\r\r\n`) issues on Windows.
-     - The conflicting cleartext with visible conflict markers is re-encrypted back into `%A`.
-     - `sync_all()` is executed to ensure durability.
-     - The merge driver exits with non-zero status (`exit(1)`), ensuring Git pauses the merge and developers see the exact conflict in their editor.
-6. **Clean Merge:** If there are no conflicts, the clean merged text is re-encrypted into `%A`, `sync_all()` is called, and the merge driver exits with code `0`.
+### Tier 2: HMAC-Keyed Local Ciphertext Cache (Secondary)
+1. Plaintext is hashed using `HMAC-SHA256(key = repo.key, message = plaintext)`.
+2. The cache directory `.git/git-agecrypt/cache/<sha256(repo.pub)[0..16]>/` is queried for `<hmac_hex>.age`.
+3. **Cryptographic Poisoning Verification:** On a cache hit, `clean` decrypts the cached `.age` file with the active master key and verifies that the resulting plaintext matches the incoming `stdin` SHA-256 hash and length before emitting it.
+4. **LRU Bounds:** When the cache directory exceeds 256 files, the oldest 64 entries by modification time are evicted.
 
 ---
 
-## 5. Safeguard Hook Architecture
+## 4. Bounded Streaming & O(1) Memory Spool (`SpoolBuffer`)
 
-`git-agecrypt install-hooks` installs non-destructive Git hooks that inspect staged files prior to commit and push:
-
-### 5.1 Pre-Commit & Pre-Merge-Commit
-
-1. **Staged Blob Inspection:** Inspects every staged file in the index matching encrypted attributes. Confirms each staged blob starts with the valid `age-encryption.org/v1` header.
-2. **Corrupted Ciphertext Guard:** Detects partial `git add -p` staging artifacts or corrupted ciphertext containers and halts the commit.
-3. **Untracked Secret Heuristic Scanner:** Inspects staged files that are *not* configured with `filter=agecrypt`. If any staged file matches high-entropy secret patterns, `.env` conventions, or private key headers (`BEGIN ... PRIVATE KEY`), the commit is blocked to prevent accidental plaintext exposure.
-
-### 5.2 Pre-Push
-
-1. **Outgoing Commit Validation:** Scans the revision range `origin/branch..HEAD` to verify that every commit about to leave the local repository has all sensitive files properly encrypted.
-2. **Key Epoch Verification:** Verifies that all outgoing encrypted files are decryptable with the currently active master key, preventing developers from pushing commits encrypted under outdated or revoked keys.
+To support both tiny `.env` files and multi-gigabyte database dumps without exhausting RAM:
+- Payloads `<= 8 MiB` (`IN_MEMORY_SPOOL_LIMIT`) are buffered in a `Zeroizing<Vec<u8>>` in RAM and scrubbed on drop.
+- Payloads `> 8 MiB` automatically spill over to an anonymous, automatically unlinked `tempfile::tempfile()` on disk.
 
 ---
 
-## 6. Scoped Recipient Rings Architecture
+## 5. Crash-Consistent Lock Transactions (Write-Ahead Log)
 
-`git-agecrypt` supports partitioned recipient access domains known as **Scoped Recipient Rings**.
+Locking a repository (`git-agecrypt lock`) must remove `repo.key` and replace plaintext secrets across all linked worktrees with ciphertext. If interrupted mid-operation by `SIGKILL` or power loss, a naive implementation leaves `repo.key` deleted while some worktree files are 0-byte truncated or half-smudged.
 
-### 6.1 Directory & State Hierarchy
-
-```text
-Repository Root
-├── .gitattributes
-├── .git-agecrypt/
-│   ├── keys/                         # Default ring recipient envelopes
-│   │   ├── alice.age
-│   │   └── bob.age
-│   ├── repo.pub                      # Default ring public identity
-│   └── rings/
-│       ├── prod/                     # Scoped ring "prod"
-│       │   ├── keys/
-│       │   │   └── ops_lead.age
-│       │   └── repo.pub
-│       └── dev/                      # Scoped ring "dev"
-│           ├── keys/
-│           │   └── team.age
-│           └── repo.pub
-└── .git/
-    └── git-agecrypt/
-        ├── repo.key                  # Ephemeral unlocked default master key
-        ├── cache/                    # HMAC ciphertext cache
-        ├── spool/                    # Auxiliary local state and cleanup area
-        └── rings/
-            ├── prod/
-            │   └── repo.key          # Ephemeral unlocked prod master key
-            └── dev/
-                └── repo.key          # Ephemeral unlocked dev master key
-```
-
-### 6.2 Driver Binding & Filter Routing
-
-Scoped rings bind Git filters through `.gitattributes`:
-- `*.secret.env filter=agecrypt diff=agecrypt merge=agecrypt -text` routes to the default ring.
-- `secrets/prod/** filter=agecrypt-prod diff=agecrypt-prod merge=agecrypt-prod -text` routes to ring `prod`.
-
-When `git-agecrypt clean %f --ring prod` or `git-agecrypt smudge %f --ring prod` executes:
-1. It queries `.git/git-agecrypt/rings/prod/repo.key`.
-2. If unlocked, it decrypts/encrypts using the `prod` master key.
-3. If locked, `smudge` safely passes ciphertext through without breaking Git checkout or branch switching.
-4. During pre-commit and pre-push validation, `git-agecrypt check` dynamically inspects each staged file's assigned filter attribute and validates ciphertext against that specific ring's key epoch.
-
-### 6.3 Ring Identifier Validation Grammar
-
-To prevent directory traversal attacks, arbitrary file overwrites, and platform-specific device name collisions, all ring identifiers supplied via `--ring <name>` or parsed from `.gitattributes` (`filter=agecrypt-<name>`) must strictly satisfy the following validation rules:
-
-1. **Length:** Between 1 and 64 characters.
-2. **Grammar Whitelist:** Must begin with an alphanumeric character (`[a-zA-Z0-9]`), followed optionally by alphanumeric characters, underscores (`_`), dots (`.`), or hyphens (`-`).
-3. **Disallowed Characters:** Forward slashes (`/`), backslashes (`\`), spaces, null bytes, and non-printable control characters are strictly rejected.
-4. **Parent Traversal Prevention:** Sequences such as `..`, `.`, or paths containing path separators are immediately rejected before performing any filesystem operations.
-5. **Reserved Device Protection:** Rejects reserved Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1` through `COM9`, `LPT1` through `LPT9`) regardless of file extension or letter casing.
-
----
-
-## 7. Anonymous In-Memory Secret Passing (`memfd_create`)
-
-To avoid intentionally placing decrypted environment variables in `/proc/<pid>/environ` on Linux hosts:
-
-### 7.1 Linux Kernel In-Memory File Descriptors
-
-When `git-agecrypt run --fd -- <cmd>` is executed on Linux:
-1. **Syscall Invocation:** `git-agecrypt` invokes `libc::syscall(SYS_memfd_create, name, MFD_CLOEXEC)`. The `MFD_CLOEXEC` flag guarantees that the descriptor will not leak into unrelated forks or subprocesses spawned by the parent.
-2. **Anonymous RAM Allocation:** The Linux kernel allocates an anonymous, RAM-backed file descriptor that has no path on the physical filesystem.
-3. **Decryption & Spooling:** The encrypted `.env` file is decrypted in RAM and written into the file descriptor.
-4. **File Offset Rewind:** The file position is rewound to 0 (`lseek(fd, 0, SEEK_SET)`).
-5. **Child Process Descriptor Transfer:** In `Command::pre_exec` before executing the child command via `execve`, the `FD_CLOEXEC` flag is cleared (`fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC)`) exclusively for the target child process.
-6. **FD Exposure:** The descriptor number is injected into the child's environment as `GIT_AGECRYPT_ENV_FD=<fd>`. Child processes can read secrets via `/dev/fd/<fd>` or `open("/proc/self/fd/<fd>", O_RDONLY)`.
-7. **Descriptor Lifetime:** When the parent and child close the descriptor, the kernel releases the anonymous file. This avoids an application-created pathname, but does not establish that plaintext can never be paged, captured, or written by the operating system.
-8. **Fail-Closed on Non-Linux Hosts:** On operating systems lacking anonymous RAM descriptors (Windows, macOS), `run --fd` strictly fails closed by default. Users must explicitly supply `--allow-env-fallback` to permit falling back to standard in-memory environment variable injection.
-
----
-
-## 8. Crash Durability & Directory Synchronization
-
-To reduce filesystem metadata inconsistency after interruption or a crash:
-
-1. **Atomic Temporary Replacement:** Key, journal, and merge-target writes generally use uniquely named temporary files and replacement within the target filesystem. Stream spools and some fallback paths use the host temporary-file facility instead.
-2. **File Content Sync:** Critical replacement paths call `sync_all()` (`fsync`) before replacement. This asks the operating system to flush file data and metadata; it is not a universal proof of physical-media persistence.
-3. **Directory Entry Sync (`sync_dir`):** POSIX replacement paths also attempt to synchronize the containing directory. Windows behavior and filesystem guarantees differ by platform.
-4. **Error Handling:** Security-critical write, replacement, and recovery errors are propagated. Auxiliary cache cleanup and some cleanup synchronization are intentionally best effort.
-
----
-
-## 9. Generative State Machine & Combinatorial DAG Verification
-
-The repository includes generative randomized state-machine harnesses, including [`tests/test_generative_shadow_state_machine.rs`](../tests/test_generative_shadow_state_machine.rs), powered by seeded PRNGs (`rand_chacha::ChaCha8Rng`):
-
-1. **State Space Exploration:** The harness executes a default 100-step pseudorandom sequential run, with configurable depth, including `EditSecret`, `GitAdd`, `GitCommit`, `GitCreateBranch`, `GitSwitchBranch`, `GitStashPush`, `GitStashPop`, `GitRepack`, `AgecryptLock`, `AgecryptUnlock`, and `AgecryptRekey`.
-2. **Shadow State Model:** Tracks expected plaintext and encrypted status in memory and checks the invariants implemented by the harness at each transition.
-3. **Forensic Canary Validation:** Injects unique canary tokens into secrets and checks selected packfile/loose-object scenarios for plaintext canary presence; this does not cover every Git operation or misconfiguration.
-4. **Combinatorial DAG Testing:** Separate tests exercise multi-ring and multi-generation branch divergence, merges, and credential synchronization ([`tests/test_combinatorial_rings_generations.rs`](../tests/test_combinatorial_rings_generations.rs)).
-
----
-
-## 10. Filesystem Boundary Validation & Platform Hardening
-
-1. **Symlink & Reparse Point Protection:** To defend against arbitrary file overwrite or credential redirection attacks via symlink swapping (TOCTOU), `ensure_not_symlink_or_reparse` validates that `.git/git-agecrypt/repo.key`, `.git-agecrypt/keys/`, and state directories are genuine physical directories and files.
-2. **Case-Insensitive Collision Prevention:** On case-insensitive filesystems (Windows NTFS, macOS APFS), `check_ring_case_collision` prevents ring collisions (e.g. creating `PROD` when `prod` already exists).
-3. **Linux Kernel Memory Lockdown:** When passing secrets via `run --fd`, child processes execute `libc::prctl(PR_SET_DUMPABLE, 0)` in `pre_exec` to prevent unauthorized memory attachment via `ptrace` or core dump generation.
-
-
-
+`GitRepo::transactional_lock_for_ring` guarantees atomic recovery via a 4-phase protocol under `recovery.lock`:
+1. **Preflight Validation:** Verifies no active Git rebase/merge/cherry-pick/bisect is in progress, no tracked secret files have uncommitted changes, all linked worktrees are reachable, and no tracked secret file is held open exclusively by another process.
+2. **Write-Ahead Log (`lock.journal`):** Writes every target `<worktree>\t<rel_path>` to `.git/git-agecrypt/lock.journal`, calls `sync_all()`, and syncs the parent directory.
+3. **Key Staging (`repo.key.locking`):** Atomically renames `repo.key` -> `repo.key.locking` and syncs the state directory.
+4. **Worktree Refresh & Commit:** Checkouts all tracked secret files as ciphertext across all worktrees, then removes `repo.key.locking` and `lock.journal`. If any step fails or crashes, `acquire_recovery_lock()` on the next invocation restores `repo.key` and selectively re-smudges only the files recorded in `lock.journal`.

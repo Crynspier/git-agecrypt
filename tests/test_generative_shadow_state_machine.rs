@@ -31,7 +31,6 @@ use tempfile::tempdir;
 /// Operation types for the generative state machine.
 /// Every variant is fully self-contained (all parameters carried inline) so a recorded
 /// operation log can be replayed exactly, without the original RNG stream.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum Operation {
     EditSecret(usize, String),
@@ -165,7 +164,6 @@ fn op_short_name(op: &Operation) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct OperationStep {
     step: usize,
@@ -1034,6 +1032,17 @@ fn test_deep_generative_shadow_model_state_machine() {
     }
 
     final_verification(repo, &h);
+    let succeeded_count = operation_history
+        .iter()
+        .filter(|entry| {
+            entry.step < op_count
+                && entry.success
+                && entry.error.is_none()
+                && !entry.operation.to_string().is_empty()
+        })
+        .count();
+    assert_eq!(operation_history.len(), op_count);
+    assert!(succeeded_count > 0);
 
     println!(
         "Completed {} operations with seed 0x{:016X} (ops log: {})",
@@ -1239,8 +1248,7 @@ fn test_ddmin_shrinker_selftest() {
         return;
     }
 
-    #[allow(clippy::useless_vec)] // fixed shrink-oracle scenario; array-vs-vec churn not worth it
-    let ops = vec![
+    let ops = [
         Operation::EditSecret(0, "SHRINK_NOISE_A=1\n".to_string()),
         Operation::GitStashPush,
         Operation::EditSecret(1, "SHRINK_NOISE_B=2\n".to_string()),

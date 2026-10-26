@@ -1,0 +1,55 @@
+# ==============================================================================
+# git-agecrypt Hosted Git (GitHub Actions) Secret Verification Workflow
+# ==============================================================================
+# Copy this file into `.github/workflows/agecrypt-verify.yml` in any repository
+# protected by git-agecrypt where custom server-side `pre-receive` hooks are
+# unavailable (e.g. GitHub.com, GitLab SaaS).
+#
+# All third-party actions are pinned to full commit SHAs.
+# ==============================================================================
+
+name: Verify Encrypted Secrets (git-agecrypt)
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-agecrypt-policy:
+    name: Enforce git-agecrypt Ciphertext & Metadata Policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository with full history
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca00cbe6fb93a
+        with:
+          toolchain: stable
+
+      - name: Install git-agecrypt
+        run: cargo install --locked git-agecrypt
+
+      - name: Verify repository metadata format and health
+        run: git-agecrypt inspect --format json
+
+      - name: Verify commits in push or pull request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$BASE_SHA" ]; then
+            git-agecrypt check --commit-range "${BASE_SHA}..${HEAD_SHA}"
+          elif [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            git-agecrypt check --commit-range "${BEFORE_SHA}..${HEAD_SHA}"
+          else
+            git-agecrypt check --commit-range "${HEAD_SHA}"
+          fi

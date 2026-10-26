@@ -1,19 +1,31 @@
-﻿# Security Policy
+# Security Policy & Vulnerability Reporting
 
-## Supported Release Policy
+## Supported Versions
 
-Security support follows the versions identified as supported in the project's published release information. Development checkouts and unreleased versions are not supported release channels. Refer to the [GitHub Releases](https://github.com/Crynspier/git-agecrypt/releases) page for published versions and release-specific guidance.
+| Format Version | Supported | Notes |
+| :--- | :--- | :--- |
+| Format Version `1` (Latest release) | :white_check_mark: Yes | Recommended for all deployments. |
+| Earlier releases | :x: No | Upgrade to the latest release (100% format-compatible with existing Format Version `1` repositories). |
+
+For upgrade, rollback, and clean-room disaster recovery instructions, see [`docs/operations.md`](docs/operations.md).
+
+---
 
 ## Reporting a Vulnerability
 
-The `git-agecrypt` project takes the security of transparent secret management seriously. If you discover a vulnerability or potential security flaw, please do not file a public GitHub issue.
+**Please do NOT report security vulnerabilities through public GitHub issues, discussions, or pull requests.**
 
-If enabled for this repository, use **GitHub Private Vulnerability Reporting**: open the repository's **Security** tab at https://github.com/Crynspier/git-agecrypt/security and select **Report a vulnerability**. This is separate from public GitHub issues. Do not file a public issue or include secret material in a public discussion.
+Instead, please report suspected vulnerabilities privately via **[GitHub Private Vulnerability Reporting (Security Advisories)](https://github.com/Crynspier/git-agecrypt/security/advisories/new)**.
 
-Include the affected commit or release, impact, reproduction steps, and a minimal proof of concept. If the private reporting button is unavailable, contact the repository owner through the GitHub account at https://github.com/Crynspier rather than disclosing details publicly.
+### What to Include in a Report
+- The `git-agecrypt --version` and platform/OS (`Linux`, `macOS`, `Windows`).
+- A minimal reproduction script or repository fixture demonstrating the issue.
+- Which security boundary or invariant is affected (see [`docs/security-model.md`](docs/security-model.md) and [`docs/security-review-package.md`](docs/security-review-package.md)).
 
-### What to Expect
+---
 
-Reports submitted through GitHub Private Vulnerability Reporting will be reviewed by the maintainers. Response time, assessment, remediation, and disclosure timing depend on maintainer availability and the severity of the issue.
+## External Security Review & Audit Status
 
-Thank you for helping keep `git-agecrypt` and its users safe.
+`git-agecrypt` has not yet undergone a paid third-party cryptographic audit.
+- All symmetric and asymmetric cryptography is delegated directly to the upstream [`age`](https://crates.io/crates/age) crate (`X25519`, `ssh-ed25519`, `ssh-rsa`, `ChaCha20-Poly1305` STREAM) and RustCrypto (`sha2`, `hmac`).
+- A comprehensive **[External Security Review Readiness Package](docs/security-review-package.md)** documents the complete trust model, key hierarchy, data-flow diagrams, every `unsafe` block and OS syscall in the codebase, crash/durability invariants, and priority review questions.

@@ -116,7 +116,7 @@ Because `git-agecrypt` Format Version 1 uses 100% standard `age` v1 primitives, 
 
 1. **Unwrap the repository master key (`AGE-SECRET-KEY-1...`) from your recipient envelope** in `.git-agecrypt/keys/<your_name>.age` using your personal `age` or SSH private key:
    ```bash
-   age --decrypt --identity ~/.ssh/id_ed25519 .git-agecrypt/keys/alice.age > /tmp/recovered-repo.key
+   grep -v '^#' .git-agecrypt/keys/alice.age | age --decrypt --identity ~/.ssh/id_ed25519 > /tmp/recovered-repo.key
    chmod 600 /tmp/recovered-repo.key
    ```
 2. **Extract the encrypted blob from Git and decrypt it with `age`:**

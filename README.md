@@ -103,7 +103,7 @@ cargo install --path . --locked
 - **Evidence-Bounded Claims:** `git-agecrypt` has not yet undergone a paid third-party cryptographic audit. All cryptographic operations use the upstream [`age`](https://crates.io/crates/age) crate (`X25519`, `ChaCha20-Poly1305`) and RustCrypto [`sha2`](https://crates.io/crates/sha2) / [`hmac`](https://crates.io/crates/hmac). See [`docs/security-review-package.md`](docs/security-review-package.md) for the complete `unsafe`/syscall inventory and threat model.
 - **Git History Immutability:** Removing a collaborator (`remove-recipient` + `rekey`) prevents them from decrypting *future* commits, but cannot erase their access to historical commits they already cloned. Always rotate actual external credentials when offboarding.
 - **Server-Side Enforcement Recommended:** Client-side Git hooks can be skipped with `--no-verify`. Production repositories should enable the reference server-side `pre-receive` hook ([`examples/hooks/pre-receive`](examples/hooks/pre-receive)) or GitHub Action workflow ([`examples/github-actions/agecrypt-verify.yml`](examples/github-actions/agecrypt-verify.yml)).
-- **Clean-Room Recovery Without `git-agecrypt`:** Because Format Version 1 uses standard `age` v1 files, you can recover any secret using only `git` and the standard `age` CLI (`age -d -i <your_key> .git-agecrypt/keys/<you>.age > repo.key && git show HEAD:<secret> | age -d -i repo.key`).
+- **Clean-Room Recovery Without `git-agecrypt`:** Because Format Version 1 uses standard `age` v1 files, you can recover any secret using only `git` and the standard `age` CLI (`grep -v '^#' .git-agecrypt/keys/<you>.age | age -d -i <your_key> > repo.key && git show HEAD:<secret> | age -d -i repo.key`).
 
 ---
 

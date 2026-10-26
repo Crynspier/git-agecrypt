@@ -9,6 +9,14 @@ ignore = [
     # and is not exposed as a remote network decryption oracle. Revisit on every release and
     # remove this exception when age no longer brings the affected rsa path into the graph.
     "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2026-0387: Timing variability in crypto-bigint 0.5.5 (transitive dep via age 0.12.1 -> p256 0.13.2).
+    # Exception owner: project maintainer (Crynspier). Review date: 2027-01-17.
+    # Tracking: https://rustsec.org/advisories/RUSTSEC-2026-0387.html
+    # Upstream age 0.12.1 pins p256 0.13 / elliptic-curve 0.13 which depends on crypto-bigint 0.5.
+    # git-agecrypt uses X25519 / ssh-ed25519 / ChaCha20-Poly1305 locally and does not use P-256 or
+    # expose a network decryption oracle. Remove when upstream age upgrades p256 / crypto-bigint.
+    "RUSTSEC-2026-0387",
 ]
 
 [licenses]

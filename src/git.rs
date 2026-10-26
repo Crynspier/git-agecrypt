@@ -115,9 +115,9 @@ pub fn open_pinned_secret_file(
             .with_context(|| format!("Failed to open parent dir {}", parent_dir.display()))?;
         let dir_fd = dir_file.into_raw_fd();
         let c_name = std::ffi::CString::new(file_name)?;
-        let mut flags = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        let mut flags = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_CREAT;
         if create_excl {
-            flags |= libc::O_CREAT | libc::O_EXCL;
+            flags |= libc::O_EXCL;
         }
         let fd = unsafe { libc::openat(dir_fd, c_name.as_ptr(), flags, 0o600) };
         let err = std::io::Error::last_os_error();

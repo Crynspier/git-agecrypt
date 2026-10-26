@@ -44,7 +44,7 @@ fn test_run_fd_inheritance_boundaries() {
             "--",
             "sh",
             "-c",
-            "test -n \"$GIT_AGECRYPT_ENV_FD\" && test -z \"$GIT_AGECRYPT_ENV_FILE\" && cat /dev/fd/$GIT_AGECRYPT_ENV_FD",
+            "test -n \"$GIT_AGECRYPT_ENV_FD\" && test \"$GIT_AGECRYPT_ENV_FILE\" = \"/dev/fd/$GIT_AGECRYPT_ENV_FD\" && cat /dev/fd/$GIT_AGECRYPT_ENV_FD",
         ]);
         let out = cmd.output().unwrap();
         assert!(out.status.success(), "Direct child must read FD");

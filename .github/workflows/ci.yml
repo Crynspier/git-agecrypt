@@ -114,9 +114,12 @@ jobs:
         run: cargo build --workspace --locked --release --target ${{ matrix.target }}
       - name: Run platform smoke tests
         run: cargo test --workspace --locked --target ${{ matrix.target }} --lib --bins
-      - name: Run native macOS and Windows integration tests
-        if: startsWith(matrix.os, 'macos-') || startsWith(matrix.os, 'windows-')
+      - name: Run native macOS integration tests
+        if: startsWith(matrix.os, 'macos-')
         run: cargo test --workspace --locked --target ${{ matrix.target }} --tests
+      - name: Run native Windows integration tests
+        if: startsWith(matrix.os, 'windows-')
+        run: cargo test --workspace --locked --target ${{ matrix.target }} --test test_durability --test test_filesystem_security --test test_format_and_recovery_fixtures --test test_server_enforcement --test test_fuzz_boundaries --test test_run_fd_inheritance --test test_concurrency --test test_submodules_worktrees
 
   supply-chain:
     name: Supply Chain Audit (cargo-deny)

@@ -104,13 +104,21 @@ fn test_external_age_cli_clean_room_interoperability() {
         &["commit", "-m", "Add secret for external age CLI test"],
     );
 
-    // Step 1: Unwrap `.git-agecrypt/keys/alice.age` using the external `age -d` binary
+    // Step 1: Strip # metadata comments (grep -v '^#') from .git-agecrypt/keys/alice.age`n    // and unwrap the ASCII-armored envelope using the external ge -d binary
+    let raw_envelope = fs::read_to_string(repo.join(".git-agecrypt/keys/alice.age")).unwrap();
+    let stripped_armor: String = raw_envelope
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let stripped_envelope_path = repo.join("alice_stripped.age");
+    fs::write(&stripped_envelope_path, &stripped_armor).unwrap();
     let unwrap_out = Command::new("age")
         .args([
             "-d",
             "-i",
             alice_key_file.to_str().unwrap(),
-            repo.join(".git-agecrypt/keys/alice.age").to_str().unwrap(),
+            stripped_envelope_path.to_str().unwrap(),
         ])
         .output()
         .expect("Failed to execute external age CLI");

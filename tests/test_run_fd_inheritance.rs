@@ -100,7 +100,7 @@ fn test_run_fd_inheritance_boundaries() {
             "--fd",
             "--",
             bin_path.to_str().unwrap(),
-            "test-dumpable",
+            "__test-dumpable",
             "--output",
             dump_out_file.to_str().unwrap(),
         ]);

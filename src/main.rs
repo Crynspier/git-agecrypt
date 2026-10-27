@@ -700,16 +700,16 @@ fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
                 if let Ok(recipient) = crypto::parse_recipient(&pub_str) {
                     recipients_to_rekey.push((path, pub_str, recipient));
                 } else {
-                    eprintln!(
-                        "git-agecrypt [WARNING]: Failed to parse public key in {}",
+                    return Err(anyhow!(
+                        "Failed to parse recipient public key in {}: invalid recipient key",
                         path.display()
-                    );
+                    ));
                 }
             } else {
-                eprintln!(
-                    "git-agecrypt [WARNING]: Recipient file {} lacks public-key comment header. Skipping.",
+                return Err(anyhow!(
+                    "Recipient file {} lacks required '# public-key:' comment header. Rekey aborted to prevent partial rotation.",
                     path.display()
-                );
+                ));
             }
         }
     }
@@ -729,10 +729,12 @@ fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
     let rekey_journal = state_dir.join("rekey.journal");
 
     if backup_dir.exists() {
-        let _ = fs::remove_dir_all(&backup_dir);
+        fs::remove_dir_all(&backup_dir)
+            .context("Failed to clean up preexisting rekey backup directory")?;
     }
     if staging_dir.exists() {
-        let _ = fs::remove_dir_all(&staging_dir);
+        fs::remove_dir_all(&staging_dir)
+            .context("Failed to clean up preexisting rekey staging directory")?;
     }
     fs::create_dir_all(backup_dir.join("keys"))?;
     fs::create_dir_all(staging_dir.join("keys"))?;
@@ -942,8 +944,18 @@ fn cmd_rekey(force: bool, ring_opt: Option<&str>) -> Result<()> {
 
     // 7. Completed successfully: remove transaction journal, backup, and staging
     let _ = fs::remove_dir_all(&staging_dir);
-    let _ = fs::remove_dir_all(&backup_dir);
-    let _ = fs::remove_file(&rekey_journal);
+    if backup_dir.exists()
+        && let Err(e) = fs::remove_dir_all(&backup_dir)
+    {
+        eprintln!(
+            "git-agecrypt [WARNING]: Failed to remove rekey backup directory {}: {e}. Manual cleanup recommended to remove old master key backup.",
+            backup_dir.display()
+        );
+    }
+    if rekey_journal.exists() {
+        fs::remove_file(&rekey_journal)
+            .context("Failed to remove rekey recovery journal after successful rekey")?;
+    }
     git::crash_point("after_rekey_cleanup");
 
     eprintln!();
@@ -2170,13 +2182,16 @@ fn cmd_run(
             env_files.push(default_env);
         }
         if let Ok(out) = git::git_cmd_with_path(&repo.root)
-            .args(["ls-files"])
+            .args(["ls-files", "-z"])
             .output()
             && out.status.success()
         {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                let rel = line.trim();
+            for slice in out.stdout.split(|&b: &u8| b == 0) {
+                if slice.is_empty() {
+                    continue;
+                }
+                let rel_cow = String::from_utf8_lossy(slice);
+                let rel = rel_cow.trim();
                 if rel.is_empty() {
                     continue;
                 }

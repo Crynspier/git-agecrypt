@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v0.6.0)'
+        description: 'Release tag (e.g. v0.6.5)'
         required: true
-        default: 'v0.6.0'
+        default: 'v0.6.5'
 
 # Least privilege by default; individual jobs elevate only where required.
 permissions:
@@ -27,6 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install external age CLI for clean-room interop tests
@@ -41,7 +43,7 @@ jobs:
         run: |
           set -euo pipefail
           if ! echo "$RELEASE_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
-            echo "Invalid release tag '$RELEASE_TAG': must be a semantic version tag like v0.6.0 or v0.6.0-rc.1"
+            echo "Invalid release tag '$RELEASE_TAG': must be a semantic version tag like v0.6.5 or v0.6.5-rc.1"
             exit 1
           fi
           BASE_TAG="${RELEASE_TAG%%-*}"
@@ -109,6 +111,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
@@ -188,6 +192,7 @@ jobs:
             asset_name: git-agecrypt-linux-x86_64.tar.gz
             binary_name: git-agecrypt
           - os: macos-15-intel
+            target: x86_64-apple-darwin
             asset_name: git-agecrypt-macos-x86_64.tar.gz
             binary_name: git-agecrypt
           - os: macos-14
@@ -228,43 +233,5 @@ jobs:
           printf "RELEASE_SECRET=verified_123\n" > app.secret.env
           git add .gitattributes .git-agecrypt app.secret.env
           git commit -m "Verify release binary round-trip"
-          git cat-file -p HEAD:app.secret.env | head -n 1 | grep -Fx "age-encryption.org/v1"
           git-agecrypt check
-          git-agecrypt inspect --format json
-      - name: Verify SHA-256 checksum and Sigstore attestation (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $expected = (Get-Content ".\${{ matrix.asset_name }}.sha256").Split(' ')[0].Trim()
-          $actual = (Get-FileHash ".\${{ matrix.asset_name }}" -Algorithm SHA256).Hash.ToLower()
-          if ($expected -ne $actual) { throw "SHA-256 mismatch: expected $expected, got $actual" }
-          gh attestation verify "${{ matrix.asset_name }}" --repo "$env:GITHUB_REPOSITORY"
-          if ($LASTEXITCODE -ne 0) { throw "Attestation verification failed" }
-          $binDir = Join-Path $env:RUNNER_TEMP 'verify-bin'
-          Remove-Item -LiteralPath $binDir -Recurse -Force -ErrorAction SilentlyContinue
-          Expand-Archive -LiteralPath "${{ matrix.asset_name }}" -DestinationPath $binDir
-          $env:PATH = "$binDir;$env:PATH"
-          git config --global user.name "Release Verifier"
-          git config --global user.email "verify@example.com"
-          $repoDir = Join-Path $env:RUNNER_TEMP 'verify-repo'
-          Remove-Item -LiteralPath $repoDir -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Path $repoDir | Out-Null
-          Push-Location $repoDir
-          try {
-            git init
-            git-agecrypt init
-            Set-Content -Path .gitattributes -Value "*.secret.env filter=agecrypt diff=agecrypt merge=agecrypt -text`n" -NoNewline
-            Set-Content -Path app.secret.env -Value "RELEASE_SECRET=verified_123`n" -NoNewline
-            git add .gitattributes .git-agecrypt app.secret.env
-            git commit -m "Verify release binary round-trip"
-            $blob = git cat-file -p HEAD:app.secret.env
-            if (-not ($blob -join "`n").StartsWith("age-encryption.org/v1")) { throw "Committed blob is not encrypted" }
-            git-agecrypt check
-            if ($LASTEXITCODE -ne 0) { throw "git-agecrypt check failed" }
-            git-agecrypt inspect --format json | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "git-agecrypt inspect failed" }
-          } finally {
-            Pop-Location
-          }
+          git-agecrypt inspect

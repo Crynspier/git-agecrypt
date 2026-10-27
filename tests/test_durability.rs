@@ -355,3 +355,111 @@ fn test_interrupted_rekey_and_rewrap_recovery() {
     agecrypt_cmd(repo).arg("check").assert().success();
     assert_invariant_a(repo, "vault.secret.env", expected_secret);
 }
+
+#[test]
+fn test_interrupted_rekey_missing_backup_preserves_journal_and_fails() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+    init_repo(repo);
+
+    let (alice_sec, alice_pub) = generate_test_identity();
+    let alice_key = repo.join("alice.key");
+    fs::write(&alice_key, &alice_sec).unwrap();
+
+    agecrypt_cmd(repo).arg("init").assert().success();
+    agecrypt_cmd(repo)
+        .args(["add-recipient", "-i", &alice_pub, "-n", "alice"])
+        .assert()
+        .success();
+
+    let secret_file = repo.join("vault.secret.env");
+    fs::write(&secret_file, "SECRET=rekey_backup_missing_test\n").unwrap();
+    run_git(
+        repo,
+        &["add", ".gitattributes", ".git-agecrypt", "vault.secret.env"],
+    );
+    run_git(repo, &["commit", "-m", "Initial secret"]);
+
+    // Crash during rekey
+    let mut crash_rekey = agecrypt_cmd(repo);
+    crash_rekey
+        .env("GIT_AGECRYPT_CRASH_POINT", "after_rekey_pub_write")
+        .arg("rekey")
+        .assert()
+        .failure();
+
+    let state_dir = repo.join(".git").join("git-agecrypt");
+    let journal_file = state_dir.join("rekey.journal");
+    let backup_dir = state_dir.join("rekey.backup");
+
+    assert!(journal_file.exists(), "Journal must exist after crash");
+    assert!(backup_dir.exists(), "Backup dir must exist after crash");
+
+    // Adversarially delete backup_dir to test F-02
+    fs::remove_dir_all(&backup_dir).unwrap();
+    assert!(!backup_dir.exists());
+
+    // Status / recovery must FAIL and preserve journal rather than falsely claiming rollback
+    let status_out = agecrypt_cmd(repo).arg("status").output().unwrap();
+    assert!(
+        !status_out.status.success(),
+        "Recovery must fail closed when backup directory is missing"
+    );
+    assert!(
+        journal_file.exists(),
+        "Journal must be preserved when recovery cannot complete"
+    );
+    let stderr = String::from_utf8_lossy(&status_out.stderr);
+    assert!(
+        stderr.contains("backup directory") || stderr.contains("missing"),
+        "stderr must explain backup directory is missing: {stderr}"
+    );
+}
+
+#[test]
+fn test_rekey_aborts_on_malformed_recipient_envelope() {
+    let temp = tempdir().expect("Failed to create tempdir");
+    let repo = temp.path();
+    init_repo(repo);
+
+    let (_alice_sec, alice_pub) = generate_test_identity();
+    agecrypt_cmd(repo).arg("init").assert().success();
+    agecrypt_cmd(repo)
+        .args(["add-recipient", "-i", &alice_pub, "-n", "alice"])
+        .assert()
+        .success();
+
+    let secret_file = repo.join("vault.secret.env");
+    fs::write(&secret_file, "SECRET=rekey_malformed_test\n").unwrap();
+    run_git(
+        repo,
+        &["add", ".gitattributes", ".git-agecrypt", "vault.secret.env"],
+    );
+    run_git(repo, &["commit", "-m", "Initial secret"]);
+
+    let pub_file = repo.join(".git-agecrypt").join("repo.pub");
+    let original_pub = fs::read_to_string(&pub_file).unwrap();
+
+    // Adversarially create an invalid .age file lacking '# public-key:' header
+    let invalid_age = repo.join(".git-agecrypt").join("keys").join("corrupt.age");
+    fs::write(&invalid_age, "not_an_age_envelope\n").unwrap();
+
+    // Rekey must fail closed without modifying repo.pub or active recipient keys
+    let rekey_out = agecrypt_cmd(repo).arg("rekey").output().unwrap();
+    assert!(
+        !rekey_out.status.success(),
+        "Rekey must abort when an invalid recipient envelope is present"
+    );
+    let stderr = String::from_utf8_lossy(&rekey_out.stderr);
+    assert!(
+        stderr.contains("public-key:") || stderr.contains("invalid"),
+        "stderr must mention public-key header failure: {stderr}"
+    );
+
+    // Verify repo.pub was not mutated
+    let current_pub = fs::read_to_string(&pub_file).unwrap();
+    assert_eq!(
+        current_pub, original_pub,
+        "repo.pub must remain unchanged after aborted rekey"
+    );
+}

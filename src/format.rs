@@ -1301,20 +1301,77 @@ pub fn export_secret_to_age_file(
     Ok(())
 }
 
+fn tokenize_gitattributes_line(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = line.chars().peekable();
+
+    // Skip leading whitespace
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+
+    // Comment line
+    if let Some(&c) = chars.peek()
+        && c == '#'
+    {
+        return tokens;
+    }
+
+    while chars.peek().is_some() {
+        // Skip whitespace between tokens
+        while let Some(&c) = chars.peek() {
+            if c.is_whitespace() {
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+
+        let mut token = String::new();
+        let mut in_quotes = false;
+
+        while let Some(&c) = chars.peek() {
+            if c == '\\' {
+                chars.next(); // consume '\\'
+                if let Some(next_c) = chars.next() {
+                    token.push(next_c);
+                }
+            } else if c == '"' {
+                chars.next(); // consume '"'
+                in_quotes = !in_quotes;
+            } else if c.is_whitespace() && !in_quotes {
+                break;
+            } else {
+                token.push(c);
+                chars.next();
+            }
+        }
+
+        if !token.is_empty() {
+            tokens.push(token);
+        }
+    }
+
+    tokens
+}
+
 /// Parses `.gitattributes` content into `(pattern, ring_name)` pairs for all `filter=agecrypt*` rules.
 pub fn parse_gitattributes_rules(content: &str) -> Result<Vec<(String, String)>> {
     let mut rules = Vec::new();
     for raw_line in content.lines() {
-        let trimmed = raw_line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        let Some(pat) = parts.first() else {
+        let tokens = tokenize_gitattributes_line(raw_line);
+        let Some(pat) = tokens.first() else {
             continue;
         };
-        for attr in &parts[1..] {
-            if *attr == "filter=agecrypt" {
+        for attr in &tokens[1..] {
+            if attr == "filter=agecrypt" {
                 rules.push((pat.to_string(), "default".to_string()));
             } else if let Some(ring) = attr.strip_prefix("filter=agecrypt-") {
                 validate_ring_name(ring).with_context(|| {
@@ -1338,7 +1395,10 @@ fn match_path_to_ring(file_path: &str, rules: &[(String, String)]) -> Option<Str
             }
             if pat.ends_with("/**") {
                 let prefix = pat.trim_end_matches("/**");
-                if normalized.starts_with(prefix) {
+                if prefix.is_empty()
+                    || normalized == prefix
+                    || normalized.starts_with(&format!("{prefix}/"))
+                {
                     matched_ring = Some(ring.clone());
                 }
             }
@@ -1425,35 +1485,50 @@ impl GitRepo {
                 let out = crate::git::git_cmd_with_path(&self.root)
                     .args(["rev-list", &new_commit, "--not", "--all"])
                     .output();
-                let mut list: Vec<String> = match out {
+                match out {
                     Ok(o) if o.status.success() && !o.stdout.is_empty() => {
-                        String::from_utf8_lossy(&o.stdout)
+                        let mut list: Vec<String> = String::from_utf8_lossy(&o.stdout)
                             .lines()
                             .map(|s| s.trim().to_string())
                             .filter(|s| !s.is_empty())
-                            .collect()
+                            .collect();
+                        if !list.contains(&new_commit) {
+                            list.push(new_commit.clone());
+                        }
+                        list
                     }
                     _ => {
                         let out2 = crate::git::git_cmd_with_path(&self.root)
                             .args(["rev-list", &new_commit])
                             .output();
-                        if let Ok(o2) = out2
-                            && o2.status.success()
-                        {
-                            String::from_utf8_lossy(&o2.stdout)
-                                .lines()
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty())
-                                .collect()
-                        } else {
-                            vec![new_commit.clone()]
+                        match out2 {
+                            Ok(o2) if o2.status.success() => {
+                                let mut list: Vec<String> = String::from_utf8_lossy(&o2.stdout)
+                                    .lines()
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                if !list.contains(&new_commit) {
+                                    list.push(new_commit.clone());
+                                }
+                                list
+                            }
+                            Ok(o2) => {
+                                violations.push(format!(
+                                    "[{refname}] Inspection failed: git rev-list {new_commit} failed: {}",
+                                    String::from_utf8_lossy(&o2.stderr).trim()
+                                ));
+                                continue;
+                            }
+                            Err(e) => {
+                                violations.push(format!(
+                                    "[{refname}] Inspection failed: failed to execute git rev-list for {new_commit}: {e}"
+                                ));
+                                continue;
+                            }
                         }
                     }
-                };
-                if !list.contains(&new_commit) {
-                    list.push(new_commit.clone());
                 }
-                list
             } else {
                 let old_commit = crate::git::peel_to_commit(&self.root, old_oid)
                     .unwrap_or_else(|| old_oid.to_string());
@@ -1461,21 +1536,32 @@ impl GitRepo {
                 let out = crate::git::git_cmd_with_path(&self.root)
                     .args(["rev-list", &range])
                     .output();
-                let mut list: Vec<String> = if let Ok(o) = out
-                    && o.status.success()
-                {
-                    String::from_utf8_lossy(&o.stdout)
-                        .lines()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect()
-                } else {
-                    vec![new_commit.clone()]
-                };
-                if !list.contains(&new_commit) {
-                    list.push(new_commit.clone());
+                match out {
+                    Ok(o) if o.status.success() => {
+                        let mut list: Vec<String> = String::from_utf8_lossy(&o.stdout)
+                            .lines()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !list.contains(&new_commit) {
+                            list.push(new_commit.clone());
+                        }
+                        list
+                    }
+                    Ok(o) => {
+                        violations.push(format!(
+                            "[{refname}] Inspection failed: git rev-list {range} failed: {}",
+                            String::from_utf8_lossy(&o.stderr).trim()
+                        ));
+                        continue;
+                    }
+                    Err(e) => {
+                        violations.push(format!(
+                            "[{refname}] Inspection failed: failed to execute git rev-list for {range}: {e}"
+                        ));
+                        continue;
+                    }
                 }
-                list
             };
 
             for commit in &commits {
@@ -1608,46 +1694,65 @@ impl GitRepo {
         let tree_out = crate::git::git_cmd_with_path(&self.root)
             .args(["ls-tree", "-r", "-z", commit])
             .output();
-        if let Ok(to) = tree_out
-            && to.status.success()
-        {
-            for slice in to.stdout.split(|&b| b == 0) {
-                if slice.is_empty() {
-                    continue;
-                }
-                let line_str = String::from_utf8_lossy(slice);
-                if let Some((meta, path)) = line_str.split_once('\t') {
-                    let parts: Vec<&str> = meta.split_whitespace().collect();
-                    let norm = path.replace('\\', "/");
-                    if parts.len() >= 3
-                        && parts[1] == "blob"
-                        && (norm == ".gitattributes" || norm.ends_with("/.gitattributes"))
-                        && let Some(attr_bytes) = self.read_blob_header(parts[2], 256 * 1024)
-                    {
-                        let attr_str = String::from_utf8_lossy(&attr_bytes);
-                        let dir_prefix = norm
-                            .strip_suffix(".gitattributes")
-                            .unwrap_or("")
-                            .trim_end_matches('/');
-                        match parse_gitattributes_rules(&attr_str) {
-                            Ok(parsed) => {
-                                for (pat, ring) in parsed {
-                                    let scoped_pat = if dir_prefix.is_empty() {
-                                        pat
-                                    } else {
-                                        format!("{dir_prefix}/{}", pat.trim_start_matches('/'))
-                                    };
-                                    rules.push((scoped_pat, ring));
+        match tree_out {
+            Ok(to) if to.status.success() => {
+                for slice in to.stdout.split(|&b| b == 0) {
+                    if slice.is_empty() {
+                        continue;
+                    }
+                    let line_str = String::from_utf8_lossy(slice);
+                    if let Some((meta, path)) = line_str.split_once('\t') {
+                        let parts: Vec<&str> = meta.split_whitespace().collect();
+                        let norm = path.replace('\\', "/");
+                        if parts.len() >= 3
+                            && parts[1] == "blob"
+                            && (norm == ".gitattributes" || norm.ends_with("/.gitattributes"))
+                        {
+                            if let Some(attr_bytes) = self.read_blob_header(parts[2], 256 * 1024) {
+                                let attr_str = String::from_utf8_lossy(&attr_bytes);
+                                let dir_prefix = norm
+                                    .strip_suffix(".gitattributes")
+                                    .unwrap_or("")
+                                    .trim_end_matches('/');
+                                match parse_gitattributes_rules(&attr_str) {
+                                    Ok(parsed) => {
+                                        for (pat, ring) in parsed {
+                                            let scoped_pat = if dir_prefix.is_empty() {
+                                                pat
+                                            } else {
+                                                format!(
+                                                    "{dir_prefix}/{}",
+                                                    pat.trim_start_matches('/')
+                                                )
+                                            };
+                                            rules.push((scoped_pat, ring));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        violations.push(format!(
+                                            "[{ref_label} @ {commit}] Invalid {norm} agecrypt rule: {e}"
+                                        ));
+                                    }
                                 }
-                            }
-                            Err(e) => {
+                            } else {
                                 violations.push(format!(
-                                    "[{ref_label} @ {commit}] Invalid {norm} agecrypt rule: {e}"
+                                    "[{ref_label} @ {commit}] Inspection failed: unreadable .gitattributes blob: {norm}"
                                 ));
                             }
                         }
                     }
                 }
+            }
+            Ok(to) => {
+                violations.push(format!(
+                    "[{ref_label} @ {commit}] Inspection failed: git ls-tree exited with error: {}",
+                    String::from_utf8_lossy(&to.stderr).trim()
+                ));
+            }
+            Err(e) => {
+                violations.push(format!(
+                    "[{ref_label} @ {commit}] Inspection failed: failed to execute git ls-tree: {e}"
+                ));
             }
         }
         if rules.is_empty()
@@ -1683,12 +1788,22 @@ impl GitRepo {
             ])
             .output();
 
-        let Ok(out) = diff_out else {
-            return;
+        let out = match diff_out {
+            Ok(o) if o.status.success() => o,
+            Ok(o) => {
+                violations.push(format!(
+                    "[{ref_label} @ {commit}] Inspection failed: git diff-tree exited with error: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ));
+                return;
+            }
+            Err(e) => {
+                violations.push(format!(
+                    "[{ref_label} @ {commit}] Inspection failed: failed to execute git diff-tree: {e}"
+                ));
+                return;
+            }
         };
-        if !out.status.success() {
-            return;
-        }
 
         let slices: Vec<&[u8]> = out
             .stdout
@@ -1824,12 +1939,22 @@ impl GitRepo {
         let tree_out = crate::git::git_cmd_with_path(&self.root)
             .args(["ls-tree", "-r", "-z", tip_commit])
             .output();
-        let Ok(to) = tree_out else {
-            return;
+        let to = match tree_out {
+            Ok(o) if o.status.success() => o,
+            Ok(o) => {
+                violations.push(format!(
+                    "[{ref_label} @ {tip_commit}] Inspection failed: git ls-tree exited with error: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ));
+                return;
+            }
+            Err(e) => {
+                violations.push(format!(
+                    "[{ref_label} @ {tip_commit}] Inspection failed: failed to execute git ls-tree: {e}"
+                ));
+                return;
+            }
         };
-        if !to.status.success() {
-            return;
-        }
 
         let mut tree_blobs: Vec<(String, String, String)> = Vec::new();
         for slice in to.stdout.split(|&b| b == 0) {

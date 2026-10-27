@@ -99,7 +99,7 @@ fn test_server_pre_receive_accepts_valid_encrypted_pushes_in_bare_repo() {
         &client,
         &["remote", "add", "origin", server.to_str().unwrap()],
     );
-    run_git(&client, &["push", "origin", "main"]);
+    run_git(&client, &["push", "--no-verify", "origin", "main"]);
 
     // Run `git-agecrypt check --pre-receive` inside the BARE server repo!
     // 1. New branch creation (ZERO_SHA -> commit1)
@@ -640,4 +640,205 @@ fn test_encryption_boundary_and_historical_key_rejection_matrix() {
             .contains("services/billing/stripe.billing.key")
     );
     let _ = v1_commit;
+}
+
+#[test]
+fn test_server_pre_receive_rejects_intermediate_commit_leak() {
+    let temp = TempDir::new().unwrap();
+    let client = temp.path().join("client");
+    let server = temp.path().join("server.git");
+    fs::create_dir_all(&client).unwrap();
+    fs::create_dir_all(&server).unwrap();
+
+    run_git(&server, &["init", "--bare"]);
+    init_repo(&client);
+
+    let (_sec, pub_key) = generate_test_identity();
+    assert!(
+        agecrypt_cmd(&client)
+            .arg("init")
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        agecrypt_cmd(&client)
+            .args(["add-recipient", "-i", &pub_key, "-n", "alice"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    fs::create_dir_all(client.join("secrets")).unwrap();
+    fs::write(
+        client.join("secrets/db.secret.env"),
+        "DB_PASS=initial_encrypted_secret\n",
+    )
+    .unwrap();
+    run_git(
+        &client,
+        &[
+            "add",
+            ".gitattributes",
+            ".git-agecrypt",
+            "secrets/db.secret.env",
+        ],
+    );
+    run_git(&client, &["commit", "-m", "Commit 1 (clean)"]);
+    let commit1 = rev_parse_head(&client);
+
+    // Commit 2 (intermediate): inject a plaintext leak into secrets/db.secret.env
+    let mut hash_plain = std::process::Command::new("git")
+        .args(["hash-object", "-w", "--stdin"])
+        .current_dir(&client)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    hash_plain
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"PLAINTEXT_LEAKED_INTERMEDIATE_SECRET=compromised\n")
+        .unwrap();
+    let plain_oid = String::from_utf8_lossy(&hash_plain.wait_with_output().unwrap().stdout)
+        .trim()
+        .to_string();
+
+    run_git(
+        &client,
+        &[
+            "update-index",
+            "--cacheinfo",
+            &format!("100644,{plain_oid},secrets/db.secret.env"),
+        ],
+    );
+    run_git(
+        &client,
+        &[
+            "commit",
+            "--no-verify",
+            "-m",
+            "Commit 2 (intermediate leak)",
+        ],
+    );
+    let commit2 = rev_parse_head(&client);
+
+    // Commit 3 (tip): delete or re-encrypt the file so tip tree looks clean
+    run_git(&client, &["rm", "-f", "secrets/db.secret.env"]);
+    run_git(&client, &["commit", "-m", "Commit 3 (tip cleaned)"]);
+    let commit3 = rev_parse_head(&client);
+
+    // Push all commits to bare server
+    run_git(
+        &client,
+        &["remote", "add", "origin", server.to_str().unwrap()],
+    );
+    run_git(&client, &["push", "--no-verify", "origin", "main"]);
+
+    // Test check --pre-receive on the range commit1..commit3
+    let out = run_pre_receive_stdin(
+        &server,
+        &format!("{commit1} {commit3} refs/heads/main\n"),
+        &[],
+    );
+
+    // Must reject because intermediate commit2 contained plaintext leak
+    assert!(
+        !out.status.success(),
+        "pre-receive must reject push when intermediate commit contains plaintext secret"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Plaintext secret committed") || stderr.contains(&commit2),
+        "stderr must identify leak in commit2: {stderr}"
+    );
+}
+
+#[test]
+fn test_gitattributes_escaped_whitespace_and_directory_boundary() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path();
+    init_repo(repo);
+
+    let (_sec, pub_key) = generate_test_identity();
+    assert!(agecrypt_cmd(repo).arg("init").status().unwrap().success());
+    assert!(
+        agecrypt_cmd(repo)
+            .args(["add-recipient", "-i", &pub_key, "-n", "alice"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // Attributes with escaped space and recursive wildcard prefix
+    fs::write(
+        repo.join(".gitattributes"),
+        "secret\\ file.env filter=agecrypt diff=agecrypt merge=agecrypt -text\nconfig/prod/** filter=agecrypt diff=agecrypt merge=agecrypt -text\n",
+    )
+    .unwrap();
+
+    fs::create_dir_all(repo.join("config/prod")).unwrap();
+    fs::create_dir_all(repo.join("config/production")).unwrap();
+
+    // 1. config/production/notes.txt is NOT in config/prod/** -> should not be flagged as unencrypted protected secret
+    fs::write(
+        repo.join("config/production/notes.txt"),
+        "Public documentation notes\n",
+    )
+    .unwrap();
+    run_git(
+        repo,
+        &[
+            "add",
+            ".gitattributes",
+            ".git-agecrypt",
+            "config/production/notes.txt",
+        ],
+    );
+    let check_prod_sibling = agecrypt_cmd(repo).arg("check").output().unwrap();
+    assert!(
+        check_prod_sibling.status.success(),
+        "config/production should not match config/prod/**: {}",
+        String::from_utf8_lossy(&check_prod_sibling.stderr)
+    );
+
+    // 2. secret file.env has escaped space in .gitattributes -> must be recognized as protected!
+    let mut hash_plain = std::process::Command::new("git")
+        .args(["hash-object", "-w", "--stdin"])
+        .current_dir(repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    hash_plain
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"UNENCRYPTED_ESCAPED_SPACE_SECRET=1\n")
+        .unwrap();
+    let plain_oid = String::from_utf8_lossy(&hash_plain.wait_with_output().unwrap().stdout)
+        .trim()
+        .to_string();
+
+    run_git(
+        repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{plain_oid},secret file.env"),
+        ],
+    );
+
+    let check_escaped = agecrypt_cmd(repo).arg("check").output().unwrap();
+    assert!(
+        !check_escaped.status.success(),
+        "check must reject unencrypted secret in path with escaped space"
+    );
+    let stderr = String::from_utf8_lossy(&check_escaped.stderr);
+    assert!(
+        stderr.contains("secret file.env"),
+        "stderr must mention secret file.env: {stderr}"
+    );
 }

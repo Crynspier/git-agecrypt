@@ -1,6 +1,6 @@
 [package]
 name = "git-agecrypt"
-version = "0.6.0"
+version = "0.6.5"
 rust-version = "1.88.0"
 # Rust language edition (RFC 3501, requires Rust 1.85+; let-chains are stable from Rust 1.88)
 edition = "2024"
@@ -49,4 +49,3 @@ strip = true
 [[bench]]
 name = "bench_main"
 harness = false
-

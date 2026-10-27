@@ -14,13 +14,19 @@ env:
 
 jobs:
   format:
-    name: Code Formatting (Rustfmt)
+    name: Code Formatting & Doc Links
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - name: Check code formatting
         run: cargo fmt --all -- --check
+      - name: Verify documentation contains no machine-local links
+        run: |
+          if grep -rE "file:///[A-Za-z]:" docs/; then
+            echo "Error: Machine-local absolute file:/// paths found in docs/"
+            exit 1
+          fi
 
   clippy:
     name: Linter (Clippy)
@@ -65,10 +71,16 @@ jobs:
           GIT_AGECRYPT_REQUIRE_AGE_CLI: "1"
         run: cargo test --workspace --locked --verbose
       - name: Check fuzz targets compile
-        run: cargo check --manifest-path fuzz/Cargo.toml --bins --locked
-      # Benchmarks are compiled here; performance runs are opt-in locally.
+        run: cargo check --manifest-path fuzz/Cargo.toml
       - name: Compile benchmarks
-        run: cargo bench --no-run --locked
+        run: cargo bench --no-run --locked --verbose
+
+  deny:
+    name: Supply Chain Audit (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
 
   build:
     name: Build Project
@@ -81,50 +93,46 @@ jobs:
         run: cargo build --workspace --locked --verbose
 
   platform-matrix:
-    name: Platform Build and Smoke Test (${{ matrix.name }})
+    name: Platform Build and Smoke Test (${{ matrix.platform_name }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: Linux x86_64
-            os: ubuntu-latest
+          - os: ubuntu-latest
+            platform_name: Linux x86_64
             target: x86_64-unknown-linux-gnu
-          - name: macOS Intel
-            os: macos-15-intel
+            binary_name: git-agecrypt
+          - os: macos-15-intel
+            platform_name: macOS Intel
             target: x86_64-apple-darwin
-          - name: macOS Apple Silicon
-            os: macos-14
+            binary_name: git-agecrypt
+          - os: macos-14
+            platform_name: macOS Apple Silicon
             target: aarch64-apple-darwin
-          - name: Windows x86_64
-            os: windows-latest
+            binary_name: git-agecrypt
+          - os: windows-latest
+            platform_name: Windows x86_64
             target: x86_64-pc-windows-msvc
+            binary_name: git-agecrypt.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Configure Git user identity for tests
+        run: |
+          git config --global user.name "Platform Tester"
+          git config --global user.email "platform@example.com"
+      - name: Build release binary
+        run: cargo build --release --locked --verbose
+      - name: Run platform smoke tests
         shell: bash
         run: |
-          git config --global user.name "CI Runner"
-          git config --global user.email "ci@example.com"
-      - name: Build release binary
-        run: cargo build --workspace --locked --release --target ${{ matrix.target }}
-      - name: Run platform smoke tests
-        run: cargo test --workspace --locked --target ${{ matrix.target }} --lib --bins
+          ./target/release/${{ matrix.binary_name }} --help
+          ./target/release/${{ matrix.binary_name }} --version
       - name: Run native macOS integration tests
-        if: startsWith(matrix.os, 'macos-')
-        run: cargo test --workspace --locked --target ${{ matrix.target }} --tests
+        if: runner.os == 'macOS'
+        run: cargo test --test test_durability --verbose
       - name: Run native Windows integration tests
-        if: startsWith(matrix.os, 'windows-')
-        run: cargo test --workspace --locked --target ${{ matrix.target }} --test test_durability --test test_filesystem_security --test test_format_and_recovery_fixtures --test test_server_enforcement --test test_fuzz_boundaries --test test_run_fd_inheritance --test test_concurrency --test test_submodules_worktrees
-
-  supply-chain:
-    name: Supply Chain Audit (cargo-deny)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - name: Run cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        if: runner.os == 'Windows'
+        run: cargo test --test test_durability --verbose

@@ -1465,129 +1465,144 @@ impl GitRepo {
         } else {
             // Interrupted rekey transaction (interrupted before key rotation was fully active):
             // Roll back all recipient envelopes, repo.pub, and master key to the previous generation.
-            if backup_dir.exists() {
-                let backup_pub = backup_dir.join("repo.pub");
-                if backup_pub.exists() {
-                    let pub_content = fs::read(&backup_pub).with_context(|| {
-                        format!("Failed to read backup public key {}", backup_pub.display())
+            if !backup_dir.exists() {
+                return Err(anyhow!(
+                    "Cannot recover interrupted rekey for ring '{}': backup directory {} is missing. Recovery journal preserved at {}. Manual recovery required.",
+                    ring.unwrap_or("default"),
+                    backup_dir.display(),
+                    rekey_journal.display()
+                ));
+            }
+
+            let backup_pub = backup_dir.join("repo.pub");
+            if !backup_pub.exists() {
+                return Err(anyhow!(
+                    "Cannot recover interrupted rekey for ring '{}': backup public key {} is missing. Recovery journal preserved at {}. Manual recovery required.",
+                    ring.unwrap_or("default"),
+                    backup_pub.display(),
+                    rekey_journal.display()
+                ));
+            }
+
+            let backup_keys = backup_dir.join("keys");
+            if !backup_keys.exists() {
+                return Err(anyhow!(
+                    "Cannot recover interrupted rekey for ring '{}': backup keys directory {} is missing. Recovery journal preserved at {}. Manual recovery required.",
+                    ring.unwrap_or("default"),
+                    backup_keys.display(),
+                    rekey_journal.display()
+                ));
+            }
+
+            let pub_content = fs::read(&backup_pub).with_context(|| {
+                format!("Failed to read backup public key {}", backup_pub.display())
+            })?;
+            write_atomic_metadata_file(&pub_file, &pub_content).with_context(|| {
+                format!("Failed to restore public key from {}", backup_pub.display())
+            })?;
+
+            let keys_dir = self.keys_dir_for_ring(ring);
+            fs::create_dir_all(&keys_dir).with_context(|| {
+                format!("Failed to ensure keys directory {}", keys_dir.display())
+            })?;
+
+            // Restore all backup keys
+            for entry in fs::read_dir(&backup_keys).with_context(|| {
+                format!(
+                    "Failed to read backup keys directory {}",
+                    backup_keys.display()
+                )
+            })? {
+                let entry = entry?;
+                let p = entry.path();
+                if p.is_file() {
+                    let dest = keys_dir.join(entry.file_name());
+                    let content = fs::read(&p).with_context(|| {
+                        format!("Failed to read backup key envelope {}", p.display())
                     })?;
-                    write_atomic_metadata_file(&pub_file, &pub_content).with_context(|| {
-                        format!("Failed to restore public key from {}", backup_pub.display())
+                    write_atomic_metadata_file(&dest, &content).with_context(|| {
+                        format!("Failed to restore recipient envelope {}", dest.display())
                     })?;
                 }
+            }
 
-                let backup_keys = backup_dir.join("keys");
-                let keys_dir = self.keys_dir_for_ring(ring);
-                if backup_keys.exists() {
-                    fs::create_dir_all(&keys_dir).with_context(|| {
-                        format!("Failed to ensure keys directory {}", keys_dir.display())
+            // Remove any newly staged/activated keys that did not exist in backup
+            if keys_dir.exists() {
+                for entry in fs::read_dir(&keys_dir).with_context(|| {
+                    format!("Failed to read keys directory {}", keys_dir.display())
+                })? {
+                    let entry = entry?;
+                    let p = entry.path();
+                    if p.is_file() && !backup_keys.join(entry.file_name()).exists() {
+                        fs::remove_file(&p).with_context(|| {
+                            format!(
+                                "Failed to clean up uncommitted key envelope {}",
+                                p.display()
+                            )
+                        })?;
+                    }
+                }
+            }
+
+            let backup_key = backup_dir.join("repo.key");
+            if backup_key.exists() {
+                let key_str = fs::read_to_string(&backup_key).with_context(|| {
+                    format!("Failed to read backup master key {}", backup_key.display())
+                })?;
+                self.save_local_master_key_for_ring(&key_str, ring)
+                    .context("Failed to restore local master key from backup")?;
+            }
+
+            // Verify repository consistency after restoration BEFORE deleting recovery assets:
+            // 1. Verify repo.pub matches backup_pub
+            let current_pub = fs::read_to_string(&pub_file)
+                .context("Failed to read restored public key for consistency check")?;
+            let expected_backup_pub = fs::read_to_string(&backup_pub)
+                .context("Failed to read backup public key for consistency check")?;
+            if current_pub.trim() != expected_backup_pub.trim() {
+                return Err(anyhow!(
+                    "Rekey recovery consistency check failed: restored public key does not match backup"
+                ));
+            }
+
+            // 2. Verify all restored recipient envelopes parse validly
+            for entry in fs::read_dir(&backup_keys)? {
+                let entry = entry?;
+                let p = entry.path();
+                if p.is_file() {
+                    let dest = keys_dir.join(entry.file_name());
+                    if !dest.exists() {
+                        return Err(anyhow!(
+                            "Rekey recovery consistency check failed: restored key envelope {} is missing",
+                            dest.display()
+                        ));
+                    }
+                    let content = fs::read_to_string(&dest).with_context(|| {
+                        format!("Failed to read restored envelope {}", dest.display())
                     })?;
-
-                    // Restore all backup keys
-                    for entry in fs::read_dir(&backup_keys).with_context(|| {
+                    crate::format::validate_wrapped_key_envelope(&content).with_context(|| {
                         format!(
-                            "Failed to read backup keys directory {}",
-                            backup_keys.display()
+                            "Restored envelope {} failed envelope validation",
+                            dest.display()
                         )
-                    })? {
-                        let entry = entry?;
-                        let p = entry.path();
-                        if p.is_file() {
-                            let dest = keys_dir.join(entry.file_name());
-                            let content = fs::read(&p).with_context(|| {
-                                format!("Failed to read backup key envelope {}", p.display())
-                            })?;
-                            write_atomic_metadata_file(&dest, &content).with_context(|| {
-                                format!("Failed to restore recipient envelope {}", dest.display())
-                            })?;
-                        }
-                    }
-
-                    // Remove any newly staged/activated keys that did not exist in backup
-                    if keys_dir.exists() {
-                        for entry in fs::read_dir(&keys_dir).with_context(|| {
-                            format!("Failed to read keys directory {}", keys_dir.display())
-                        })? {
-                            let entry = entry?;
-                            let p = entry.path();
-                            if p.is_file() && !backup_keys.join(entry.file_name()).exists() {
-                                fs::remove_file(&p).with_context(|| {
-                                    format!(
-                                        "Failed to clean up uncommitted key envelope {}",
-                                        p.display()
-                                    )
-                                })?;
-                            }
-                        }
-                    }
-                }
-
-                let backup_key = backup_dir.join("repo.key");
-                if backup_key.exists() {
-                    let key_str = fs::read_to_string(&backup_key).with_context(|| {
-                        format!("Failed to read backup master key {}", backup_key.display())
                     })?;
-                    self.save_local_master_key_for_ring(&key_str, ring)
-                        .context("Failed to restore local master key from backup")?;
                 }
+            }
 
-                // Verify repository consistency after restoration BEFORE deleting recovery assets:
-                // 1. Verify repo.pub matches backup_pub
-                if backup_pub.exists() {
-                    let current_pub = fs::read_to_string(&pub_file)
-                        .context("Failed to read restored public key for consistency check")?;
-                    let expected_backup_pub = fs::read_to_string(&backup_pub)
-                        .context("Failed to read backup public key for consistency check")?;
-                    if current_pub.trim() != expected_backup_pub.trim() {
-                        return Err(anyhow!(
-                            "Rekey recovery consistency check failed: restored public key does not match backup"
-                        ));
-                    }
-                }
-
-                // 2. Verify all restored recipient envelopes parse validly
-                if backup_keys.exists() {
-                    for entry in fs::read_dir(&backup_keys)? {
-                        let entry = entry?;
-                        let p = entry.path();
-                        if p.is_file() {
-                            let dest = keys_dir.join(entry.file_name());
-                            if !dest.exists() {
-                                return Err(anyhow!(
-                                    "Rekey recovery consistency check failed: restored key envelope {} is missing",
-                                    dest.display()
-                                ));
-                            }
-                            let content = fs::read_to_string(&dest).with_context(|| {
-                                format!("Failed to read restored envelope {}", dest.display())
-                            })?;
-                            crate::format::validate_wrapped_key_envelope(&content).with_context(
-                                || {
-                                    format!(
-                                        "Restored envelope {} failed envelope validation",
-                                        dest.display()
-                                    )
-                                },
-                            )?;
-                        }
-                    }
-                }
-
-                // 3. Verify local master key matches repo.pub if both are restored
-                if backup_key.exists() {
-                    let restored_master = self
-                        .read_local_master_key_for_ring(ring)
-                        .context("Failed to read restored master key for consistency check")?
-                        .ok_or_else(|| anyhow!("Restored master key is missing"))?;
-                    let id = age::x25519::Identity::from_str(&restored_master)
-                        .map_err(|e| anyhow!("Restored master key is invalid: {e}"))?;
-                    let restored_pub = fs::read_to_string(&pub_file)
-                        .context("Failed to read restored public key")?;
-                    if format!("{}", id.to_public()) != restored_pub.trim() {
-                        return Err(anyhow!(
-                            "Rekey recovery consistency check failed: restored master key does not match restored repo.pub"
-                        ));
-                    }
+            // 3. Verify local master key matches repo.pub if both are restored
+            if backup_key.exists() {
+                let restored_master = self
+                    .read_local_master_key_for_ring(ring)
+                    .context("Failed to read restored master key for consistency check")?
+                    .ok_or_else(|| anyhow!("Restored master key is missing"))?;
+                let id = age::x25519::Identity::from_str(&restored_master)
+                    .map_err(|e| anyhow!("Restored master key is invalid: {e}"))?;
+                let restored_pub =
+                    fs::read_to_string(&pub_file).context("Failed to read restored public key")?;
+                if format!("{}", id.to_public()) != restored_pub.trim() {
+                    return Err(anyhow!(
+                        "Rekey recovery consistency check failed: restored master key does not match restored repo.pub"
+                    ));
                 }
             }
 
@@ -2299,40 +2314,39 @@ impl GitRepo {
         }
 
         let is_default = matches!(ring, None | Some("default") | Some(""));
+        let target_ring = if is_default { "default" } else { ring.unwrap() };
+
+        let content = fs::read_to_string(&gitattributes_path)?;
+        let mut patterns = Vec::new();
+
+        if let Ok(rules) = crate::format::parse_gitattributes_rules(&content) {
+            for (pat, r) in rules {
+                if r == target_ring {
+                    patterns.push(pat);
+                }
+            }
+        }
+
+        // Warnings for driver collisions or missing binary flags
         let filter_needle = if is_default {
             "filter=agecrypt".to_string()
         } else {
             format!("filter=agecrypt-{}", ring.unwrap())
         };
-
-        let content = fs::read_to_string(&gitattributes_path)?;
-        let mut patterns = Vec::new();
-
         for line in content.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
             if trimmed.contains(&filter_needle) {
-                let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                if let Some(pat) = parts.first() {
-                    patterns.push(pat.to_string());
-
-                    // Check for conflicting filter drivers (e.g. filter=lfs)
-                    if trimmed.contains("filter=lfs") {
-                        eprintln!(
-                            "git-agecrypt [WARNING]: Pattern '{pat}' in .gitattributes specifies both '{filter_needle}' and 'filter=lfs'. \
-                             Git does not support filter chaining; one driver will silently override the other!"
-                        );
-                    }
-
-                    // Check for missing -text binary flag
-                    if !trimmed.contains("-text") && !trimmed.contains("binary") {
-                        eprintln!(
-                            "git-agecrypt [WARNING]: Pattern '{pat}' in .gitattributes does not specify '-text'. \
-                             Add '-text' to ensure Git never corrupts binary Age ciphertexts with Windows CRLF conversion."
-                        );
-                    }
+                if trimmed.contains("filter=lfs") {
+                    eprintln!(
+                        "git-agecrypt [WARNING]: Rule in .gitattributes specifies both '{filter_needle}' and 'filter=lfs'. \
+                         Git does not support filter chaining; one driver will silently override the other!"
+                    );
+                }
+                if !trimmed.contains("-text") && !trimmed.contains("binary") {
+                    eprintln!(
+                        "git-agecrypt [WARNING]: Rule in .gitattributes does not specify '-text'. \
+                         Add '-text' to ensure Git never corrupts binary Age ciphertexts with Windows CRLF conversion."
+                    );
                 }
             }
         }
@@ -2351,7 +2365,10 @@ impl GitRepo {
                 // Handle patterns like "secrets/**" matching "secrets/sub/file.env"
                 if pat.ends_with("/**") {
                     let prefix = pat.trim_end_matches("/**");
-                    if normalized.starts_with(prefix) {
+                    if prefix.is_empty()
+                        || normalized == prefix
+                        || normalized.starts_with(&format!("{prefix}/"))
+                    {
                         return true;
                     }
                 }

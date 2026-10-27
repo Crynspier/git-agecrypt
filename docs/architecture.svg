@@ -57,13 +57,13 @@
   <text x="254" y="238" class="note">Wrapped age envelopes</text>
 
   <!-- Git Index Box -->
-  <rect x="425" y="65" width="162" height="195" class="box"/>
-  <text x="439" y="92" class="label">Git Index &amp; Objects</text>
-  <text x="439" y="118" class="subtitle">age-encryption.org/v1</text>
-  <text x="439" y="142" class="note">X25519 + ChaCha20</text>
-  <text x="439" y="162" class="note">Poly1305 Ciphertext</text>
-  <text x="439" y="195" class="subtitle">Never stores</text>
-  <text x="439" y="213" class="subtitle">plaintext secrets</text>
+  <rect x="418" y="65" width="176" height="195" class="box"/>
+  <text x="430" y="92" class="label">Git Index &amp; Objects</text>
+  <text x="430" y="118" class="subtitle" font-size="11px">age-encryption.org/v1</text>
+  <text x="430" y="142" class="note">X25519 + ChaCha20</text>
+  <text x="430" y="162" class="note">Poly1305 Ciphertext</text>
+  <text x="430" y="195" class="subtitle">Never stores</text>
+  <text x="430" y="213" class="subtitle">plaintext secrets</text>
 
   <!-- Right Zone: Untrusted Remote Git Server -->
   <rect x="625" y="20" width="235" height="260" class="zone-untrusted"/>
@@ -80,8 +80,8 @@
   <!-- Arrows -->
   <line x1="203" y1="98" x2="238" y2="98" class="arrow"/>
   <line x1="242" y1="120" x2="207" y2="120" class="arrow"/>
-  <line x1="387" y1="108" x2="421" y2="108" class="arrow"/>
+  <line x1="387" y1="108" x2="414" y2="108" class="arrow"/>
   <line x1="242" y1="215" x2="207" y2="215" class="arrow-key"/>
   <line x1="165" y1="175" x2="265" y2="152" class="arrow-key"/>
-  <line x1="587" y1="155" x2="639" y2="155" class="arrow-remote"/>
+  <line x1="594" y1="155" x2="639" y2="155" class="arrow-remote"/>
 </svg>

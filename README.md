@@ -2,6 +2,11 @@
 
 [![CI](https://github.com/Crynspier/git-agecrypt/actions/workflows/ci.yml/badge.svg)](https://github.com/Crynspier/git-agecrypt/actions/workflows/ci.yml)
 [![Release](https://github.com/Crynspier/git-agecrypt/actions/workflows/release.yml/badge.svg)](https://github.com/Crynspier/git-agecrypt/actions/workflows/release.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/Crynspier/git-agecrypt?color=0284c7&label=release&logo=github)](https://github.com/Crynspier/git-agecrypt/releases/latest)
+[![Rust MSRV](https://img.shields.io/badge/rustc-1.85%2B-F44A00.svg?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Platform Support](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)](#installation--verification)
+[![Provenance: Sigstore](https://img.shields.io/badge/provenance-sigstore%20verified-success?logo=sigstore&logoColor=white)](https://github.com/Crynspier/git-agecrypt/releases)
+[![Format: age v1](https://img.shields.io/badge/format-age%20v1-7c3aed.svg)](https://age-encryption.org/v1)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 **Transparent, GPG-free Git file encryption powered by [`age`](https://age-encryption.org/) and existing SSH keys.**
@@ -50,6 +55,12 @@ git show HEAD:secrets/app.secret.env | head -c 21
 git-agecrypt lock
 git-agecrypt unlock ~/.ssh/id_ed25519
 ```
+
+> [!TIP]
+> **Team Onboarding:** You can enroll team members directly by their GitHub handle without manually collecting public keys:
+> ```bash
+> git-agecrypt add-recipient --github <username> -n <alias>
+> ```
 
 ---
 
@@ -104,6 +115,12 @@ cargo install --path . --locked
 - **Git History Immutability:** Removing a collaborator (`remove-recipient` + `rekey`) prevents them from decrypting *future* commits, but cannot erase their access to historical commits they already cloned. Always rotate actual external credentials when offboarding.
 - **Server-Side Enforcement Recommended:** Client-side Git hooks can be skipped with `--no-verify`. Production repositories should enable the reference server-side `pre-receive` hook ([`examples/hooks/pre-receive`](examples/hooks/pre-receive)) or GitHub Action workflow ([`examples/github-actions/agecrypt-verify.yml`](examples/github-actions/agecrypt-verify.yml)).
 - **Clean-Room Recovery Without `git-agecrypt`:** Because Format Version 1 uses standard `age` v1 files, you can recover any secret using only `git` and the standard `age` CLI (`grep -v '^#' .git-agecrypt/keys/<you>.age | age -d -i <your_key> > repo.key && git show HEAD:<secret> | age -d -i repo.key`).
+
+> [!IMPORTANT]
+> **Key Isolation & Storage:** The active repository master key (`.git/git-agecrypt/repo.key`) lives exclusively on the local machine with strict `0600` POSIX permissions. Only encrypted recipient envelopes (`.git-agecrypt/keys/<name>.age`) and public identities are stored in Git.
+
+> [!WARNING]
+> **Server vs. Hosted CI Enforcement:** A hosted GitHub Actions check runs **after** an unencrypted commit has already been pushed to the remote repository. For strict server-side blocking before commits enter the repository reflog, deploy the native `pre-receive` hook directly on your Git server.
 
 ---
 

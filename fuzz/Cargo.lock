@@ -104,6 +104,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "agecrypt"
+version = "0.6.5"
+dependencies = [
+ "age",
+ "anyhow",
+ "clap",
+ "content_inspector",
+ "ctrlc",
+ "dirs",
+ "filetime",
+ "fs2",
+ "glob",
+ "hmac",
+ "libc",
+ "sha2 0.10.9",
+ "tempfile",
+ "ureq",
+ "zeroize",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -888,32 +909,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "git-agecrypt"
-version = "0.6.0"
-dependencies = [
- "age",
- "anyhow",
- "clap",
- "content_inspector",
- "ctrlc",
- "dirs",
- "filetime",
- "fs2",
- "glob",
- "hmac",
- "libc",
- "sha2 0.10.9",
- "tempfile",
- "ureq",
- "zeroize",
-]
-
-[[package]]
 name = "git-agecrypt-fuzz"
 version = "0.0.0"
 dependencies = [
  "age",
- "git-agecrypt",
+ "agecrypt",
  "libfuzzer-sys",
 ]
 

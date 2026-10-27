@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-git-agecrypt = { path = ".." }
+agecrypt = { path = ".." }
 age = { version = "0.12.1", features = ["ssh", "armor", "cli-common", "plugin"] }
 
 [[bin]]

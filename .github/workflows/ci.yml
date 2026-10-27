@@ -132,7 +132,7 @@ jobs:
           ./target/release/${{ matrix.binary_name }} --version
       - name: Run native macOS integration tests
         if: runner.os == 'macOS'
-        run: cargo test --test test_durability --verbose
+        run: cargo test --workspace --locked --tests --verbose
       - name: Run native Windows integration tests
         if: runner.os == 'Windows'
-        run: cargo test --test test_durability --verbose
+        run: cargo test --workspace --locked --test test_durability --test test_filesystem_security --test test_format_and_recovery_fixtures --test test_server_enforcement --test test_fuzz_boundaries --test test_run_fd_inheritance --test test_concurrency --test test_submodules_worktrees --verbose

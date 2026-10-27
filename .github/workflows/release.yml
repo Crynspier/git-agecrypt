@@ -210,7 +210,7 @@ jobs:
         run: |
           set -euo pipefail
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "${{ matrix.asset_name }}" --pattern "${{ matrix.asset_name }}.sha256" --clobber
-      - name: Verify SHA-256 checksum and Sigstore attestation (Unix)
+      - name: Verify SHA-256 checksum, Sigstore attestation, and binary roundtrip (Unix)
         if: runner.os != 'Windows'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -233,5 +233,43 @@ jobs:
           printf "RELEASE_SECRET=verified_123\n" > app.secret.env
           git add .gitattributes .git-agecrypt app.secret.env
           git commit -m "Verify release binary round-trip"
+          git cat-file -p HEAD:app.secret.env | head -n 1 | grep -Fx "age-encryption.org/v1"
           git-agecrypt check
-          git-agecrypt inspect
+          git-agecrypt inspect --format json
+      - name: Verify SHA-256 checksum, Sigstore attestation, and binary roundtrip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $expected = (Get-Content ".\${{ matrix.asset_name }}.sha256").Split(' ')[0].Trim()
+          $actual = (Get-FileHash ".\${{ matrix.asset_name }}" -Algorithm SHA256).Hash.ToLower()
+          if ($expected -ne $actual) { throw "SHA-256 mismatch: expected $expected, got $actual" }
+          gh attestation verify "${{ matrix.asset_name }}" --repo "$env:GITHUB_REPOSITORY"
+          if ($LASTEXITCODE -ne 0) { throw "Attestation verification failed" }
+          $binDir = Join-Path $env:RUNNER_TEMP 'verify-bin'
+          Remove-Item -LiteralPath $binDir -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath "${{ matrix.asset_name }}" -DestinationPath $binDir
+          $env:PATH = "$binDir;$env:PATH"
+          git config --global user.name "Release Verifier"
+          git config --global user.email "verify@example.com"
+          $repoDir = Join-Path $env:RUNNER_TEMP 'verify-repo'
+          Remove-Item -LiteralPath $repoDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $repoDir | Out-Null
+          Push-Location $repoDir
+          try {
+            git init
+            git-agecrypt init
+            Set-Content -Path .gitattributes -Value "*.secret.env filter=agecrypt diff=agecrypt merge=agecrypt -text`n" -NoNewline
+            Set-Content -Path app.secret.env -Value "RELEASE_SECRET=verified_123`n" -NoNewline
+            git add .gitattributes .git-agecrypt app.secret.env
+            git commit -m "Verify release binary round-trip"
+            $blob = git cat-file -p HEAD:app.secret.env
+            if (-not ($blob -join "`n").StartsWith("age-encryption.org/v1")) { throw "Committed blob is not encrypted" }
+            git-agecrypt check
+            if ($LASTEXITCODE -ne 0) { throw "git-agecrypt check failed" }
+            git-agecrypt inspect --format json | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "git-agecrypt inspect failed" }
+          } finally {
+            Pop-Location
+          }

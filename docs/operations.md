@@ -138,7 +138,7 @@ Because `git-agecrypt` Format Version 1 uses 100% standard `age` v1 primitives, 
    git status
    git-agecrypt status
    ```
-2. **Install the new `git-agecrypt` binary** (via verified GitHub Release archive, `cargo install --locked git-agecrypt`, or package manager).
+2. **Install the new `git-agecrypt` binary** (via verified GitHub Release archive, `cargo install --locked agecrypt`, or package manager).
 3. **Verify repository health and refresh hooks:**
    ```bash
    git-agecrypt --version

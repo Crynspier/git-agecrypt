@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Crynspier/git-agecrypt/actions/workflows/ci.yml/badge.svg)](https://github.com/Crynspier/git-agecrypt/actions/workflows/ci.yml)
 [![Release](https://github.com/Crynspier/git-agecrypt/actions/workflows/release.yml/badge.svg)](https://github.com/Crynspier/git-agecrypt/actions/workflows/release.yml)
-[![GitHub Release](https://img.shields.io/github/v/release/Crynspier/git-agecrypt?color=0284c7&label=release&logo=github)](https://github.com/Crynspier/git-agecrypt/releases/latest)
+[![Crates.io Release](https://img.shields.io/crates/v/agecrypt?color=0284c7&label=crates.io&logo=rust)](https://crates.io/crates/agecrypt)
 [![Rust MSRV](https://img.shields.io/badge/rustc-1.85%2B-F44A00.svg?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Platform Support](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)](#installation--verification)
 [![Provenance: Sigstore](https://img.shields.io/badge/provenance-sigstore%20verified-success?logo=sigstore&logoColor=white)](https://github.com/Crynspier/git-agecrypt/releases)
@@ -80,7 +80,9 @@ gh attestation verify git-agecrypt-linux-x86_64.tar.gz \
 
 ### 2. Build from Source with Cargo
 ```bash
-cargo install --locked git-agecrypt
+# Install from crates.io (installs the `git-agecrypt` CLI binary):
+cargo install --locked agecrypt
+
 # Or from a local checkout:
 cargo install --path . --locked
 ```

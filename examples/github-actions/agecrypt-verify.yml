@@ -34,7 +34,7 @@ jobs:
           toolchain: stable
 
       - name: Install git-agecrypt
-        run: cargo install --locked git-agecrypt
+        run: cargo install --locked agecrypt
 
       - name: Verify repository metadata format and health
         run: git-agecrypt inspect --format json

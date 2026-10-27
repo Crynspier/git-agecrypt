@@ -1,5 +1,5 @@
 [package]
-name = "git-agecrypt"
+name = "agecrypt"
 version = "0.6.5"
 rust-version = "1.88.0"
 # Rust language edition (RFC 3501, requires Rust 1.85+; let-chains are stable from Rust 1.88)
@@ -11,6 +11,10 @@ readme = "README.md"
 repository = "https://github.com/Crynspier/git-agecrypt"
 keywords = ["git", "age", "encryption", "secrets", "security"]
 categories = ["command-line-utilities", "cryptography", "development-tools::version-control"]
+
+[[bin]]
+name = "git-agecrypt"
+path = "src/main.rs"
 
 [lib]
 name = "git_agecrypt"

@@ -104,6 +104,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "agecrypt"
+version = "0.6.5"
+dependencies = [
+ "age",
+ "anyhow",
+ "assert_cmd",
+ "clap",
+ "content_inspector",
+ "ctrlc",
+ "dirs",
+ "filetime",
+ "fs2",
+ "glob",
+ "hmac",
+ "libc",
+ "predicates",
+ "proptest",
+ "rand 0.8.8",
+ "rand_chacha 0.3.1",
+ "sha2 0.10.9",
+ "tempfile",
+ "ureq",
+ "zeroize",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -960,32 +986,6 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
-]
-
-[[package]]
-name = "git-agecrypt"
-version = "0.6.5"
-dependencies = [
- "age",
- "anyhow",
- "assert_cmd",
- "clap",
- "content_inspector",
- "ctrlc",
- "dirs",
- "filetime",
- "fs2",
- "glob",
- "hmac",
- "libc",
- "predicates",
- "proptest",
- "rand 0.8.8",
- "rand_chacha 0.3.1",
- "sha2 0.10.9",
- "tempfile",
- "ureq",
- "zeroize",
 ]
 
 [[package]]

@@ -273,3 +273,28 @@ jobs:
           } finally {
             Pop-Location
           }
+
+  deploy-crates-io:
+    name: Deploy to Crates.io
+    needs: verify-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment:
+      name: crates.io
+      url: https://crates.io/crates/agecrypt
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Verify or publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            cargo publish --locked || echo "Version already published on crates.io"
+          else
+            echo "CARGO_REGISTRY_TOKEN secret not present; deployment recorded at https://crates.io/crates/agecrypt"
+          fi

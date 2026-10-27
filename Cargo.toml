@@ -10,7 +10,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 repository = "https://github.com/Crynspier/git-agecrypt"
 keywords = ["git", "age", "encryption", "secrets", "security"]
-categories = ["command-line-utilities", "cryptography", "development-tools::version-control"]
+categories = ["command-line-utilities", "cryptography", "development-tools"]
 
 [[bin]]
 name = "git-agecrypt"
